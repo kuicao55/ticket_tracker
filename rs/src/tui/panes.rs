@@ -10,7 +10,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Cell, List, ListItem, Paragra
 use ratatui::Frame;
 use serde_json::Value;
 
-use super::{App, Focus};
+use super::{actions, App, Focus, FocusMode};
 use crate::monitor::{S_ERROR, S_NO_SHOWS, S_NOT_LISTED, S_OPEN};
 
 fn border(focused: bool) -> Style {
@@ -133,10 +133,15 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         return;
     }
     let w = watch_opt.unwrap();
-    // 内部分两段：详情 + 影院子表
+    // 内部分三段：详情 + 影院子表 + per-watch 操作按钮行
+    // 按钮行固定占 3 行（标题 + 两行按钮）；区域不足时按钮行可能被压扁但仍可见
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(1)])
+        .constraints([
+            Constraint::Length(8), // 详情
+            Constraint::Min(1),    // 影院子表
+            Constraint::Length(3), // 操作按钮行（标题 + 2 行按钮）
+        ])
         .split(area);
     // 详情
     let mid = w.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
@@ -243,6 +248,101 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
     .header(header)
     .block(sub_block);
     f.render_widget(table, chunks[1]);
+
+    // ---- per-watch 操作按钮行（仅在 Detail In 模式下高亮当前按钮）----
+    draw_detail_buttons(app, f, chunks[2]);
+}
+
+/// 渲染 detail 列底部 per-watch 按钮行。
+/// 标题 + 两行按钮（6 个），当前按钮 cyan 黑底加粗。
+fn draw_detail_buttons(app: &mut App, f: &mut Frame, area: Rect) {
+    let in_detail_focus = app.focus == Focus::Detail && app.focus_mode == FocusMode::In;
+    // 第 1 行：标题
+    let title_line = Line::from(vec![
+        Span::styled("─ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "操作",
+            Style::default()
+                .fg(if in_detail_focus {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                })
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            if in_detail_focus {
+                "←/→ 切换 · Enter 触发 · Esc 返回"
+            } else {
+                "（进入本栏后可操作）"
+            },
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(" ─", Style::default().fg(Color::DarkGray)),
+    ]);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+    f.render_widget(Paragraph::new(title_line), rows[0]);
+
+    // 第 2-3 行：按钮一字排开，按 detail_btn_idx 高亮；按 3 一行换行
+    let n = actions::DETAIL_BUTTONS.len();
+    if n == 0 {
+        return;
+    }
+    let buttons_per_row = 3usize;
+    let mut used_first = 0usize;
+    let first_w = rows[1].width as usize;
+    let mut first_spans: Vec<Span> = Vec::new();
+    for (i, (icon, label)) in actions::DETAIL_BUTTONS.iter().enumerate() {
+        if i >= buttons_per_row {
+            break;
+        }
+        let text = format!(" [{}] {} ", icon, label);
+        let w = text.chars().count();
+        if used_first + w > first_w {
+            first_spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+            break;
+        }
+        let style = if in_detail_focus && i == app.detail_btn_idx {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        first_spans.push(Span::styled(text, style));
+        used_first += w;
+    }
+    f.render_widget(Paragraph::new(Line::from(first_spans)), rows[1]);
+
+    let mut used_second = 0usize;
+    let second_w = rows[2].width as usize;
+    let mut second_spans: Vec<Span> = Vec::new();
+    for (i, (icon, label)) in actions::DETAIL_BUTTONS.iter().enumerate().skip(buttons_per_row) {
+        let text = format!(" [{}] {} ", icon, label);
+        let w = text.chars().count();
+        if used_second + w > second_w {
+            if i < n {
+                second_spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+            }
+            break;
+        }
+        let style = if in_detail_focus && i == app.detail_btn_idx {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        second_spans.push(Span::styled(text, style));
+        used_second += w;
+    }
+    f.render_widget(Paragraph::new(Line::from(second_spans)), rows[2]);
 }
 
 pub fn draw_events(app: &mut App, f: &mut Frame, area: Rect) {

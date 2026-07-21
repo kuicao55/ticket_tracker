@@ -272,6 +272,8 @@ pub struct Monitor {
     pub shared: Arc<SharedState>,
     stop: Arc<Notify>,
     force_flag: Arc<AtomicBool>,
+    /// wid 集合：要求「只强制检查这一条」的 watch（per-watch force check）
+    force_targets: Arc<StdMutex<std::collections::HashSet<String>>>,
     #[allow(dead_code)]
     watch_filter: Vec<String>,
 }
@@ -314,6 +316,7 @@ impl Monitor {
             }),
             stop: Arc::new(Notify::new()),
             force_flag: Arc::new(AtomicBool::new(false)),
+            force_targets: Arc::new(StdMutex::new(std::collections::HashSet::new())),
             watch_filter: watch_filter.unwrap_or_default(),
         })
     }
@@ -355,6 +358,44 @@ impl Monitor {
 
     pub fn force_check(&self) {
         self.force_flag.store(true, Ordering::SeqCst);
+    }
+
+    /// 强制只检查一条 watch（跳过 interval 节流；其余 watch 仍按正常节奏跑）
+    pub fn force_check_wid(&self, wid: String) {
+        if !wid.is_empty() {
+            self.force_targets.lock().unwrap().insert(wid);
+        }
+    }
+
+    /// 全局手动检查：将所有当前启用的 watch 的 wid 都加入 force_targets。
+    /// 不直接翻转 force_flag 以避免一过即丢，集合里的 wid 在被消费后自动清出。
+    pub fn force_check_all(&self) {
+        // 同时保留旧 force_flag（用于兼容），并把 enabled 集合塞入
+        self.force_flag.store(true, Ordering::SeqCst);
+        let enabled_wids: Vec<String> = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("watches")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
+                        .filter_map(|w| w.get("id").and_then(|v| v.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut ft = self.force_targets.lock().unwrap();
+        for w in enabled_wids {
+            ft.insert(w);
+        }
+    }
+
+    /// 读出当前 force_targets 的 snapshot 并清空它（一轮 tick 内消费一次）。
+    fn drain_force_targets(&self) -> std::collections::HashSet<String> {
+        let mut ft = self.force_targets.lock().unwrap();
+        let snap = ft.clone();
+        ft.clear();
+        snap
     }
 
     pub async fn run(&self) {
@@ -429,13 +470,18 @@ impl Monitor {
                 continue;
             }
 
-            // 强制检查？
-            let force = self.force_flag.swap(false, Ordering::SeqCst);
-            if force {
+            // 强制检查：force_flag（全局） + force_targets（per-wid 集合）
+            let force_all = self.force_flag.swap(false, Ordering::SeqCst);
+            let force_set = self.drain_force_targets();
+            let force = force_all || !force_set.is_empty();
+            if force_all {
                 self.push_event("· 手动触发一轮检查…".into()).await;
             }
+            if !force_set.is_empty() && !force_all {
+                self.push_event(format!("· 手动触发 {} 条 watch 检查…", force_set.len())).await;
+            }
 
-            let did = self.tick(mode, force).await;
+            let did = self.tick(mode, force, &force_set).await;
             if did {
                 let mut s = self.shared.stats.lock().unwrap();
                 s.check_count += 1;
@@ -535,7 +581,12 @@ impl Monitor {
     }
 
     /// 主 tick 一轮
-    async fn tick(&self, mode: config::Mode, force: bool) -> bool {
+    async fn tick(
+        &self,
+        mode: config::Mode,
+        force: bool,
+        force_set: &std::collections::HashSet<String>,
+    ) -> bool {
         let mut any_done = false;
         let mut cinema_cache: HashMap<String, Value> = HashMap::new();
         let now = SystemTime::now()
@@ -568,8 +619,12 @@ impl Monitor {
             }
             let wid = watch.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
+            // per-watch 强制检查（即使 force 全局为 false）
+            let per_wid_force = force_set.contains(&wid);
+            let effective_force = force || per_wid_force;
+
             // 独立 interval 节流
-            if !force {
+            if !effective_force {
                 let w_interval = watch.get("interval").and_then(|v| v.as_u64());
                 if let Some(secs) = w_interval {
                     let mut s = self.shared.stats.lock().unwrap();

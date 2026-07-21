@@ -10,7 +10,7 @@ use ratatui::Terminal;
 use serde_json::Value;
 use std::io::Stdout;
 
-use super::{actions, panes, App, InputMode};
+use super::{actions, panes, App, Focus, FocusMode, InputMode};
 
 pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     let area = f.area();
@@ -108,6 +108,20 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     let now = chrono::Local::now().format("%H:%M").to_string();
     let elapsed = chrono::Utc::now().timestamp() as f64 - app.cached_started_at;
     let uptime = crate::monitor::format_uptime(elapsed.max(0.0) as u64);
+    let block_label = match app.focus {
+        Focus::Watches => "Watches",
+        Focus::Detail => "Detail",
+        Focus::Events => "Events",
+        Focus::Actions => "Actions",
+    };
+    let mode_label = match app.focus_mode {
+        FocusMode::Top => "TOP",
+        FocusMode::In => "IN",
+    };
+    let mode_color = match app.focus_mode {
+        FocusMode::Top => Color::Yellow,
+        FocusMode::In => Color::Cyan,
+    };
     let line = Line::from(vec![
         Span::styled(
             "ticket-tracker",
@@ -121,6 +135,11 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
         Span::styled(app.cached_mode.as_str(), Style::default().fg(Color::Yellow)),
         Span::raw("   "),
         Span::raw(format!("{} active", app.cached_active)),
+        Span::raw("   "),
+        Span::styled(
+            format!("[{}] {}", mode_label, block_label),
+            Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+        ),
     ]);
     f.render_widget(Paragraph::new(line), area);
 }
@@ -195,7 +214,7 @@ fn draw_statusbar(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
 }
 
 fn default_tips() -> String {
-    "←/→ 切焦点或按钮   ↑/↓ 移动   Enter 触发按钮   ? 帮助   q 退出".into()
+    "←/→ 选区块 (Top)   ↓ 进区块 (In)   Enter 触发   Esc 退回上一级   ? 帮助   q 退出".into()
 }
 
 fn draw_input_line(app: &App, f: &mut ratatui::Frame, status: Rect) {
@@ -238,19 +257,28 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
             Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from("焦点: ←/→ (Watches/Detail/Events/Actions)"),
-        Line::from("       Tab 也可循环焦点"),
-        Line::from("移动: ↑/↓ 在焦点 pane 内移动"),
-        Line::from("触发: Enter 触发当前 Action 按钮"),
+        Line::from(Span::styled(
+            "Top 模式（标题栏写 TOP）：",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  ←/→ 选区块（Watches/Detail/Events/Actions）"),
+        Line::from("  ↓ 或 Enter 进入当前区块（→ In 模式）"),
+        Line::from("  Esc / q / Ctrl+C 退出"),
         Line::from(""),
-        Line::from(Span::styled("Action Bar：", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from("  [+] 添加   [-] 删除   [~] 编辑   [◉] 启停"),
-        Line::from("  [r] 立即检查   [⚙] 配置   [?] 帮助   [q] 退出"),
+        Line::from(Span::styled(
+            "In 模式（标题栏写 IN）：",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  Watches: ↑/↓ 切 watch；Enter 无操作（已 In）"),
+        Line::from("  Detail:  ↑/↓ / ←/→ 切 per-watch 按钮；Enter 触发"),
+        Line::from("          [◉ 启停] [~ 影院] [~ 日期] [~ 间隔] [r 检查] [- 删除]"),
+        Line::from("  Events:  ↑/↓ 滚事件"),
+        Line::from("  Actions: ←/→/↑/↓ 切按钮；Enter 触发"),
+        Line::from("  Esc 退回 Top；Tab 跳下一区块并保持 In"),
         Line::from(""),
         Line::from(Span::styled("其它：", Style::default().add_modifier(Modifier::BOLD))),
         Line::from("  ? 切换本覆盖层"),
-        Line::from("  q / Ctrl+C 干净退出"),
-        Line::from("  Esc 关闭帮助 / 取消 confirm / 取消 prompt"),
+        Line::from("  q / Ctrl+C 干净退出（Discord 收到「已停止 🛑」）"),
         Line::from(Span::styled(
             "（按 ? 或任意键关闭）",
             Style::default().fg(Color::DarkGray),

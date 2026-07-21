@@ -17,6 +17,16 @@ pub const BUTTONS: &[(&str, &str)] = &[
     ("q", "退出"),
 ];
 
+/// Detail 列内的 per-watch 按钮（仅 Detail In 模式生效）。长度 = 6。
+pub const DETAIL_BUTTONS: &[(&str, &str)] = &[
+    ("◉", "启停"),
+    ("~", "影院"),
+    ("~", "日期"),
+    ("~", "间隔"),
+    ("r", "立即检查"),
+    ("-", "删除"),
+];
+
 /// 当前 `app.action_idx` 对应的按钮 Enter 触发的动作。
 pub fn dispatch(app: &mut App) {
     match app.action_idx {
@@ -146,4 +156,75 @@ pub fn dispatch_prompt_cancel(app: &mut App) {
 pub fn cmd_delete_wid(app: &mut App, wid: &str) {
     let cmd_str = format!("rm {}", wid);
     cmd::execute(app, &cmd_str);
+}
+
+/// Detail In 模式下按 Enter 触发当前按钮。
+/// 顺序与 `DETAIL_BUTTONS` 一致：0=启停, 1=影院, 2=日期, 3=间隔, 4=立即检查, 5=删除。
+pub fn dispatch_detail_action(app: &mut App, btn_idx: usize) {
+    let wid = match cmd::current_wid(app) {
+        Some(w) => w,
+        None => {
+            cmd::push_status(app, "没有选中 watch".into(), 3);
+            return;
+        }
+    };
+    match btn_idx {
+        0 => {
+            // 启停
+            cmd::execute(app, "toggle");
+        }
+        1 => {
+            // 编辑影院：开 prompt `edit <wid> cinemas > `
+            app.input_mode = InputMode::Cmd;
+            app.prompt_target = None;
+            app.input_buf = format!("edit {} cinemas ", wid);
+            cmd::push_status(
+                app,
+                format!(
+                    "编辑 {} 影院 ID（空格分隔；只输 clear 清空）",
+                    wid
+                ),
+                8,
+            );
+        }
+        2 => {
+            // 编辑日期
+            app.input_mode = InputMode::Cmd;
+            app.prompt_target = None;
+            app.input_buf = format!("edit {} dates ", wid);
+            cmd::push_status(
+                app,
+                format!(
+                    "编辑 {} 日期 YYYY-MM-DD（空格分隔；只输 clear 清空）",
+                    wid
+                ),
+                8,
+            );
+        }
+        3 => {
+            // 编辑间隔
+            app.input_mode = InputMode::Cmd;
+            app.prompt_target = None;
+            app.input_buf = format!("edit {} interval ", wid);
+            cmd::push_status(
+                app,
+                format!("编辑 {} 间隔（秒，default 用全局）", wid),
+                8,
+            );
+        }
+        4 => {
+            // per-watch 立即检查
+            app.monitor.force_check_wid(wid.clone());
+            cmd::push_event(app, format!("· 手动检查 watch {} …", wid));
+            cmd::push_status(app, format!("已触发 {} 立即检查", wid), 3);
+        }
+        5 => {
+            // 删除（走 confirm）
+            app.confirm = Some(ConfirmPrompt {
+                text: format!("删 watch {} ? (y/n)", wid),
+                created_at: std::time::Instant::now(),
+            });
+        }
+        _ => {}
+    }
 }

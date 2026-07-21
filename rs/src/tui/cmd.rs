@@ -269,8 +269,70 @@ fn cmd_enable(rest: &[&str], _app: &mut App, en: bool) -> Result<String, String>
     }
 }
 
-fn cmd_edit(_rest: &[&str], _app: &mut App) -> Result<String, String> {
-    Err("简化版：未实现，编辑请用 tt watch edit".into())
+fn cmd_edit(rest: &[&str], _app: &mut App) -> Result<String, String> {
+    // 用法:
+    //   edit <wid> cinemas <id>... | clear
+    //   edit <wid> dates <YYYY-MM-DD>... | clear
+    //   edit <wid> interval <secs> | default
+    if rest.len() < 2 {
+        return Err("用法: edit <wid> <field> <value...>".into());
+    }
+    let wid = rest[0];
+    let field = rest[1];
+    let args = &rest[2..];
+
+    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let w = config::find_watch_mut(&mut cfg, wid)
+        .ok_or_else(|| format!("watch 不存在: {}", wid))?;
+
+    match field {
+        "cinemas" => {
+            if args.first().map(|s| *s == "clear").unwrap_or(false) {
+                w["cinemas"] = serde_json::json!([]);
+                config::save(&cfg).map_err(|e| e.to_string())?;
+                return Ok(format!("{} cinemas = (cleared)", wid));
+            }
+            if args.is_empty() {
+                return Err("cinemas 缺参数".into());
+            }
+            w["cinemas"] = serde_json::json!(args);
+            config::save(&cfg).map_err(|e| e.to_string())?;
+            Ok(format!("{} cinemas = {}", wid, args.join(" ")))
+        }
+        "dates" => {
+            if args.first().map(|s| *s == "clear").unwrap_or(false) {
+                w["dates"] = serde_json::Value::Null;
+                config::save(&cfg).map_err(|e| e.to_string())?;
+                return Ok(format!("{} dates = (cleared)", wid));
+            }
+            if args.is_empty() {
+                return Err("dates 缺参数".into());
+            }
+            for d in args {
+                if d.len() != 10 || !d.chars().nth(4).map(|c| c == '-').unwrap_or(false) {
+                    return Err(format!("日期格式应为 YYYY-MM-DD: {}", d));
+                }
+            }
+            w["dates"] = serde_json::json!(args);
+            config::save(&cfg).map_err(|e| e.to_string())?;
+            Ok(format!("{} dates = {}", wid, args.join(" ")))
+        }
+        "interval" => {
+            let v = args
+                .first()
+                .ok_or_else(|| "interval 缺参数".to_string())?;
+            if *v == "default" {
+                w.as_object_mut().map(|o| o.remove("interval"));
+                config::save(&cfg).map_err(|e| e.to_string())?;
+                return Ok(format!("{} interval = default", wid));
+            }
+            let secs: u64 = v.parse().map_err(|_| "interval 必须是数字或 default".to_string())?;
+            w["interval"] = serde_json::json!(secs);
+            config::save(&cfg).map_err(|e| e.to_string())?;
+            Ok(format!("{} interval = {}s", wid, secs))
+        }
+        other => Err(format!("edit 不支持字段: {}（支持 cinemas / dates / interval）", other)),
+    }
 }
 
 /// 反转当前 watch 的 enabled 状态。无 wid 时报错。

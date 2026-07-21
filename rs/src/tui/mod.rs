@@ -36,11 +36,16 @@ pub use focus::Focus;
 /// 全局应用状态 —— 持有所有可变状态，TUI 各模块通过 `&mut App` 修改。
 pub struct App {
     pub monitor: Arc<Monitor>,
+    /// 当前聚焦的区块（Watches / Detail / Events / Actions）
     pub focus: Focus,
+    /// 层级化导航模式：Top（区块选择）/ In（区块内选择）
+    pub focus_mode: FocusMode,
     /// TUI 的 watch 选择（左栏）
     pub watch_idx: usize,
     /// TUI 的 event 滚动（右栏），list state 偏移
     pub event_idx: usize,
+    /// Detail 栏内的 per-watch 按钮索引（0..=5）；仅 Detail In 模式下生效
+    pub detail_btn_idx: usize,
     /// prompt 期间进入文本输入模式（仅一种：Cmd —— 由 action bar 进入）
     pub input_mode: InputMode,
     pub input_buf: String,
@@ -60,6 +65,17 @@ pub struct App {
     pub cached_active: usize,
     /// 监控线程句柄 + 停止标志
     pub monitor_thread: Option<MonitorHandle>,
+    /// SIGINT handler 设的标志 —— 主循环检测到即干净退出（让 Monitor::run() 发 Discord 「已停止」）
+    sigint_flag: Arc<AtomicBool>,
+}
+
+/// 层级化导航模式。
+/// - Top：方向键在 4 区块间切；Enter / ↓ 进入当前区块（→ In）
+/// - In：方向键在当前区块内操作；Esc 退回 Top；Enter 触发
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FocusMode {
+    Top,
+    In,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,8 +146,10 @@ impl App {
         Self {
             monitor: Arc::new(monitor),
             focus: Focus::Watches,
+            focus_mode: FocusMode::Top,
             watch_idx: 0,
             event_idx: 0,
+            detail_btn_idx: 0,
             input_mode: InputMode::Normal,
             input_buf: String::new(),
             action_idx: 0,
@@ -146,7 +164,18 @@ impl App {
             cached_mode: "normal".into(),
             cached_active: 0,
             monitor_thread: None,
+            sigint_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Ctrl+C handler 调用：设置 should_quit 并记录是 SIGINT 触发的（无副作用，目前仅日志需要）。
+    pub fn request_quit(&mut self) {
+        self.should_quit = true;
+    }
+
+    /// 主线程读 sigint_flag
+    pub fn sigint_pending(&self) -> bool {
+        self.sigint_flag.load(Ordering::SeqCst)
     }
     /// 每帧刷新缓存（cheap，纯同步读）
     pub fn refresh_caches(&mut self) {
@@ -205,6 +234,26 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
+    // ---- 抢注 SIGINT handler：在独立线程里跑一个 mini tokio runtime 监听 Ctrl+C。
+    // Unix tty driver 在 raw mode 下仍然会把 Ctrl+C 发成 SIGINT（ISIG 仍启用）；
+    // 一旦 Tokio 接管这个信号，默认 handler 不再杀进程，主循环就能干净走 cleanup。
+    let sigint_flag = app.sigint_flag.clone();
+    let _sigint_thread = std::thread::Builder::new()
+        .name("ticket-tracker-sigint".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                sigint_flag.store(true, Ordering::SeqCst);
+            });
+        })?;
+
     // ---- 启动 monitor 线程（自带 tokio runtime）----
     // 通过两个 atomic 把 stop/force 信号从 TUI 主线程传给 monitor；监控线程内部
     // 每轮检查一次 stop_flag（避免依赖 tokio::Notify），确保 join 立即返回。
@@ -232,7 +281,11 @@ fn run_event_loop(
     // ---- 主循环 ----
     use std::time::Duration;
     loop {
-        if app.should_quit {
+        if app.should_quit || app.sigint_pending() {
+            // sigint 触发的退出也要走 cleanup
+            if app.sigint_pending() {
+                app.should_quit = true;
+            }
             break;
         }
         app.refresh_caches();
