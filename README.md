@@ -28,20 +28,30 @@
 
 ## 安装
 
-需要 Python 3.8+。
+需要 Python 3.8+。目前只支持**从源码安装**（还没发 PyPI）：
 
 ```bash
+git clone https://github.com/kuicao55/ticket_tracker.git
+cd ticket_tracker
+
+# 推荐：pipx（隔离环境，不污染全局）
+pipx install .
+
+# 或传统 pip：
 pip install -e .
 ```
 
-或在隔离环境：
+完成后命令行可用 `tt`。验证：
 ```bash
-pipx install .
+tt --version
+tt doctor                        # 自检：依赖 / 网络 / 配置 / macOS 通知
 ```
 
 升级：
 ```bash
-pip install -U ticket-tracker
+cd ticket_tracker
+git pull
+pipx upgrade ticket-tracker      # 或：pip install -e . --upgrade
 ```
 
 ---
@@ -123,32 +133,38 @@ tt watch edit w_a1b2c3 --interval 30
 `tt start` 进入交互式 TUI。**所有按键都显示在底部 Footer，一目了然。**
 
 ```
-┌─ ticket-tracker ────────────────────────────── 17:52 ─┐
-│ ⏱ 已运行 12h34m   🔍 检查 478 次   📡 正常   📱 ✓   │
-├──────────────────────────────────────────────────────┤
-│ ID          电影         影院         日期    状态   │
-│ w_a1b2c3 ✓  蜘蛛侠…     MOViE(37…) 07-29  ✓开售    │
-│ w_d4e5f6 ×  阿凡达 3    大光明…    不限   待查    │
-├──────────────────────────────────────────────────────┤
-│ 最近事件（自动滚动，鼠标滚轮翻页）                    │
-│ 17:51:22  ✓ w_a1b2c3 ...                             │
-├──────────────────────────────────────────────────────┤
-│  Add  Delete  Toggle  Browse  Search  Interval  ...  │  ← Footer
-└──────────────────────────────────────────────────────┘
+┌─ ticket-tracker ───────────────────────── 17:52 ─┐
+│ ⏱ 12h34m  🔍 478 次  📡 正常  📱 ✓  ☕ ✓  🔥 1  │   ← 顶部状态栏
+├──────────────────────────────────────────────────┤
+│ ID           电影       影院        日期    状态 │   ← 表格
+│ w_a1b2c3  ✓  蜘蛛侠…   MOViE…   07-29  ✓开售    │
+│ w_d4e5f6  ×  阿凡达 3  大光明…   不限   待查    │
+├──────────────────────────────────────────────────┤
+│ ✓ w_79bdad · 蜘蛛侠：崭新之日                      │
+│   影院    : MOViE MOViE (前滩太古里) (37534)     │   ← 中部详情面板
+│   日期    : 2026-07-29   间隔  : 60s              │     （点表里任一行才出
+│   启用    : 是   已触发  : 1/2                    │      现，未选则空）
+│   [关闭] [编辑影院] [编辑日期]                    │
+│   [编辑间隔] [启停]   [删除]                      │
+├──────────────────────────────────────────────────┤
+│ [A] 添加  [D] 删除  [R] 立即检查                   │   ← 9 按钮分 3 行
+│ [I] 间隔  [W] Webhook [Q] 静默时段               │
+│ [P] 只推手机  [H] 报告间隔  [?] 帮助              │
+└──────────────────────────────────────────────────┘
 ```
 
 ### 按键（在 Footer 一目了然）
 
 | 键 | 作用 |
 |---|---|
-| `a` | 添加 watch（弹出表单；电影 ID 行有"选电影"按钮，影院 ID 行有"收藏"按钮） |
-| `d` | 删除 watch（若中部已选 watch，直接删它） |
-| `i` | 改全局检查间隔 |
+| `a` | 添加 watch（弹窗里有"选电影"+"收藏"按钮） |
+| `d` | 删除 watch（若中部已选 watch，直接删它；否则弹列表选） |
+| `i` | 改全局检查间隔（秒） |
 | `w` | 改 Discord webhook URL |
 | `q` | 改静默时段 |
 | `p` | 改 phone-only 时段 |
-| `h` | 改 Discord 报告间隔（默认 1 小时；可设任意秒数） |
-| `r` | 立即检查一轮 |
+| `h` | 改 Discord 报告间隔（默认 3600s；可改任意秒数） |
+| `r` | 立即检查一轮（无视节流全跑一遍） |
 | `Esc` | 收起中部详情面板 |
 | `?` | 弹 Markdown 完整帮助 |
 | `Ctrl+C` | 退出 |
@@ -157,25 +173,41 @@ tt watch edit w_a1b2c3 --interval 30
 
 | 元素 | 操作 |
 |---|---|
-| 表格行 | 单击高亮 + 中部显示详情；再点同一行 / 点关闭按钮 / 按 Esc 收起 |
-| 详情面板按钮 | 编辑影院 / 日期 / 间隔（弹小窗改字段）、启停、删除、关闭 |
+| 表格行 | 单击 → 中部显示该 watch 的详情 + 6 个操作按钮 |
+| 详情面板按钮 | 编辑影院 / 日期 / 间隔 / 启停 / 删除 / 关闭 |
 | 弹窗按钮 | 直接点 |
-| **底部按钮菜单** | 8 个动作分 3 行排列，鼠标直接点（按键 `[X]` 即对应快捷键） |
-| Input 框 | 点击聚焦 |
+| **底部按钮菜单** | 9 个动作分 3 行，鼠标直接点；按钮上 `[X]` 即对应键盘快捷键 |
+| Input 框 | 点击聚焦；`Enter` 提交 |
+| 弹窗滚动 | 鼠标滚轮 / 方向键 |
 
-底部菜单（Grid 流式布局，8 个按钮分 3 行 = 3+3+2，列宽自适应窗口大小）：
+底部菜单（Grid `grid-size: 3`，9 个按钮 = 3+3+3 列宽自适应窗口）：
 
 ```
-┌─ [A] 添加     [D] 删除     [R] 立即检查 ──┐
-├─ [I] 检查间隔 [W] Discord [Q] 静默时段 ──┤
-└─ [P] 只推手机 [?] 帮助                  ┘
+[A] 添加        [D] 删除        [R] 立即检查
+[I] 检查间隔    [W] Discord     [Q] 静默时段
+[P] 只推手机    [H] 报告间隔    [?] 帮助
 ```
 
-弹窗（`VerticalScroll` 包裹）：超过 `max-height: 90%` 时自动出滚动条，可用鼠标滚轮 / 方向键滚动。
+弹窗（`VerticalScroll` 包裹）：超过 `max-height: 90%` 自动出滚动条。
 
 ### Empty State（无 watch）
 
-尚无 watch 时进入 TUI 也 OK，会显示大黄色引导卡片，按 `a` 或点 "+ 添加第一条 watch" 按钮即进入添加流程。
+首次启动 `tt init` 后还没添加任何 watch 时，进入 TUI 显示大黄色引导卡片：
+
+```
+       🎬  ticket-tracker
+       你还没有添加任何监视项
+       按 a 添加  ·  按 ? 看帮助
+       [ + 添加第一条 watch ]
+```
+
+按 `a` 或点按钮直接进入添加弹窗。
+
+### 自动停用 & 节流
+
+- 一条 watch 的**所有 cinema 都触发过开售报警后**，自动 `enabled=False` 停用，不再浪费 API（避免重复拉）
+- 无任何 active watch 时，**Discord 报告也跳过**（避免"看着像例行报告"误读）
+- `r` 触发的手动检查跳过节流，全跑所有 enabled watch
 
 ---
 
@@ -218,7 +250,8 @@ tt doctor                                        自检
 ## 配置文件
 
 位置：`~/.config/ticket-tracker/config.json`（XDG 规范）
-日志：`~/.local/state/ticket-tracker/log.txt`
+日志：`~/.local/state/ticket-tracker/ticket-tracker.log`
+PID：`~/.local/state/ticket-tracker/ticket-tracker.pid`
 
 用 `tt config show` / `tt config get <key>` / `tt config set <key> <value>` 操作。
 特殊 key 别名：`interval` ↔ `check_interval`、`webhook` ↔ `discord_webhook`、`quiet` ↔ `quiet_window`、`phone-only` ↔ `phone_only_window`。
@@ -257,8 +290,8 @@ GET https://m.maoyan.com/ajax/cinemaDetail?cinemaId=<影城ID>
 ## 开发
 
 ```bash
-git clone https://github.com/you/ticket-tracker
-cd ticket-tracker
+git clone https://github.com/kuicao55/ticket_tracker.git
+cd ticket_tracker
 pip install -e .
 
 # 跑测试（如果有）

@@ -29,8 +29,8 @@ dependencies = [
 ]
 
 [project.urls]
-"Source" = "https://github.com/your-name/ticket-tracker"
-"Issues" = "https://github.com/your-name/ticket-tracker/issues"
+"Source" = "https://github.com/kuicao55/ticket_tracker"
+"Issues" = "https://github.com/kuicao55/ticket_tracker/issues"
 
 [project.scripts]
 tt = "ticket_tracker.cli:main"
