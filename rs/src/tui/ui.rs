@@ -1,11 +1,21 @@
 //! 主 render。
+//!
+//! 布局（与 py 版一致）：
+//!   header (1)
+//!   body  ：watches (左, 满高) │ [details (右上) / logs (右下)]
+//!   menu  ：标题 (1) + 两行按钮 (2)
+//!   status (1)
+//!
+//! 输入模式（Top / In）见 input.rs。
+//! - Top：方向键在 4 区块间循环（Watches/Detail/Logs/Menu）
+//! - In ：方向键在当前区块内操作；Enter 触发；Esc 退回 Top
 
 use anyhow::Result;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, BorderType, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 use ratatui::Terminal;
 use serde_json::Value;
 use std::io::Stdout;
@@ -14,35 +24,32 @@ use super::{actions, panes, App, Focus, FocusMode, InputMode};
 
 pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     let area = f.area();
-    // 极小窗口 fallback
-    if area.width < 60 || area.height < 8 {
+
+    // 极小窗口 fallback —— 全部垂直堆叠
+    if area.width < 60 || area.height < 12 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(1),
-                Constraint::Min(0),
-                Constraint::Length(1),
+                Constraint::Length(if area.height >= 8 { 6 } else { 3 }), // watches
+                Constraint::Length(if area.height >= 8 { 4 } else { 2 }), // details
+                Constraint::Min(1),                                        // logs
+                Constraint::Length(3),                                     // menu
+                Constraint::Length(1),                                     // status
             ])
             .split(area);
         draw_header(app, f, chunks[0]);
-        let body_chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(if area.height >= 6 { 3 } else { 1 }),
-                Constraint::Length(0),
-                Constraint::Min(1),
-            ])
-            .split(chunks[1]);
-        panes::draw_watches(app, f, body_chunks[0]);
-        panes::draw_detail(app, f, body_chunks[1]);
-        panes::draw_events(app, f, body_chunks[2]);
-        draw_statusbar(app, f, chunks[2]);
-        draw_input_line(app, f, chunks[2]);
+        panes::draw_watches(app, f, chunks[1]);
+        panes::draw_detail(app, f, chunks[2]);
+        panes::draw_logs(app, f, chunks[3]);
+        draw_menu(app, f, chunks[4]);
+        draw_statusbar(app, f, chunks[5]);
+        draw_input_line(app, f, chunks[5]);
         if app.show_help {
             draw_help(f, area);
         }
         if let Some(c) = &app.confirm {
-            let row = chunks[2].y.saturating_sub(1);
+            let row = chunks[5].y.saturating_sub(1);
             let confirm_area = Rect::new(area.x, row, area.width, 1);
             let line = Paragraph::new(Line::from(Span::styled(
                 format!(" {}", c.text),
@@ -52,39 +59,37 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
         }
         return;
     }
-    // 正常布局：[header / body / actions / status]
+
+    // ---- 正常布局：[header / body / menu / status] ----
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
-            Constraint::Min(5),    // body
-            Constraint::Length(2), // actions（标题 + 按钮行）
+            Constraint::Min(6),    // body
+            Constraint::Length(3), // menu（标题 + 两行按钮）
             Constraint::Length(1), // status
         ])
         .split(area);
 
     draw_header(app, f, chunks[0]);
 
-    // body 三栏：左 ≤ 18，中 ≥ 60，右 = remaining
-    let mid_w = 60u16.min(area.width.saturating_sub(50));
-    let left_w = 18u16.min(area.width.saturating_sub(mid_w + 24));
-    let right_w = area.width.saturating_sub(mid_w + left_w);
+    // body：左 watches（满高），右 [details / logs]
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Length(left_w),
-            Constraint::Length(mid_w),
-            Constraint::Length(right_w),
-        ])
+        .constraints([Constraint::Length(22), Constraint::Min(40)])
         .split(chunks[1]);
     panes::draw_watches(app, f, body_cols[0]);
-    panes::draw_detail(app, f, body_cols[1]);
-    panes::draw_events(app, f, body_cols[2]);
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(body_cols[1]);
+    panes::draw_detail(app, f, right_rows[0]);
+    panes::draw_logs(app, f, right_rows[1]);
 
-    // actions bar（2 行：标题 + 按钮）
-    draw_actions(app, f, chunks[2]);
+    // menu
+    draw_menu(app, f, chunks[2]);
 
-    // status 栏 + input line 叠加
+    // status + input line overlay
     draw_statusbar(app, f, chunks[3]);
     draw_input_line(app, f, chunks[3]);
 
@@ -111,8 +116,8 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     let block_label = match app.focus {
         Focus::Watches => "Watches",
         Focus::Detail => "Detail",
-        Focus::Events => "Events",
-        Focus::Actions => "Actions",
+        Focus::Events => "Logs",
+        Focus::Actions => "Menu",
     };
     let mode_label = match app.focus_mode {
         FocusMode::Top => "TOP",
@@ -144,16 +149,17 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_actions(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
+/// 底部菜单栏：标题 + 两行按钮（5 个 / 行）。
+fn draw_menu(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
         .split(area);
     // 第 1 行：标题
     let title = Line::from(vec![
         Span::styled("─ ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            "actions",
+            "menu (全局)",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -167,29 +173,40 @@ fn draw_actions(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     ]);
     f.render_widget(Paragraph::new(title), rows[0]);
 
-    // 第 2 行：按钮一字排开，按 app.action_idx 高亮
-    let mut spans: Vec<Span> = Vec::new();
-    let mut used = 0usize;
-    let max_w = area.width as usize;
-    for (i, (icon, label)) in actions::BUTTONS.iter().enumerate() {
-        let text = format!(" [{}] {} ", icon, label);
-        let w = text.chars().count();
-        if used + w > max_w {
-            spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
-            break;
-        }
-        let style = if i == app.action_idx {
-            Style::default()
-                .bg(Color::Cyan)
-                .fg(Color::Black)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::White)
-        };
-        spans.push(Span::styled(text, style));
-        used += w;
+    // 第 2-3 行：按钮按顺序排，一行 5 个；当前按钮高亮
+    let n = actions::BUTTONS.len();
+    if n == 0 {
+        return;
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+    let per_row = 5usize;
+    let in_menu = app.focus == Focus::Actions && app.focus_mode == FocusMode::In;
+    for (row_idx, row_area) in [rows[1], rows[2]].iter().enumerate() {
+        let mut spans: Vec<Span> = Vec::new();
+        let mut used = 0usize;
+        let max_w = row_area.width as usize;
+        let start = row_idx * per_row;
+        let end = (start + per_row).min(n);
+        for i in start..end {
+            let (icon, label) = actions::BUTTONS[i];
+            let text = format!(" [{}] {} ", icon, label);
+            let w = text.chars().count();
+            if used + w > max_w {
+                spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+                break;
+            }
+            let style = if in_menu && i == app.action_idx {
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            spans.push(Span::styled(text, style));
+            used += w;
+        }
+        f.render_widget(Paragraph::new(Line::from(spans)), *row_area);
+    }
 }
 
 fn draw_statusbar(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
@@ -221,13 +238,15 @@ fn draw_input_line(app: &App, f: &mut ratatui::Frame, status: Rect) {
     if app.input_mode != InputMode::Cmd {
         return;
     }
-    // prefix：add / edit / config 循环
     let prefix = match (&app.prompt_target, &app.input_buf) {
         (Some(t), _) => format!("{}> ", t.label()),
-        (None, s) if s.starts_with("add ") || s.starts_with("edit ") => {
-            let cmd = if s.starts_with("add ") { "add> " } else { "edit> " };
-            cmd.to_string()
-        }
+        (None, s) if s.starts_with("add ") => "add> ".into(),
+        (None, s) if s.starts_with("edit ") => "edit> ".into(),
+        (None, s) if s.starts_with("interval ") => "interval> ".into(),
+        (None, s) if s.starts_with("webhook ") => "webhook> ".into(),
+        (None, s) if s.starts_with("quiet ") => "quiet> ".into(),
+        (None, s) if s.starts_with("phone ") => "phone> ".into(),
+        (None, s) if s.starts_with("report ") => "report> ".into(),
         (None, _) => "input> ".into(),
     };
     let row = status.y.saturating_sub(1);
@@ -258,10 +277,16 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
+            "布局：",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  左：watches    右上：details    右下：logs    底：menu (全局按钮)"),
+        Line::from(""),
+        Line::from(Span::styled(
             "Top 模式（标题栏写 TOP）：",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  ←/→ 选区块（Watches/Detail/Events/Actions）"),
+        Line::from("  ←/→ 选区块（Watches/Detail/Logs/Menu）"),
         Line::from("  ↓ 或 Enter 进入当前区块（→ In 模式）"),
         Line::from("  Esc / q / Ctrl+C 退出"),
         Line::from(""),
@@ -269,14 +294,24 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
             "In 模式（标题栏写 IN）：",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Watches: ↑/↓ 切 watch；Enter 无操作（已 In）"),
+        Line::from("  Watches: ↑/↓ 切 watch"),
         Line::from("  Detail:  ↑/↓ / ←/→ 切 per-watch 按钮；Enter 触发"),
-        Line::from("          [◉ 启停] [~ 影院] [~ 日期] [~ 间隔] [r 检查] [- 删除]"),
-        Line::from("  Events:  ↑/↓ 滚事件"),
-        Line::from("  Actions: ←/→/↑/↓ 切按钮；Enter 触发"),
+        Line::from("           [◉ 启停] [~ 影院] [~ 日期] [~ 间隔] [r 检查] [- 删除]"),
+        Line::from("  Logs:    ↑/↓ 滚事件（最近 12 条）"),
+        Line::from("  Menu:    ←/→ 切全局按钮；Enter 触发"),
         Line::from("  Esc 退回 Top；Tab 跳下一区块并保持 In"),
         Line::from(""),
-        Line::from(Span::styled("其它：", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "Menu 全局按钮：",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  [A] 添加  [D] 删除当前  [R] 立即检查  [I] 间隔  [W] webhook"),
+        Line::from("  [Q] 静默  [P] 手机      [H] 报告      [?] 帮助  [q] 退出"),
+        Line::from(""),
+        Line::from(Span::styled(
+            "其它：",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
         Line::from("  ? 切换本覆盖层"),
         Line::from("  q / Ctrl+C 干净退出（Discord 收到「已停止 🛑」）"),
         Line::from(Span::styled(

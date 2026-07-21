@@ -307,7 +307,7 @@ impl Monitor {
         Ok(Self {
             shared: Arc::new(SharedState {
                 cfg: StdMutex::new(cfg),
-                events: StdMutex::new(VecDeque::with_capacity(64)),
+                events: StdMutex::new(VecDeque::with_capacity(12)),
                 stats: StdMutex::new(Stats {
                     started_at,
                     check_count: 0,
@@ -346,7 +346,8 @@ impl Monitor {
         let ts = chrono::Local::now().format("%H:%M:%S");
         let entry = format!("[{}] {}", ts, line);
         let mut q = self.shared.events.lock().unwrap();
-        if q.len() >= 64 {
+        // 仅保留最近 12 条，避免高频推送导致队列爆炸
+        if q.len() >= 12 {
             q.pop_back();
         }
         q.push_front(entry);

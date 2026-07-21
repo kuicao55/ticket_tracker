@@ -5,14 +5,17 @@
 
 use crate::tui::{cmd, App, ConfirmPrompt, InputMode, PromptTarget};
 
-/// Action Bar 按钮定义。长度 = 8。
+/// 底部 Menu Bar：全部是**全局动作**。per-watch 动作（如启停单条、删除单条）
+/// 全部放在 Detail 列内的 per-watch 按钮行；这里不放。
 pub const BUTTONS: &[(&str, &str)] = &[
-    ("+", "添加"),
-    ("-", "删除"),
-    ("~", "编辑"),
-    ("◉", "启停"),
-    ("r", "立即检查"),
-    ("⚙", "配置"),
+    ("A", "添加"),       // add watch (global)
+    ("D", "删除"),       // delete current watch (or dialog if none selected)
+    ("R", "立即检查"),   // force check all
+    ("I", "间隔"),       // global check_interval
+    ("W", "webhook"),    // global discord_webhook
+    ("Q", "静默"),       // global quiet_window
+    ("P", "手机"),       // global phone_only_window
+    ("H", "报告"),       // global heartbeat_interval_sec
     ("?", "帮助"),
     ("q", "退出"),
 ];
@@ -33,64 +36,66 @@ pub fn dispatch(app: &mut App) {
         0 => {
             // 添加 watch：开 prompt，让用户输入 `<movie_id> [-c ...] [-d ...] [--name ...]`
             app.input_mode = InputMode::Cmd;
-            app.prompt_target = None; // 不是配置循环
+            app.prompt_target = None;
             app.input_buf = "add ".into();
             cmd::push_status(app, "请输入 watch 参数：movie_id [-c cinema ...] [-d date ...] [--name ...]".into(), 8);
         }
         1 => {
-            // 删除：confirm
+            // 删除当前 watch（走 confirm）
             if let Some(wid) = cmd::current_wid(app) {
                 app.confirm = Some(ConfirmPrompt {
                     text: format!("删 watch {} ? (y/n)", wid),
                     created_at: std::time::Instant::now(),
                 });
             } else {
-                cmd::push_status(app, "没有选中 watch，无法删除".into(), 3);
+                cmd::push_status(app, "没有选中 watch，请先在左栏选一条".into(), 3);
             }
         }
         2 => {
-            // 编辑：开 prompt，预填 wid
-            if let Some(wid) = cmd::current_wid(app) {
-                app.input_mode = InputMode::Cmd;
-                app.prompt_target = None;
-                app.input_buf = format!("edit {} ", wid);
-                cmd::push_status(app, format!("编辑 watch {} —— 语法：edit <wid> <field> <value>", wid), 8);
-            } else {
-                cmd::push_status(app, "没有选中 watch，无法编辑".into(), 3);
-            }
-        }
-        3 => {
-            // 启停：直接调 toggle 命令
-            let cmd_str = "toggle";
-            cmd::execute(app, cmd_str);
-        }
-        4 => {
-            // 立即检查
-            app.monitor.force_check();
+            // 立即检查（全局 force_check_all）
+            app.monitor.force_check_all();
             cmd::push_event(app, "· 手动触发一轮检查…".into());
             cmd::push_status(app, "已触发立即检查".into(), 3);
         }
+        3 => {
+            // 全局检查间隔
+            open_global_prompt(app, "interval", "检查间隔（秒）", true);
+        }
+        4 => {
+            // 全局 Discord webhook
+            open_global_prompt(app, "webhook", "Discord webhook URL（留空=clear）", false);
+        }
         5 => {
-            // 配置：循环推进 prompt_target 到第一项
-            app.input_mode = InputMode::Cmd;
-            app.prompt_target = Some(PromptTarget::Webhook);
-            app.input_buf.clear();
-            cmd::push_status(
-                app,
-                format!("配置项：当前 = {}（回车提交 → 跳下一项，Esc 退出）", PromptTarget::Webhook.label()),
-                8,
-            );
+            // 全局静默时段
+            open_global_prompt(app, "quiet", "静默时段 HH:MM-HH:MM", true);
         }
         6 => {
+            // 全局只推手机时段
+            open_global_prompt(app, "phone", "只推手机时段 HH:MM-HH:MM", true);
+        }
+        7 => {
+            // 全局报告间隔
+            open_global_prompt(app, "report", "Discord 报告间隔（秒）", true);
+        }
+        8 => {
             // 帮助
             app.show_help = !app.show_help;
         }
-        7 => {
+        9 => {
             // 退出
             app.should_quit = true;
         }
         _ => {}
     }
+}
+
+/// 全局 cfg 字段编辑：开 prompt，buf 预填 "<cmd> "。
+/// `prefill_current` = true 时尝试从 cfg 读当前值作为 hint（不写到 buf，仅给提示用）。
+fn open_global_prompt(app: &mut App, cmd_name: &str, hint: &str, _prefill_current: bool) {
+    app.input_mode = InputMode::Cmd;
+    app.prompt_target = None;
+    app.input_buf = format!("{} ", cmd_name);
+    cmd::push_status(app, format!("{} —— 输入新值，回车提交，Esc 取消", hint), 8);
 }
 
 /// prompt 期间 Enter 提交时调用：把 input_buf 翻译成 `cmd::execute(...)` 调用。

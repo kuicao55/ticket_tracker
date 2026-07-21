@@ -65,7 +65,7 @@ pub fn push_event(app: &mut App, line: String) {
     // 真实事件线也同步写入 monitor 的 events 队列（同步 lock，不 await）
     {
         let mut q = app.monitor.shared.events.lock().unwrap();
-        if q.len() >= 64 {
+        if q.len() >= 12 {
             q.pop_back();
         }
         q.push_front(entry_for_events);
