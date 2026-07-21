@@ -21,6 +21,7 @@ use serde_json::Value;
 use std::io::Stdout;
 
 use super::{actions, panes, App, Focus, FocusMode, InputMode};
+use ratatui::layout::Margin;
 
 pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     let area = f.area();
@@ -34,7 +35,7 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
                 Constraint::Length(if area.height >= 8 { 6 } else { 3 }), // watches
                 Constraint::Length(if area.height >= 8 { 4 } else { 2 }), // details
                 Constraint::Min(1),                                        // logs
-                Constraint::Length(3),                                     // menu
+                Constraint::Length(4),                                     // menu（带边框）
                 Constraint::Length(1),                                     // status
             ])
             .split(area);
@@ -66,7 +67,7 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
         .constraints([
             Constraint::Length(1), // header
             Constraint::Min(6),    // body
-            Constraint::Length(3), // menu（标题 + 两行按钮）
+            Constraint::Length(4), // menu（border 顶 + 2 行按钮 + border 底）
             Constraint::Length(1), // status
         ])
         .split(area);
@@ -149,38 +150,45 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-/// 底部菜单栏：标题 + 两行按钮（5 个 / 行）。
+/// 底部菜单栏：Borders::ALL 包裹 + 标题 + 两行按钮（5 个 / 行）。
+/// 与 watches / detail / logs 视觉一致。
 fn draw_menu(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-    // 第 1 行：标题
-    let title = Line::from(vec![
-        Span::styled("─ ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            "menu (全局)",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "←/→ 切换 · Enter 触发",
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::styled(" ─", Style::default().fg(Color::DarkGray)),
-    ]);
-    f.render_widget(Paragraph::new(title), rows[0]);
+    let in_menu_focus = app.focus == Focus::Actions;
+    // Top 模式聚焦：黄色边框；In 模式聚焦：青色边框；未聚焦：深灰
+    let border_style = if in_menu_focus && app.focus_mode == FocusMode::In {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else if in_menu_focus {
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border_style)
+        .title(Span::styled(" menu (全局) ", border_style));
+    f.render_widget(block, area);
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
 
-    // 第 2-3 行：按钮按顺序排，一行 5 个；当前按钮高亮
+    // inner 区两行按钮
     let n = actions::BUTTONS.len();
     if n == 0 {
         return;
     }
-    let per_row = 5usize;
-    let in_menu = app.focus == Focus::Actions && app.focus_mode == FocusMode::In;
-    for (row_idx, row_area) in [rows[1], rows[2]].iter().enumerate() {
+    let button_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+    let per_row = n.div_ceil(2);
+    let in_menu_in = in_menu_focus && app.focus_mode == FocusMode::In;
+    for (row_idx, row_area) in button_rows.iter().enumerate() {
         let mut spans: Vec<Span> = Vec::new();
         let mut used = 0usize;
         let max_w = row_area.width as usize;
@@ -194,7 +202,7 @@ fn draw_menu(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
                 spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
                 break;
             }
-            let style = if in_menu && i == app.action_idx {
+            let style = if in_menu_in && i == app.action_idx {
                 Style::default()
                     .bg(Color::Cyan)
                     .fg(Color::Black)

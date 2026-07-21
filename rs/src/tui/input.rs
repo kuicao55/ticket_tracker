@@ -92,7 +92,8 @@ fn handle_top_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// In 模式：方向键在当前区块子内容里操作；Enter 触发；Esc 退回 Top。
+/// In 模式：方向键在当前区块子内容里操作；Enter 触发；Esc 退回 Top；
+/// Tab / BackTab 在两个模式下都能切区块（保留 In 状态）。
 fn handle_in_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     let no_ctrl = !key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -100,6 +101,15 @@ fn handle_in_mode(app: &mut App, key: KeyEvent) -> Result<()> {
             // 退回 Top 模式
             app.focus_mode = FocusMode::Top;
             app.status_msg = None;
+            return Ok(());
+        }
+        // Tab / BackTab 在 In 模式也能切区块（这样 user 在 Watches In 也能用 Tab 到 Menu）
+        KeyCode::Tab => {
+            app.focus = app.focus.next();
+            return Ok(());
+        }
+        KeyCode::BackTab => {
+            app.focus = app.focus.prev();
             return Ok(());
         }
         KeyCode::Char('?') => {

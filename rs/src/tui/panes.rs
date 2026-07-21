@@ -8,7 +8,7 @@
 //! - detail（右上：watch 全部信息 + per-watch 按钮行）
 //! - logs（右下：最近 12 条事件）
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Margin, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
@@ -136,26 +136,34 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
             .border_style(border(focused))
             .title(Span::styled(" detail ", border(focused))),
     };
+
+    // 先画外框（border + title）—— 与 watches/logs 一致
+    f.render_widget(body_block.clone(), area);
+    let inner = area.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+
     if watch_opt.is_none() {
         let empty = Paragraph::new(Line::from(Span::styled(
             "（请在左栏选一条 watch）",
             Style::default().fg(Color::DarkGray),
         )))
-        .block(body_block)
+        .block(Block::default().borders(Borders::NONE))
         .wrap(Wrap { trim: false });
-        f.render_widget(empty, area);
+        f.render_widget(empty, inner);
         return;
     }
     let w = watch_opt.unwrap();
 
-    // 两段：info (Min) / 按钮行 (Length 3)
+    // inner 区两段：info (Min) / 按钮行 (Length 3)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),    // info 区（含影院列表，按影院数自动撑开）
             Constraint::Length(3), // 操作按钮行（标题 + 2 行按钮）
         ])
-        .split(area);
+        .split(inner);
 
     // ---- 详情文本：影院列表 id+name ----
     let mid = w.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
