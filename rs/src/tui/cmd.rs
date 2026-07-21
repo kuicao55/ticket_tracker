@@ -55,12 +55,20 @@ pub fn execute(app: &mut App, line: &str) {
 fn push_event(app: &mut App, line: String) {
     let ts = chrono::Local::now().format("%H:%M:%S").to_string();
     let entry = format!("[{}] {}", ts, line);
-    if let Ok(q) = app.monitor.try_lock() {
-        // 简化：推事件是异步的；这里只更新状态栏文案
-        let _ = q;
-    }
+    // 直接走 events_snapshot 的位置（这里只是状态栏文案提示，monitor 跑在
+    // 独立线程）。保留 entry 给状态栏用；
+    let entry_for_events = entry.clone();
     app.status_msg = Some(entry);
-    app.status_msg_until = Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    app.status_msg_until =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(5));
+    // 真实事件线也同步写入 monitor 的 events 队列（同步 lock，不 await）
+    {
+        let mut q = app.monitor.shared.events.lock().unwrap();
+        if q.len() >= 64 {
+            q.pop_back();
+        }
+        q.push_front(entry_for_events);
+    }
 }
 
 fn cmd_run(_app: &mut App) -> Result<String, String> {

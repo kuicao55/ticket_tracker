@@ -11,12 +11,12 @@
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use serde_json::{json, Value};
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
 use crate::config;
 use crate::maoyan;
@@ -236,10 +236,17 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
 
 // ----------------- Monitor 主循环 -----------------
 
+/// Monitor 共享状态：cfg/events/stats 用 `std::sync::Mutex` 包装，并通过
+/// `Arc` 让 TUI 的渲染线程可以**零 async** 地读，避免 tokio::sync::Mutex 被
+/// run() 永久占用导致 try_lock 永远失败的旧 bug。
+pub struct SharedState {
+    pub cfg: StdMutex<Value>,
+    pub events: StdMutex<VecDeque<String>>,
+    pub stats: StdMutex<Stats>,
+}
+
 pub struct Monitor {
-    pub cfg: Value,
-    pub events: Arc<Mutex<VecDeque<String>>>,
-    pub stats: Arc<Mutex<Stats>>,
+    pub shared: Arc<SharedState>,
     stop: Arc<Notify>,
     force_flag: Arc<AtomicBool>,
     #[allow(dead_code)]
@@ -255,9 +262,8 @@ pub struct Stats {
 
 impl Monitor {
     pub fn new(watch_filter: Option<Vec<String>>) -> Result<Self> {
-        let cfg = config::load_or_init()?;
+        let mut cfg = config::load_or_init()?;
         // 应用 watch_filter：只保留指定的 watch id
-        let mut cfg = cfg;
         if let Some(ref ids) = watch_filter {
             let id_set: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
             if let Some(arr) = cfg.get_mut("watches").and_then(|v| v.as_array_mut()) {
@@ -274,23 +280,46 @@ impl Monitor {
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
         Ok(Self {
-            cfg,
-            events: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
-            stats: Arc::new(Mutex::new(Stats {
-                started_at,
-                check_count: 0,
-                per_watch_last: HashMap::new(),
-            })),
+            shared: Arc::new(SharedState {
+                cfg: StdMutex::new(cfg),
+                events: StdMutex::new(VecDeque::with_capacity(64)),
+                stats: StdMutex::new(Stats {
+                    started_at,
+                    check_count: 0,
+                    per_watch_last: HashMap::new(),
+                }),
+            }),
             stop: Arc::new(Notify::new()),
             force_flag: Arc::new(AtomicBool::new(false)),
             watch_filter: watch_filter.unwrap_or_default(),
         })
     }
 
+    /// TUI 线程用：拿 cfg 的**快照**（cheap clone）。
+    pub fn cfg_snapshot(&self) -> Value {
+        self.shared.cfg.lock().unwrap().clone()
+    }
+
+    /// TUI 线程用：拿 events 的**快照**。
+    pub fn events_snapshot(&self) -> Vec<String> {
+        self.shared
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// TUI 线程用：拿 stats 的**快照**。
+    pub fn stats_snapshot(&self) -> Stats {
+        self.shared.stats.lock().unwrap().clone()
+    }
+
     pub async fn push_event(&self, line: String) {
         let ts = chrono::Local::now().format("%H:%M:%S");
         let entry = format!("[{}] {}", ts, line);
-        let mut q = self.events.lock().await;
+        let mut q = self.shared.events.lock().unwrap();
         if q.len() >= 64 {
             q.pop_back();
         }
@@ -305,41 +334,47 @@ impl Monitor {
         self.force_flag.store(true, Ordering::SeqCst);
     }
 
-    pub async fn run(&mut self) {
+    pub async fn run(&self) {
         // 预先快照所有 cfg 字段（owned），避免后续可变借用冲突
-        let n = self
-            .cfg
-            .get("watches")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
-        let interval = self
-            .cfg
-            .get("check_interval")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(90);
-        let quiet_w = self
-            .cfg
-            .get("quiet_window")
-            .and_then(|v| v.as_str())
-            .unwrap_or("01:00-06:00")
-            .to_string();
-        let phone_w = self
-            .cfg
-            .get("phone_only_window")
-            .and_then(|v| v.as_str())
-            .unwrap_or("06:00-09:00")
-            .to_string();
-        let webhook: Option<String> = self
-            .cfg
-            .get("discord_webhook")
-            .and_then(|v| v.as_str())
-            .map(String::from);
-        let hb_interval = self
-            .cfg
-            .get("heartbeat_interval_sec")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(3600);
+        let n = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("watches")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
+        };
+        let interval = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("check_interval")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(90)
+        };
+        let quiet_w = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("quiet_window")
+                .and_then(|v| v.as_str())
+                .unwrap_or("01:00-06:00")
+                .to_string()
+        };
+        let phone_w = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("phone_only_window")
+                .and_then(|v| v.as_str())
+                .unwrap_or("06:00-09:00")
+                .to_string()
+        };
+        let webhook: Option<String> = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("discord_webhook")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+        let hb_interval = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("heartbeat_interval_sec")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(3600)
+        };
 
         let msg = if n == 0 {
             "无监视项。请 tt watch add 或在 TUI 里按 a 添加。".to_string()
@@ -379,7 +414,7 @@ impl Monitor {
 
             let did = self.tick(mode, force).await;
             if did {
-                let mut s = self.stats.lock().await;
+                let mut s = self.shared.stats.lock().unwrap();
                 s.check_count += 1;
             }
 
@@ -389,12 +424,13 @@ impl Monitor {
 
             // heartbeat
             if last_heartbeat.elapsed() >= Duration::from_secs(hb_interval) {
-                let any_enabled = self
-                    .cfg
-                    .get("watches")
-                    .and_then(|v| v.as_array())
-                    .map(|a| a.iter().any(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)))
-                    .unwrap_or(false);
+                let any_enabled = {
+                    let g = self.shared.cfg.lock().unwrap();
+                    g.get("watches")
+                        .and_then(|v| v.as_array())
+                        .map(|a| a.iter().any(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)))
+                        .unwrap_or(false)
+                };
                 if any_enabled {
                     self.send_heartbeat().await;
                 }
@@ -409,16 +445,25 @@ impl Monitor {
         }
 
         // 已停止推送
-        let started = self.stats.lock().await.started_at;
+        let started = self.shared.stats.lock().unwrap().started_at;
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0)
             - started;
         let uptime = format_uptime(elapsed as u64);
-        let check_count = self.stats.lock().await.check_count;
+        let check_count = self.shared.stats.lock().unwrap().check_count;
+        let webhook_final = {
+            self.shared
+                .cfg
+                .lock()
+                .unwrap()
+                .get("discord_webhook")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
         let _ = notify::notify_discord_async(
-            self.cfg.get("discord_webhook").and_then(|v| v.as_str()),
+            webhook_final.as_deref(),
             "ticket-tracker 已停止 🛑",
             &format!("运行时长 {}｜累计检查 {} 次", uptime, check_count),
             None,
@@ -434,37 +479,40 @@ impl Monitor {
     }
 
     fn effective_interval_secs(&self) -> u64 {
-        let default = self
-            .cfg
-            .get("check_interval")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(90);
-        let enabled: Vec<&Value> = self
-            .cfg
-            .get("watches")
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter()
-                    .filter(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
-                    .collect()
-            })
-            .unwrap_or_default();
-        if enabled.is_empty() {
+        // 一次性 lock、立刻拷贝所有权，绝不跨 await 持有
+        let (default, intervals): (u64, Vec<Option<u64>>) = {
+            let g = self.shared.cfg.lock().unwrap();
+            let def = g
+                .get("check_interval")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(90);
+            let ints: Vec<Option<u64>> = g
+                .get("watches")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter(|w| {
+                            w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
+                        })
+                        .filter_map(|w| w.get("interval").and_then(|v| v.as_u64()))
+                        .map(Some)
+                        .collect()
+                })
+                .unwrap_or_default();
+            (def, ints)
+        };
+        if intervals.is_empty() {
             return default;
         }
-        enabled
-            .iter()
-            .filter_map(|w| {
-                w.get("interval")
-                    .and_then(|v| v.as_u64())
-                    .or(Some(default))
-            })
+        intervals
+            .into_iter()
+            .flatten()
             .min()
             .unwrap_or(default)
     }
 
     /// 主 tick 一轮
-    async fn tick(&mut self, mode: config::Mode, force: bool) -> bool {
+    async fn tick(&self, mode: config::Mode, force: bool) -> bool {
         let mut any_done = false;
         let mut cinema_cache: HashMap<String, Value> = HashMap::new();
         let now = SystemTime::now()
@@ -473,21 +521,23 @@ impl Monitor {
             .unwrap_or(0.0);
 
         // 一次性克隆所有 watch（避免借用 cfg 同时改 cfg）
-        let watch_count = self
-            .cfg
-            .get("watches")
-            .and_then(|v| v.as_array())
-            .map(|a| a.len())
-            .unwrap_or(0);
+        let watch_count = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("watches")
+                .and_then(|v| v.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
+        };
 
         for i in 0..watch_count {
             // 拿 watch 的 clone
-            let Some(watch) = self
-                .cfg
-                .get("watches")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.get(i).cloned())
-            else {
+            let watch_opt = {
+                let g = self.shared.cfg.lock().unwrap();
+                g.get("watches")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.get(i).cloned())
+            };
+            let Some(watch) = watch_opt else {
                 continue;
             };
             if !watch.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
@@ -499,7 +549,7 @@ impl Monitor {
             if !force {
                 let w_interval = watch.get("interval").and_then(|v| v.as_u64());
                 if let Some(secs) = w_interval {
-                    let mut s = self.stats.lock().await;
+                    let mut s = self.shared.stats.lock().unwrap();
                     let last = s.per_watch_last.get(&wid).copied().unwrap_or(0.0);
                     if (now - last) < secs as f64 {
                         drop(s);
@@ -519,23 +569,26 @@ impl Monitor {
             let label = format!("{}({})", info.name, movie_id);
 
             // 写 _last_status / _last_payload
-            if let Some(arr) = self.cfg.get_mut("watches").and_then(|v| v.as_array_mut()) {
-                if let Some(w) = arr.get_mut(i) {
-                    w["_last_status"] = json!(status_code);
-                    // _last_payload: 与 Python 字段对齐
-                    w["_last_payload"] = json!({
-                        "name": info.name,
-                        "matches": info.matches.iter().map(|m| json!({
-                            "cinema_id": m.cinema_id,
-                            "cinema_name": m.cinema_name,
-                            "show_count": m.show_count,
-                            "earliest": m.earliest,
-                            "latest": m.latest,
-                        })).collect::<Vec<_>>(),
-                        "cinema_names": info.cinema_names,
-                        "show_dates": info.show_dates,
-                        "errors": info.errors.iter().map(|(a,b)| json!([a,b])).collect::<Vec<_>>(),
-                    });
+            {
+                let mut g = self.shared.cfg.lock().unwrap();
+                if let Some(arr) = g.get_mut("watches").and_then(|v| v.as_array_mut()) {
+                    if let Some(w) = arr.get_mut(i) {
+                        w["_last_status"] = json!(status_code);
+                        // _last_payload: 与 Python 字段对齐
+                        w["_last_payload"] = json!({
+                            "name": info.name,
+                            "matches": info.matches.iter().map(|m| json!({
+                                "cinema_id": m.cinema_id,
+                                "cinema_name": m.cinema_name,
+                                "show_count": m.show_count,
+                                "earliest": m.earliest,
+                                "latest": m.latest,
+                            })).collect::<Vec<_>>(),
+                            "cinema_names": info.cinema_names,
+                            "show_dates": info.show_dates,
+                            "errors": info.errors.iter().map(|(a,b)| json!([a,b])).collect::<Vec<_>>(),
+                        });
+                    }
                 }
             }
 
@@ -558,15 +611,16 @@ impl Monitor {
                 .await;
                 for m in &info.matches {
                     let cid = &m.cinema_id;
-                    let already = self
-                        .cfg
-                        .get("watches")
-                        .and_then(|v| v.as_array())
-                        .and_then(|a| a.get(i))
-                        .and_then(|w| w.get("fired_cinemas"))
-                        .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().any(|x| x.as_str() == Some(cid.as_str())))
-                        .unwrap_or(false);
+                    let already = {
+                        let g = self.shared.cfg.lock().unwrap();
+                        g.get("watches")
+                            .and_then(|v| v.as_array())
+                            .and_then(|a| a.get(i))
+                            .and_then(|w| w.get("fired_cinemas"))
+                            .and_then(|v| v.as_array())
+                            .map(|arr| arr.iter().any(|x| x.as_str() == Some(cid.as_str())))
+                            .unwrap_or(false)
+                    };
                     if already {
                         continue;
                     }
@@ -575,46 +629,62 @@ impl Monitor {
                         "{}｜{}：{} 场｜{} 至 {}",
                         info.name, m.cinema_name, m.show_count, m.earliest, m.latest
                     );
+                    let webhook = {
+                        let g = self.shared.cfg.lock().unwrap();
+                        g.get("discord_webhook")
+                            .and_then(|v| v.as_str())
+                            .map(String::from)
+                    };
                     let _ = notify::notify_discord_async(
-                        self.cfg.get("discord_webhook").and_then(|v| v.as_str()),
+                        webhook.as_deref(),
                         "预售开启 🎬",
                         &alert,
                         Some(&buy_url),
                     )
                     .await;
                     if mode == config::Mode::Normal {
-                        let dur = self
-                            .cfg
-                            .get("alert_duration_sec")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(60);
+                        let dur = {
+                            let g = self.shared.cfg.lock().unwrap();
+                            g.get("alert_duration_sec")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(60)
+                        };
                         notify::notify_macos("预售开启 🎬", &alert, true, Some(&buy_url), dur);
                     }
-                    let _ = config::mark_presale_fired(&mut self.cfg, &wid, cid);
+                    // 在 cfg 上记 fired
+                    {
+                        let mut g = self.shared.cfg.lock().unwrap();
+                        let _ = config::mark_presale_fired(&mut g, &wid, cid);
+                    }
                 }
                 // 自动停用
-                let all_cinemas: std::collections::HashSet<String> = self
-                    .cfg
-                    .get("watches")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.get(i))
-                    .and_then(|w| w.get("cinemas"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
-                let fired_set: std::collections::HashSet<String> = self
-                    .cfg
-                    .get("watches")
-                    .and_then(|v| v.as_array())
-                    .and_then(|a| a.get(i))
-                    .and_then(|w| w.get("fired_cinemas"))
-                    .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-                    .unwrap_or_default();
+                let all_cinemas: std::collections::HashSet<String> = {
+                    let g = self.shared.cfg.lock().unwrap();
+                    g.get("watches")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.get(i))
+                        .and_then(|w| w.get("cinemas"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default()
+                };
+                let fired_set: std::collections::HashSet<String> = {
+                    let g = self.shared.cfg.lock().unwrap();
+                    g.get("watches")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.get(i))
+                        .and_then(|w| w.get("fired_cinemas"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .unwrap_or_default()
+                };
                 if !all_cinemas.is_empty() && all_cinemas.is_subset(&fired_set) {
-                    if let Some(arr) = self.cfg.get_mut("watches").and_then(|v| v.as_array_mut()) {
-                        if let Some(w) = arr.get_mut(i) {
-                            w["enabled"] = json!(false);
+                    {
+                        let mut g = self.shared.cfg.lock().unwrap();
+                        if let Some(arr) = g.get_mut("watches").and_then(|v| v.as_array_mut()) {
+                            if let Some(w) = arr.get_mut(i) {
+                                w["enabled"] = json!(false);
+                            }
                         }
                     }
                     self.push_event(format!(
@@ -651,20 +721,23 @@ impl Monitor {
             }
         }
 
-        let _ = config::save(&self.cfg);
+        let snapshot = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.clone()
+        };
+        let _ = config::save(&snapshot);
         any_done
     }
 
-    async fn send_heartbeat(&mut self) {
+    async fn send_heartbeat(&self) {
         let mut enabled: Vec<Value> = Vec::new();
-        if let Some(arr) = self
-            .cfg
-            .get("watches")
-            .and_then(|v| v.as_array())
         {
-            for w in arr {
-                if w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
-                    enabled.push(w.clone());
+            let g = self.shared.cfg.lock().unwrap();
+            if let Some(arr) = g.get("watches").and_then(|v| v.as_array()) {
+                for w in arr {
+                    if w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+                        enabled.push(w.clone());
+                    }
                 }
             }
         }
@@ -676,31 +749,36 @@ impl Monitor {
         } else {
             "✅ 例行报告（未开售）"
         };
+        let started_at = self.shared.stats.lock().unwrap().started_at;
         let elapsed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0)
-            - self.stats.lock().await.started_at;
+            - started_at;
         let uptime = format_uptime(elapsed as u64);
         let mode_h = chrono::Local::now().format("%H").to_string();
         let hour: u32 = mode_h.parse().unwrap_or(0);
-        let qw = self
-            .cfg
-            .get("quiet_window")
-            .and_then(|v| v.as_str())
-            .unwrap_or("01:00-06:00");
-        let pw = self
-            .cfg
-            .get("phone_only_window")
-            .and_then(|v| v.as_str())
-            .unwrap_or("06:00-09:00");
-        let mode = config::current_mode(qw, pw, hour).unwrap_or(config::Mode::Normal);
+        let (qw, pw) = {
+            let g = self.shared.cfg.lock().unwrap();
+            let qw = g
+                .get("quiet_window")
+                .and_then(|v| v.as_str())
+                .unwrap_or("01:00-06:00")
+                .to_string();
+            let pw = g
+                .get("phone_only_window")
+                .and_then(|v| v.as_str())
+                .unwrap_or("06:00-09:00")
+                .to_string();
+            (qw, pw)
+        };
+        let mode = config::current_mode(&qw, &pw, hour).unwrap_or(config::Mode::Normal);
         let mode_label = match mode {
             config::Mode::Normal => "正常",
             config::Mode::PhoneOnly => "只推手机",
             config::Mode::Quiet => "静默",
         };
-        let check_count = self.stats.lock().await.check_count;
+        let check_count = self.shared.stats.lock().unwrap().check_count;
         let mut lines = vec![format!(
             "⏱ {}｜🔍 {} 次｜📡 {}｜活跃 {} 条",
             uptime,
@@ -715,13 +793,13 @@ impl Monitor {
             lines.push(watch_summary_line(w));
         }
         let body = lines.join("\n");
-        let _ = notify::notify_discord_async(
-            self.cfg.get("discord_webhook").and_then(|v| v.as_str()),
-            title,
-            &body,
-            None,
-        )
-        .await;
+        let webhook = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("discord_webhook")
+                .and_then(|v| v.as_str())
+                .map(String::from)
+        };
+        let _ = notify::notify_discord_async(webhook.as_deref(), title, &body, None).await;
     }
 }
 

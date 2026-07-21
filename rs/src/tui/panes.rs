@@ -1,4 +1,7 @@
 //! 左 / 中 / 右 pane 渲染。
+//!
+//! 所有 monitor 数据通过 `cfg_snapshot()` / `events_snapshot()` 拿 cheap 副本，
+//! 完全不持有 monitor 锁，渲染零阻塞。
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -40,51 +43,44 @@ fn status_color(code: Option<&str>) -> Color {
 
 pub fn draw_watches(app: &mut App, f: &mut Frame, area: Rect) {
     let focused = app.focus == Focus::Watches;
-    let title = match app.monitor.try_lock() {
-        Ok(m) => {
-            let cfg = m.cfg.clone();
-            let n = cfg
-                .get("watches")
-                .and_then(|v| v.as_array())
-                .map(|a| a.len())
-                .unwrap_or(0);
-            format!(" watches ({}) ", n)
-        }
-        Err(_) => " watches ".to_string(),
-    };
+    let cfg = app.monitor.cfg_snapshot();
+    let n = cfg
+        .get("watches")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    let title = format!(" watches ({}) ", n);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border(focused))
         .title(Span::styled(title, border(focused)));
-    let items: Vec<ListItem> = match app.monitor.try_lock() {
-        Ok(m) => {
-            let cfg = m.cfg.clone();
-            cfg.get("watches")
-                .and_then(|v| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .map(|w| {
-                            let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
-                            let en = w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-                            let code = w.get("_last_status").and_then(|v| v.as_str());
-                            let mark = if en { "×" } else { " " };
-                            let icon = status_icon(code);
-                            let line = Line::from(vec![
-                                Span::styled(format!("{}", icon), Style::default().fg(status_color(code))),
-                                Span::raw(" "),
-                                Span::styled(id.to_string(), Style::default().fg(if en { Color::White } else { Color::DarkGray })),
-                                Span::raw(" "),
-                                Span::raw(mark),
-                            ]);
-                            ListItem::new(line)
-                        })
-                        .collect()
+    let items: Vec<ListItem> = cfg
+        .get("watches")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .map(|w| {
+                    let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                    let en = w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+                    let code = w.get("_last_status").and_then(|v| v.as_str());
+                    let mark = if en { "×" } else { " " };
+                    let icon = status_icon(code);
+                    let line = Line::from(vec![
+                        Span::styled(icon.to_string(), Style::default().fg(status_color(code))),
+                        Span::raw(" "),
+                        Span::styled(
+                            id.to_string(),
+                            Style::default().fg(if en { Color::White } else { Color::DarkGray }),
+                        ),
+                        Span::raw(" "),
+                        Span::raw(mark),
+                    ]);
+                    ListItem::new(line)
                 })
-                .unwrap_or_default()
-        }
-        Err(_) => vec![],
-    };
+                .collect()
+        })
+        .unwrap_or_default();
     if items.is_empty() {
         let p = Paragraph::new("")
             .block(block)
@@ -96,23 +92,24 @@ pub fn draw_watches(app: &mut App, f: &mut Frame, area: Rect) {
     state.select(Some(app.watch_idx.min(items.len().saturating_sub(1))));
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut state);
 }
 
 pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
     let focused = app.focus == Focus::Detail;
+    let cfg = app.monitor.cfg_snapshot();
     // 选中 watch
-    let watch_opt: Option<Value> = match app.monitor.try_lock() {
-        Ok(m) => {
-            let cfg = m.cfg.clone();
-            cfg.get("watches")
-                .and_then(|v| v.as_array())
-                .and_then(|a| a.get(app.watch_idx).cloned())
-        }
-        Err(_) => None,
-    };
+    let watch_opt: Option<Value> = cfg
+        .get("watches")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(app.watch_idx).cloned());
     let body_block = match &watch_opt {
         Some(w) => {
             let id = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
@@ -168,11 +165,16 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
     } else {
         dates.join(", ")
     };
-    let interval_str = interval.map(|n| format!("{}s", n)).unwrap_or_else(|| "(default)".into());
+    let interval_str = interval
+        .map(|n| format!("{}s", n))
+        .unwrap_or_else(|| "(default)".into());
     let detail_lines = vec![
         Line::from(vec![
             Span::styled("名称      ", Style::default().fg(Color::DarkGray)),
-            Span::styled(format!("{} ({})", name, mid), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("{} ({})", name, mid),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
         ]),
         Line::from(vec![
             Span::styled("cinemas   ", Style::default().fg(Color::DarkGray)),
@@ -186,16 +188,17 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
             Span::styled("interval  ", Style::default().fg(Color::DarkGray)),
             Span::raw(interval_str),
             Span::raw("   "),
-            Span::styled(if enabled { "✓ enabled" } else { "× disabled" }, Style::default().fg(if enabled { Color::Green } else { Color::DarkGray })),
+            Span::styled(
+                if enabled { "✓ enabled" } else { "× disabled" },
+                Style::default().fg(if enabled { Color::Green } else { Color::DarkGray }),
+            ),
         ]),
         Line::from(vec![
             Span::styled("fired     ", Style::default().fg(Color::DarkGray)),
             Span::raw(format!("{}/{}", fired_n, total_cinemas)),
         ]),
     ];
-    let detail = Paragraph::new(detail_lines).block(
-        Block::default().borders(Borders::NONE),
-    );
+    let detail = Paragraph::new(detail_lines).block(Block::default().borders(Borders::NONE));
     f.render_widget(detail, chunks[0]);
     // 子表
     let header = Row::new(vec![
@@ -227,9 +230,16 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         .borders(Borders::TOP)
         .border_style(border(focused))
         .title(Span::styled(" cinemas ", border(focused)));
-    let table = Table::new(rows, [Constraint::Percentage(50), Constraint::Length(8), Constraint::Percentage(40)])
-        .header(header)
-        .block(sub_block);
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(50),
+            Constraint::Length(8),
+            Constraint::Percentage(40),
+        ],
+    )
+    .header(header)
+    .block(sub_block);
     f.render_widget(table, chunks[1]);
 }
 
@@ -240,28 +250,24 @@ pub fn draw_events(app: &mut App, f: &mut Frame, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(border(focused))
         .title(Span::styled(" events ", border(focused)));
-    let items: Vec<ListItem> = match app.monitor.try_lock() {
-        Ok(m) => {
-            let rt = tokio::runtime::Runtime::new().ok();
-            let items: Vec<ListItem> = if let Some(rt) = rt {
-                rt.block_on(async {
-                    let q = m.events.lock().await;
-                    q.iter().map(|line| ListItem::new(line.clone())).collect::<Vec<_>>()
-                })
-            } else {
-                vec![]
-            };
-            items
-        }
-        Err(_) => vec![],
-    };
+    let items: Vec<ListItem> = app
+        .monitor
+        .events_snapshot()
+        .into_iter()
+        .map(ListItem::new)
+        .collect();
     let mut state = ratatui::widgets::ListState::default();
     if !items.is_empty() {
         state.select(Some(app.event_idx.min(items.len() - 1)));
     }
     let list = List::new(items)
         .block(block)
-        .highlight_style(Style::default().bg(Color::Cyan).fg(Color::Black).add_modifier(Modifier::BOLD))
+        .highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol("> ");
     f.render_stateful_widget(list, area, &mut state);
 }

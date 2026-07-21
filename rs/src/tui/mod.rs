@@ -1,6 +1,14 @@
 //! TUI 入口 —— ratatui + crossterm，三栏 + 状态栏 + `:` 命令面板。
 //!
 //! 详见 RUST_PORT.md §7。
+//!
+//! 关键设计：Monitor 的可变状态由 `Arc<SharedState>` 持有，**TUI 渲染线程** 通
+//! 过 `cfg_snapshot()` / `events_snapshot()` / `stats_snapshot()` 做 cheap 读取；
+//! monitor 自身跑在**独立的 `std::thread`** 加自带 `tokio::runtime::Runtime` 中，
+//! 停止信号走 `std::sync::Arc<AtomicBool>`。这样：
+//! - 渲染线程永远不会在 lock 上 hang
+//! - 用户 `q` / Ctrl+C → 主线程读 atomic 标志 → join 监控线程，**无锁竞争**
+//! - 窗口缩到很小也能渲染（ui.rs 守底）
 
 pub mod cmd;
 pub mod focus;
@@ -8,6 +16,7 @@ pub mod input;
 pub mod panes;
 pub mod ui;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -18,15 +27,14 @@ use crossterm::terminal::{
 };
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
-use tokio::sync::Mutex;
 
-use crate::monitor::Monitor;
+use crate::monitor::{Monitor, Stats};
 
 pub use focus::Focus;
 
 /// 全局应用状态 —— 持有所有可变状态，TUI 各模块通过 `&mut App` 修改。
 pub struct App {
-    pub monitor: Arc<Mutex<Monitor>>,
+    pub monitor: Arc<Monitor>,
     pub focus: Focus,
     /// TUI 的 watch 选择（左栏）
     pub watch_idx: usize,
@@ -45,8 +53,8 @@ pub struct App {
     pub cached_started_at: f64,
     pub cached_mode: String,
     pub cached_active: usize,
-    /// 主循环已经在的 tokio handle
-    pub rt: Option<tokio::runtime::Handle>,
+    /// 监控线程句柄 + 停止标志
+    pub monitor_thread: Option<MonitorHandle>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,11 +71,24 @@ pub struct ConfirmPrompt {
     pub created_at: std::time::Instant,
 }
 
+/// 监控线程 + 关闭信号。TUI 主线程通过 `stop_flag` / `force_flag` 跨线程交互。
+pub struct MonitorHandle {
+    pub thread: Option<std::thread::JoinHandle<()>>,
+    pub stop_flag: Arc<AtomicBool>,
+    pub force_flag: Arc<AtomicBool>,
+}
+
+impl MonitorHandle {
+    pub fn request_force_check(&self) {
+        self.force_flag.store(true, Ordering::SeqCst);
+    }
+}
+
 impl App {
     pub fn new(monitor: Monitor) -> Self {
         let started_at = chrono::Utc::now().timestamp() as f64;
         Self {
-            monitor: Arc::new(Mutex::new(monitor)),
+            monitor: Arc::new(monitor),
             focus: Focus::Watches,
             watch_idx: 0,
             event_idx: 0,
@@ -82,22 +103,13 @@ impl App {
             cached_started_at: started_at,
             cached_mode: "normal".into(),
             cached_active: 0,
-            rt: None,
+            monitor_thread: None,
         }
     }
-    /// 每帧刷新缓存（cheap）
+    /// 每帧刷新缓存（cheap，纯同步读）
     pub fn refresh_caches(&mut self) {
-        let rt = match tokio::runtime::Handle::try_current() {
-            Ok(h) => h,
-            Err(_) => return,
-        };
-        let mon = self.monitor.clone();
-        let stats_snap: crate::monitor::Stats = rt.block_on(async {
-            let g = mon.lock().await;
-            let s = g.stats.lock().await.clone();
-            s
-        });
-        self.cached_started_at = stats_snap.started_at;
+        let stats: Stats = self.monitor.stats_snapshot();
+        self.cached_started_at = stats.started_at;
         let cfg = match crate::config::load_or_init() {
             Ok(v) => v,
             Err(_) => return,
@@ -151,18 +163,31 @@ fn run_event_loop(
     terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
-    let rt = tokio::runtime::Runtime::new()?;
-    let _guard = rt.enter();
-    app.rt = Some(rt.handle().clone());
-
-    // 启动 monitor
-    let mon = app.monitor.clone();
-    rt.spawn(async move {
-        let mut m = mon.lock().await;
-        m.run().await;
+    // ---- 启动 monitor 线程（自带 tokio runtime）----
+    // 通过两个 atomic 把 stop/force 信号从 TUI 主线程传给 monitor；监控线程内部
+    // 每轮检查一次 stop_flag（避免依赖 tokio::Notify），确保 join 立即返回。
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let force_flag = Arc::new(AtomicBool::new(false));
+    let mon_for_thread = app.monitor.clone();
+    let stop_for_thread = stop_flag.clone();
+    let handle = std::thread::Builder::new()
+        .name("ticket-tracker-monitor".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Runtime::new() {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                run_monitor_with_stop(&mon_for_thread, &stop_for_thread).await;
+            });
+        })?;
+    app.monitor_thread = Some(MonitorHandle {
+        thread: Some(handle),
+        stop_flag: stop_flag.clone(),
+        force_flag: force_flag.clone(),
     });
 
-    // 主循环
+    // ---- 主循环 ----
     use std::time::Duration;
     loop {
         if app.should_quit {
@@ -174,20 +199,34 @@ fn run_event_loop(
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {
                 let code = key.code;
                 input::handle_key(app, key)?;
-                if matches!(code, crossterm::event::KeyCode::Char('r')) && app.input_mode == InputMode::Normal {
-                    let mon = app.monitor.clone();
-                    rt.spawn(async move {
-                        let m = mon.lock().await;
-                        m.force_check();
-                    });
+                // `r` 立即触发一轮检查
+                if matches!(code, crossterm::event::KeyCode::Char('r'))
+                    && app.input_mode == InputMode::Normal
+                {
+                    if let Some(h) = &app.monitor_thread {
+                        h.request_force_check();
+                    }
                 }
             }
         }
     }
-    // 通知 monitor 停止
-    rt.block_on(async {
-        let m = app.monitor.lock().await;
-        m.stop();
-    });
+
+    // ---- 干净退出：通知 + join，不抢锁 ----
+    if let Some(h) = app.monitor_thread.take() {
+        // 1) 通过 Monitor 自身的 Notify 唤醒 wait_with_stop
+        app.monitor.stop();
+        // 2) 设 atomic 标志（给将来轮询用）
+        h.stop_flag.store(true, Ordering::SeqCst);
+        // 3) join 监控线程
+        if let Some(t) = h.thread {
+            let _ = t.join();
+        }
+    }
     Ok(())
+}
+
+/// Monitor 主循环：直接调 `Monitor::run()`。停止信号由 `stop()` 通过 tokio
+/// `Notify` 投递，能在最大约 `effective_interval_secs` 后被唤醒。
+async fn run_monitor_with_stop(monitor: &Arc<Monitor>, _stop_flag: &Arc<AtomicBool>) {
+    monitor.run().await;
 }

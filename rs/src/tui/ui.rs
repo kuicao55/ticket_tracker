@@ -14,6 +14,46 @@ use super::{panes, App, InputMode};
 
 pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     let area = f.area();
+    // 极小窗口：guard 渲染最小骨架，不再尝试三栏拆分
+    // 经验阈值：宽 < 60 或高 < 8 时退化为单列竖排
+    if area.width < 60 || area.height < 8 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Min(0),
+                Constraint::Length(1),
+            ])
+            .split(area);
+        draw_header(app, f, chunks[0]);
+        // 单列：把 watches、events、detail 依次堆
+        let body_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(if area.height >= 6 { 3 } else { 1 }),
+                Constraint::Length(0),
+                Constraint::Min(1),
+            ])
+            .split(chunks[1]);
+        panes::draw_watches(app, f, body_chunks[0]);
+        panes::draw_detail(app, f, body_chunks[1]);
+        panes::draw_events(app, f, body_chunks[2]);
+        draw_statusbar(app, f, chunks[2]);
+        draw_input_line(app, f, chunks[2]);
+        if app.show_help {
+            draw_help(f, area);
+        }
+        if let Some(c) = &app.confirm {
+            let row = chunks[2].y.saturating_sub(1);
+            let confirm_area = Rect::new(area.x, row, area.width, 1);
+            let line = Paragraph::new(Line::from(Span::styled(
+                format!(" {}", c.text),
+                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            )));
+            f.render_widget(line, confirm_area);
+        }
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -26,12 +66,18 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     draw_header(app, f, chunks[0]);
 
     // body 三栏
+    // 顺序：中 (Min 40) > 左 (Length 22) > 右 (Length 38)
+    // length 给定硬宽，再给 Min(0) 兜底；窗口比预期还窄时，长宽超出部分会被 clamp 到 0
+    // 而 ratatui 在 Length+Min 模式下，长度项会拿满，最后 Min 自动分配 0。
+    let mid_w = 40u16.min(area.width.saturating_sub(60));
+    let left_w = 22u16.min(area.width.saturating_sub(mid_w + 1));
+    let right_w = area.width.saturating_sub(mid_w + left_w);
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(22),
-            Constraint::Min(40),
-            Constraint::Length(38),
+            Constraint::Length(left_w),
+            Constraint::Length(mid_w),
+            Constraint::Length(right_w),
         ])
         .split(chunks[1]);
     panes::draw_watches(app, f, body_cols[0]);
@@ -41,22 +87,8 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     draw_statusbar(app, f, chunks[2]);
 
     // Cmd/Focus 模式下的输入行（叠加在状态栏上方）
-    if app.input_mode == InputMode::Cmd || app.input_mode == InputMode::Filter {
-        let row = chunks[2].y.saturating_sub(1);
-        let input_area = Rect::new(area.x, row, area.width, 1);
-        f.render_widget(Clear, input_area);
-        let prefix = match app.input_mode {
-            InputMode::Cmd => ":",
-            InputMode::Filter => "/",
-            _ => "",
-        };
-        let line = Paragraph::new(Line::from(vec![
-            Span::styled(prefix, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-            Span::raw(&app.input_buf),
-            Span::styled("▮", Style::default().fg(Color::Cyan)),
-        ]));
-        f.render_widget(line, input_area);
-    }
+    draw_input_line(app, f, chunks[2]);
+
     // Help 覆盖层
     if app.show_help {
         draw_help(f, area);
@@ -71,6 +103,26 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
         )));
         f.render_widget(line, confirm_area);
     }
+}
+
+fn draw_input_line(app: &App, f: &mut ratatui::Frame, status: Rect) {
+    if app.input_mode != InputMode::Cmd && app.input_mode != InputMode::Filter {
+        return;
+    }
+    let row = status.y.saturating_sub(1);
+    let input_area = Rect::new(f.area().x, row, f.area().width, 1);
+    f.render_widget(Clear, input_area);
+    let prefix = match app.input_mode {
+        InputMode::Cmd => ":",
+        InputMode::Filter => "/",
+        _ => "",
+    };
+    let line = Paragraph::new(Line::from(vec![
+        Span::styled(prefix, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::raw(&app.input_buf),
+        Span::styled("▮", Style::default().fg(Color::Cyan)),
+    ]));
+    f.render_widget(line, input_area);
 }
 
 fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
