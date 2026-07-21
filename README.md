@@ -31,14 +31,13 @@ tt start              # 进入 Textual TUI
 
 完整文档 → [`py/README.md`](py/README.md)。
 
-## Rust 版本（开发中）
+## Rust 版本（v1.3.0 · TUI 已就绪）
 
 完整设计、阶段计划、Crate 列表 → [`docs/RUST_PORT.md`](docs/RUST_PORT.md)。
 
-完成后安装：
-
 ```bash
-cargo install --path rs   # 编译并把 `tt` 装到 ~/.cargo/bin
+cd rs
+cargo install --path .    # 编译并把 `tt` 装到 ~/.cargo/bin
 tt --version              # ticket-tracker 1.3.0
 ```
 
@@ -52,9 +51,9 @@ tt --version              # ticket-tracker 1.3.0
 
 ## 路线图
 
-- Phase 1（当前）— 仓库改 monorepo 布局 ✅
-- Phase 2 — Rust 业务骨架（paths / config / presets / maoyan / notify / monitor）
-- Phase 3 — Rust CLI 1:1 对齐 Python 版
-- Phase 4 — Rust TUI（ratatui + crossterm）
-- Phase 5 — CI（ubuntu + macos runner）
-- Phase 6 — Release（cross-build 四平台）
+- Phase 1 — 仓库改 monorepo 布局 ✅
+- Phase 2 — Rust 业务骨架（paths / config / presets / maoyan / notify / monitor） ✅
+- Phase 3 — Rust CLI 1:1 对齐 Python 版 ✅
+- Phase 4 — Rust TUI（ratatui + crossterm） ✅
+- Phase 5 — CI（ubuntu + macos runner） ✅
+- Phase 6 — Release（cross-build 四平台） ✅
