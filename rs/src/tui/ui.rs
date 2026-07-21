@@ -10,12 +10,11 @@ use ratatui::Terminal;
 use serde_json::Value;
 use std::io::Stdout;
 
-use super::{panes, App, InputMode};
+use super::{actions, panes, App, InputMode};
 
 pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     let area = f.area();
-    // 极小窗口：guard 渲染最小骨架，不再尝试三栏拆分
-    // 经验阈值：宽 < 60 或高 < 8 时退化为单列竖排
+    // 极小窗口 fallback
     if area.width < 60 || area.height < 8 {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -26,7 +25,6 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
             ])
             .split(area);
         draw_header(app, f, chunks[0]);
-        // 单列：把 watches、events、detail 依次堆
         let body_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -54,23 +52,22 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
         }
         return;
     }
+    // 正常布局：[header / body / actions / status]
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1), // header
-            Constraint::Min(3),    // body
+            Constraint::Min(5),    // body
+            Constraint::Length(2), // actions（标题 + 按钮行）
             Constraint::Length(1), // status
         ])
         .split(area);
 
     draw_header(app, f, chunks[0]);
 
-    // body 三栏
-    // 顺序：中 (Min 40) > 左 (Length 22) > 右 (Length 38)
-    // length 给定硬宽，再给 Min(0) 兜底；窗口比预期还窄时，长宽超出部分会被 clamp 到 0
-    // 而 ratatui 在 Length+Min 模式下，长度项会拿满，最后 Min 自动分配 0。
-    let mid_w = 40u16.min(area.width.saturating_sub(60));
-    let left_w = 22u16.min(area.width.saturating_sub(mid_w + 1));
+    // body 三栏：左 ≤ 18，中 ≥ 60，右 = remaining
+    let mid_w = 60u16.min(area.width.saturating_sub(50));
+    let left_w = 18u16.min(area.width.saturating_sub(mid_w + 24));
     let right_w = area.width.saturating_sub(mid_w + left_w);
     let body_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -84,18 +81,20 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     panes::draw_detail(app, f, body_cols[1]);
     panes::draw_events(app, f, body_cols[2]);
 
-    draw_statusbar(app, f, chunks[2]);
+    // actions bar（2 行：标题 + 按钮）
+    draw_actions(app, f, chunks[2]);
 
-    // Cmd/Focus 模式下的输入行（叠加在状态栏上方）
-    draw_input_line(app, f, chunks[2]);
+    // status 栏 + input line 叠加
+    draw_statusbar(app, f, chunks[3]);
+    draw_input_line(app, f, chunks[3]);
 
     // Help 覆盖层
     if app.show_help {
         draw_help(f, area);
     }
-    // Confirm 提示（占用输入行之上）
+    // Confirm 提示
     if let Some(c) = &app.confirm {
-        let row = chunks[2].y.saturating_sub(1);
+        let row = chunks[3].y.saturating_sub(1);
         let confirm_area = Rect::new(area.x, row, area.width, 1);
         let line = Paragraph::new(Line::from(Span::styled(
             format!(" {}", c.text),
@@ -105,32 +104,15 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
     }
 }
 
-fn draw_input_line(app: &App, f: &mut ratatui::Frame, status: Rect) {
-    if app.input_mode != InputMode::Cmd && app.input_mode != InputMode::Filter {
-        return;
-    }
-    let row = status.y.saturating_sub(1);
-    let input_area = Rect::new(f.area().x, row, f.area().width, 1);
-    f.render_widget(Clear, input_area);
-    let prefix = match app.input_mode {
-        InputMode::Cmd => ":",
-        InputMode::Filter => "/",
-        _ => "",
-    };
-    let line = Paragraph::new(Line::from(vec![
-        Span::styled(prefix, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-        Span::raw(&app.input_buf),
-        Span::styled("▮", Style::default().fg(Color::Cyan)),
-    ]));
-    f.render_widget(line, input_area);
-}
-
 fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     let now = chrono::Local::now().format("%H:%M").to_string();
     let elapsed = chrono::Utc::now().timestamp() as f64 - app.cached_started_at;
     let uptime = crate::monitor::format_uptime(elapsed.max(0.0) as u64);
     let line = Line::from(vec![
-        Span::styled("ticket-tracker", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+        Span::styled(
+            "ticket-tracker",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
         Span::raw("   "),
         Span::raw(now),
         Span::raw("  "),
@@ -143,9 +125,57 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(Paragraph::new(line), area);
 }
 
-fn draw_statusbar(_app: &mut App, f: &mut ratatui::Frame, area: Rect) {
-    let tips = if let Some(msg) = &_app.status_msg {
-        if let Some(until) = _app.status_msg_until {
+fn draw_actions(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+    // 第 1 行：标题
+    let title = Line::from(vec![
+        Span::styled("─ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            "actions",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            "←/→ 切换 · Enter 触发",
+            Style::default().fg(Color::DarkGray),
+        ),
+        Span::styled(" ─", Style::default().fg(Color::DarkGray)),
+    ]);
+    f.render_widget(Paragraph::new(title), rows[0]);
+
+    // 第 2 行：按钮一字排开，按 app.action_idx 高亮
+    let mut spans: Vec<Span> = Vec::new();
+    let mut used = 0usize;
+    let max_w = area.width as usize;
+    for (i, (icon, label)) in actions::BUTTONS.iter().enumerate() {
+        let text = format!(" [{}] {} ", icon, label);
+        let w = text.chars().count();
+        if used + w > max_w {
+            spans.push(Span::styled("…", Style::default().fg(Color::DarkGray)));
+            break;
+        }
+        let style = if i == app.action_idx {
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White)
+        };
+        spans.push(Span::styled(text, style));
+        used += w;
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), rows[1]);
+}
+
+fn draw_statusbar(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
+    let tips = if let Some(msg) = &app.status_msg {
+        if let Some(until) = app.status_msg_until {
             if std::time::Instant::now() < until {
                 msg.clone()
             } else {
@@ -157,36 +187,74 @@ fn draw_statusbar(_app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     } else {
         default_tips()
     };
-    let line = Line::from(Span::styled(format!(" {}", tips), Style::default().fg(Color::DarkGray)));
+    let line = Line::from(Span::styled(
+        format!(" {}", tips),
+        Style::default().fg(Color::DarkGray),
+    ));
     f.render_widget(Paragraph::new(line), area);
 }
 
 fn default_tips() -> String {
-    "Tab/h/l 切焦点  j/k 移动  / 过滤  : 命令  ? 帮助  q 退出".into()
+    "←/→ 切焦点或按钮   ↑/↓ 移动   Enter 触发按钮   ? 帮助   q 退出".into()
+}
+
+fn draw_input_line(app: &App, f: &mut ratatui::Frame, status: Rect) {
+    if app.input_mode != InputMode::Cmd {
+        return;
+    }
+    // prefix：add / edit / config 循环
+    let prefix = match (&app.prompt_target, &app.input_buf) {
+        (Some(t), _) => format!("{}> ", t.label()),
+        (None, s) if s.starts_with("add ") || s.starts_with("edit ") => {
+            let cmd = if s.starts_with("add ") { "add> " } else { "edit> " };
+            cmd.to_string()
+        }
+        (None, _) => "input> ".into(),
+    };
+    let row = status.y.saturating_sub(1);
+    let input_area = Rect::new(f.area().x, row, f.area().width, 1);
+    f.render_widget(Clear, input_area);
+    let buf_display = match &app.prompt_target {
+        Some(_) => String::new(),
+        None => app.input_buf.clone(),
+    };
+    let line = Paragraph::new(Line::from(vec![
+        Span::styled(
+            prefix,
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(buf_display),
+        Span::styled("▮", Style::default().fg(Color::Cyan)),
+    ]));
+    f.render_widget(line, input_area);
 }
 
 fn draw_help(f: &mut ratatui::Frame, area: Rect) {
-    let popup = centered_rect(80, 80, area);
+    let popup = centered_rect(70, 70, area);
     f.render_widget(Clear, popup);
     let text = vec![
-        Line::from(Span::styled("ticket-tracker 帮助", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(Span::styled(
+            "ticket-tracker 帮助",
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )),
         Line::from(""),
-        Line::from("焦点: Tab / Shift+Tab / h / l"),
-        Line::from("移动: j/k/↑/↓   首/尾: g/G"),
-        Line::from("过滤: /   命令面板: :   帮助: ?"),
-        Line::from("立即检查: r   添加: a   删除: d   编辑: e"),
+        Line::from("焦点: ←/→ (Watches/Detail/Events/Actions)"),
+        Line::from("       Tab 也可循环焦点"),
+        Line::from("移动: ↑/↓ 在焦点 pane 内移动"),
+        Line::from("触发: Enter 触发当前 Action 按钮"),
         Line::from(""),
-        Line::from(Span::styled("命令:", Style::default().add_modifier(Modifier::BOLD))),
-        Line::from(":interval <s>      设置全局间隔"),
-        Line::from(":webhook <url|clear>"),
-        Line::from(":quiet <HH:MM-HH:MM>   静默时段"),
-        Line::from(":phone <HH:MM-HH:MM>   phone-only 时段"),
-        Line::from(":films [1|2|3]      拉猫眼列表"),
-        Line::from(":add <mid> -c <cid>... -d <date>..."),
-        Line::from(":rm <wid>   :enable <wid>   :disable <wid>"),
-        Line::from(":doctor    :quit"),
+        Line::from(Span::styled("Action Bar：", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  [+] 添加   [-] 删除   [~] 编辑   [◉] 启停"),
+        Line::from("  [r] 立即检查   [⚙] 配置   [?] 帮助   [q] 退出"),
         Line::from(""),
-        Line::from(Span::styled("（按任意键关闭）", Style::default().fg(Color::DarkGray))),
+        Line::from(Span::styled("其它：", Style::default().add_modifier(Modifier::BOLD))),
+        Line::from("  ? 切换本覆盖层"),
+        Line::from("  q / Ctrl+C 干净退出"),
+        Line::from("  Esc 关闭帮助 / 取消 confirm / 取消 prompt"),
+        Line::from(Span::styled(
+            "（按 ? 或任意键关闭）",
+            Style::default().fg(Color::DarkGray),
+        )),
     ];
     let block = Block::default()
         .borders(Borders::ALL)

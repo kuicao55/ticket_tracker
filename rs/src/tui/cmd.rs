@@ -34,8 +34,9 @@ pub fn execute(app: &mut App, line: &str) {
         "rm" => cmd_rm(&rest, app),
         "enable" => cmd_enable(&rest, app, true),
         "disable" => cmd_enable(&rest, app, false),
+        "toggle" => cmd_toggle(&rest, app),
         "edit" => cmd_edit(&rest, app),
-        "help" | "h" | "?" => Ok("可用的命令见 :help 覆盖层（按 ?）".to_string()),
+        "help" | "h" | "?" => Ok("可用的命令见 ? 帮助覆盖层".to_string()),
         "quit" | "q" => {
             app.should_quit = true;
             Ok("".into())
@@ -52,7 +53,7 @@ pub fn execute(app: &mut App, line: &str) {
     }
 }
 
-fn push_event(app: &mut App, line: String) {
+pub fn push_event(app: &mut App, line: String) {
     let ts = chrono::Local::now().format("%H:%M:%S").to_string();
     let entry = format!("[{}] {}", ts, line);
     // 直接走 events_snapshot 的位置（这里只是状态栏文案提示，monitor 跑在
@@ -69,6 +70,32 @@ fn push_event(app: &mut App, line: String) {
         }
         q.push_front(entry_for_events);
     }
+}
+
+pub fn push_status(app: &mut App, msg: String, secs: u64) {
+    app.status_msg = Some(msg);
+    app.status_msg_until =
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(secs));
+}
+
+/// 拿当前选中 watch 的 id（按 `app.watch_idx`）。无选则返回 None。
+pub fn current_wid(app: &App) -> Option<String> {
+    let cfg = app.monitor.cfg_snapshot();
+    cfg.get("watches")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(app.watch_idx))
+        .and_then(|w| w.get("id"))
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
+pub fn current_watch_enabled(app: &App) -> Option<bool> {
+    let cfg = app.monitor.cfg_snapshot();
+    cfg.get("watches")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.get(app.watch_idx))
+        .and_then(|w| w.get("enabled"))
+        .and_then(|v| v.as_bool())
 }
 
 fn cmd_run(_app: &mut App) -> Result<String, String> {
@@ -244,4 +271,18 @@ fn cmd_enable(rest: &[&str], _app: &mut App, en: bool) -> Result<String, String>
 
 fn cmd_edit(_rest: &[&str], _app: &mut App) -> Result<String, String> {
     Err("简化版：未实现，编辑请用 tt watch edit".into())
+}
+
+/// 反转当前 watch 的 enabled 状态。无 wid 时报错。
+fn cmd_toggle(_rest: &[&str], app: &mut App) -> Result<String, String> {
+    let wid = current_wid(app).ok_or_else(|| "当前没有选中的 watch".to_string())?;
+    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let cur = config::find_watch_mut(&mut cfg, &wid)
+        .and_then(|w| w.get("enabled").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+    if let Some(w) = config::find_watch_mut(&mut cfg, &wid) {
+        w["enabled"] = serde_json::json!(!cur);
+    }
+    config::save(&cfg).map_err(|e| e.to_string())?;
+    Ok(format!("{} 已{}", wid, if !cur { "启用" } else { "停用" }))
 }

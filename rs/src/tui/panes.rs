@@ -170,35 +170,37 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         .unwrap_or_else(|| "(default)".into());
     let detail_lines = vec![
         Line::from(vec![
-            Span::styled("名称      ", Style::default().fg(Color::DarkGray)),
+            Span::styled("名称    ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 format!("{} ({})", name, mid),
                 Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
-            Span::styled("cinemas   ", Style::default().fg(Color::DarkGray)),
+            Span::styled("cinemas ", Style::default().fg(Color::DarkGray)),
             Span::raw(cinemas_str),
         ]),
         Line::from(vec![
-            Span::styled("dates     ", Style::default().fg(Color::DarkGray)),
+            Span::styled("dates   ", Style::default().fg(Color::DarkGray)),
             Span::raw(dates_str),
         ]),
         Line::from(vec![
-            Span::styled("interval  ", Style::default().fg(Color::DarkGray)),
-            Span::raw(interval_str),
-            Span::raw("   "),
+            Span::styled("interval", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" {}", interval_str)),
+            Span::raw("  "),
             Span::styled(
                 if enabled { "✓ enabled" } else { "× disabled" },
                 Style::default().fg(if enabled { Color::Green } else { Color::DarkGray }),
             ),
         ]),
         Line::from(vec![
-            Span::styled("fired     ", Style::default().fg(Color::DarkGray)),
-            Span::raw(format!("{}/{}", fired_n, total_cinemas)),
+            Span::styled("fired   ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" {}/{}", fired_n, total_cinemas)),
         ]),
     ];
-    let detail = Paragraph::new(detail_lines).block(Block::default().borders(Borders::NONE));
+    let detail = Paragraph::new(detail_lines)
+        .block(Block::default().borders(Borders::NONE))
+        .wrap(Wrap { trim: false });
     f.render_widget(detail, chunks[0]);
     // 子表
     let header = Row::new(vec![

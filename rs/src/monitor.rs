@@ -42,6 +42,8 @@ pub struct Match {
 pub struct WatchInfo {
     pub name: String,
     pub matches: Vec<Match>,
+    /// 所有本次扫到的 cinema（含未开售的）—— 用于未触发时也能填子表
+    pub all_cinemas: Vec<Match>,
     pub cinema_names: HashMap<String, String>,
     pub show_dates: HashMap<String, Vec<String>>,
     pub errors: Vec<(String, String)>,
@@ -104,6 +106,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
                 movie_name.clone()
             },
             matches: vec![],
+            all_cinemas: vec![],
             cinema_names: HashMap::new(),
             show_dates: HashMap::new(),
             errors: vec![("?".into(), "该 watch 未指定影院".into())],
@@ -112,6 +115,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
     }
 
     let mut matches = Vec::new();
+    let mut all_cinemas = Vec::new();
     let mut errors = Vec::new();
     let mut any_listed = false;
     let mut cinema_names = HashMap::new();
@@ -143,6 +147,14 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
         };
         let movie = maoyan::find_movie(payload, movie_id, &kw);
         let Some(movie) = movie else {
+            // 此 cinema 没出现当前电影，但仍占一行（占位）
+            all_cinemas.push(Match {
+                cinema_id: cid.clone(),
+                cinema_name: cinema_name.clone(),
+                show_count: 0,
+                earliest: String::new(),
+                latest: "—".into(),
+            });
             continue;
         };
         any_listed = true;
@@ -203,15 +215,25 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
                 .unwrap_or(0);
         }
         if dates.is_empty() || show_count <= 0 {
+            // 影院有但限定日内无场次——同样占位
+            all_cinemas.push(Match {
+                cinema_id: cid.clone(),
+                cinema_name: cinema_name.clone(),
+                show_count: 0,
+                earliest: all_dates.first().cloned().unwrap_or_default(),
+                latest: all_dates.last().cloned().unwrap_or_else(|| "—".into()),
+            });
             continue;
         }
-        matches.push(Match {
+        let m = Match {
             cinema_id: cid.clone(),
             cinema_name,
             show_count,
             earliest: dates.first().cloned().unwrap_or_default(),
             latest: dates.last().cloned().unwrap_or_default(),
-        });
+        };
+        matches.push(m.clone());
+        all_cinemas.push(m);
     }
 
     let info = WatchInfo {
@@ -221,6 +243,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
             movie_name.clone()
         },
         matches: matches.clone(),
+        all_cinemas: all_cinemas.clone(),
         cinema_names,
         show_dates,
         errors,
@@ -574,10 +597,17 @@ impl Monitor {
                 if let Some(arr) = g.get_mut("watches").and_then(|v| v.as_array_mut()) {
                     if let Some(w) = arr.get_mut(i) {
                         w["_last_status"] = json!(status_code);
+                        // 子表「cinema / shows / range」需要永远至少有 1 行；
+                        // info.matches 仅 Open 状态非空；其余情况回退到 all_cinemas（占位）。
+                        let display_matches: Vec<Match> = if !info.matches.is_empty() {
+                            info.matches.clone()
+                        } else {
+                            info.all_cinemas.clone()
+                        };
                         // _last_payload: 与 Python 字段对齐
                         w["_last_payload"] = json!({
                             "name": info.name,
-                            "matches": info.matches.iter().map(|m| json!({
+                            "matches": display_matches.iter().map(|m| json!({
                                 "cinema_id": m.cinema_id,
                                 "cinema_name": m.cinema_name,
                                 "show_count": m.show_count,

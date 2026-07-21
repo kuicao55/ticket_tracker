@@ -10,6 +10,7 @@
 //! - 用户 `q` / Ctrl+C → 主线程读 atomic 标志 → join 监控线程，**无锁竞争**
 //! - 窗口缩到很小也能渲染（ui.rs 守底）
 
+pub mod actions;
 pub mod cmd;
 pub mod focus;
 pub mod input;
@@ -40,9 +41,13 @@ pub struct App {
     pub watch_idx: usize,
     /// TUI 的 event 滚动（右栏），list state 偏移
     pub event_idx: usize,
-    /// 输入模式（None | Filter | Cmd）
+    /// prompt 期间进入文本输入模式（仅一种：Cmd —— 由 action bar 进入）
     pub input_mode: InputMode,
     pub input_buf: String,
+    /// 当前 Action Bar 选中的按钮索引（0..=7）
+    pub action_idx: usize,
+    /// prompt 期间记录「这条输入是要干什么」
+    pub prompt_target: Option<PromptTarget>,
     pub status_msg: Option<String>,
     pub status_msg_until: Option<std::time::Instant>,
     pub show_help: bool,
@@ -60,8 +65,43 @@ pub struct App {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputMode {
     Normal,
-    Filter,
     Cmd,
+}
+
+/// Action Bar `[⚙]` 配置按钮触发的循环 prompt 目标。
+/// 第一次按 `[⚙]` 进 Webhook；submit 后下一项 Quiet；最末一项后再 [⚙] 关。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PromptTarget {
+    Webhook,
+    Quiet,
+    Phone,
+    Interval,
+    Films,
+    Doctor,
+}
+
+impl PromptTarget {
+    pub fn label(&self) -> &'static str {
+        match self {
+            PromptTarget::Webhook => "webhook",
+            PromptTarget::Quiet => "quiet",
+            PromptTarget::Phone => "phone",
+            PromptTarget::Interval => "interval",
+            PromptTarget::Films => "films",
+            PromptTarget::Doctor => "doctor",
+        }
+    }
+    /// 循环到下一项
+    pub fn next(&self) -> Self {
+        match self {
+            PromptTarget::Webhook => PromptTarget::Quiet,
+            PromptTarget::Quiet => PromptTarget::Phone,
+            PromptTarget::Phone => PromptTarget::Interval,
+            PromptTarget::Interval => PromptTarget::Films,
+            PromptTarget::Films => PromptTarget::Doctor,
+            PromptTarget::Doctor => PromptTarget::Webhook,
+        }
+    }
 }
 
 /// `d` 删除时的二次确认
@@ -94,6 +134,8 @@ impl App {
             event_idx: 0,
             input_mode: InputMode::Normal,
             input_buf: String::new(),
+            action_idx: 0,
+            prompt_target: None,
             status_msg: None,
             status_msg_until: None,
             show_help: false,
