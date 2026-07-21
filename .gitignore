@@ -31,3 +31,8 @@ state.json
 # 已废弃的旧版本文件（防止误加回来）
 monitor_spiderman.py
 spiderman.sh
+
+# Rust 产物
+rs/target/
+rs/**/*.rs.bk
+# Cargo.lock 应该提交给 binary crate，不要加到这里

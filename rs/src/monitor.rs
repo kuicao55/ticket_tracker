@@ -1,0 +1,858 @@
+//! 监测循环 —— 与 py/.../monitor.py 1:1 对齐。
+//!
+//! 设计要点（参考 RUST_PORT.md §5.3）：
+//! - 异步：tokio 调度循环
+//! - 单条 watch 返回 status ∈ {open, not_listed, no_shows, error}
+//! - tick 节流：每条 watch 独立 interval，未到时间跳过
+//! - 时段策略：quiet → 60s 等；normal/phone_only → 正常
+//! - 触发顺序：Discord → macOS（仅 normal）→ mark_presale_fired
+//! - 自动停用：所有 cinema 都触发过 → enabled=false
+//! - heartbeat：每 heartbeat_interval_sec 发 Discord 报告
+
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use anyhow::Result;
+use serde_json::{json, Value};
+use tokio::sync::{Mutex, Notify};
+
+use crate::config;
+use crate::maoyan;
+use crate::notify;
+
+// 单 status 字符串
+pub type Status = String;
+pub const S_OPEN: &str = "open";
+pub const S_NOT_LISTED: &str = "not_listed";
+pub const S_NO_SHOWS: &str = "no_shows";
+pub const S_ERROR: &str = "error";
+
+#[derive(Debug, Clone)]
+pub struct Match {
+    pub cinema_id: String,
+    pub cinema_name: String,
+    pub show_count: i64,
+    pub earliest: String,
+    pub latest: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct WatchInfo {
+    pub name: String,
+    pub matches: Vec<Match>,
+    pub cinema_names: HashMap<String, String>,
+    pub show_dates: HashMap<String, Vec<String>>,
+    pub errors: Vec<(String, String)>,
+}
+
+#[derive(Debug, Clone)]
+pub enum WatchStatus {
+    Open(WatchInfo),
+    NotListed(WatchInfo),
+    NoShows(WatchInfo),
+    Error(WatchInfo),
+}
+
+impl WatchStatus {
+    pub fn code(&self) -> &'static str {
+        match self {
+            WatchStatus::Open(_) => S_OPEN,
+            WatchStatus::NotListed(_) => S_NOT_LISTED,
+            WatchStatus::NoShows(_) => S_NO_SHOWS,
+            WatchStatus::Error(_) => S_ERROR,
+        }
+    }
+    pub fn info(&self) -> &WatchInfo {
+        match self {
+            WatchStatus::Open(i)
+            | WatchStatus::NotListed(i)
+            | WatchStatus::NoShows(i)
+            | WatchStatus::Error(i) => i,
+        }
+    }
+}
+
+// ----------------- 单个 watch 检查 -----------------
+
+pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value>) -> WatchStatus {
+    let movie_id = watch
+        .get("movie_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let movie_name = watch
+        .get("movie_name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let cinema_ids: Vec<String> = watch
+        .get("cinemas")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if cinema_ids.is_empty() {
+        let info = WatchInfo {
+            name: if movie_name.is_empty() {
+                movie_id.to_string()
+            } else {
+                movie_name.clone()
+            },
+            matches: vec![],
+            cinema_names: HashMap::new(),
+            show_dates: HashMap::new(),
+            errors: vec![("?".into(), "该 watch 未指定影院".into())],
+        };
+        return WatchStatus::Error(info);
+    }
+
+    let mut matches = Vec::new();
+    let mut errors = Vec::new();
+    let mut any_listed = false;
+    let mut cinema_names = HashMap::new();
+    let mut show_dates = HashMap::new();
+
+    for cid in &cinema_ids {
+        if !cinema_cache.contains_key(cid) {
+            match maoyan::fetch_cinema_async(cid).await {
+                Ok(payload) => {
+                    cinema_cache.insert(cid.clone(), payload);
+                }
+                Err(e) => {
+                    errors.push((cid.clone(), e.to_string()));
+                    continue;
+                }
+            }
+        }
+        let payload = cinema_cache.get(cid).unwrap();
+        let cinema_name = payload
+            .get("cinema_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        cinema_names.insert(cid.clone(), cinema_name.clone());
+        let kw: Vec<&str> = if movie_name.is_empty() {
+            vec![]
+        } else {
+            vec![&movie_name]
+        };
+        let movie = maoyan::find_movie(payload, movie_id, &kw);
+        let Some(movie) = movie else {
+            continue;
+        };
+        any_listed = true;
+        let all_dates = maoyan::movie_dates(movie);
+        show_dates.insert(cid.clone(), all_dates.clone());
+        // 全场次计数
+        let total_shows: i64 = movie
+            .get("shows")
+            .and_then(|v| v.as_array())
+            .map(|arr: &Vec<Value>| {
+                arr.iter()
+                    .map(|s: &Value| {
+                        s.get("plist")
+                            .and_then(|v| v.as_array())
+                            .map(|x: &Vec<Value>| x.len() as i64)
+                            .unwrap_or(0)
+                    })
+                    .sum()
+            })
+            .unwrap_or(0);
+        let mut show_count = movie
+            .get("showCount")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(total_shows);
+
+        // 日期过滤
+        let mut dates = all_dates.clone();
+        let allowed: Option<BTreeSet<String>> = watch
+            .get("dates")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+        if let Some(ref allowed) = allowed {
+            dates.retain(|d| allowed.contains(d));
+            // 重算限定内 show_count
+            show_count = movie
+                .get("shows")
+                .and_then(|v| v.as_array())
+                .map(|arr: &Vec<Value>| {
+                    arr.iter()
+                        .map(|s: &Value| {
+                            s.get("plist")
+                                .and_then(|v| v.as_array())
+                                .map(|plist: &Vec<Value>| {
+                                    plist
+                                        .iter()
+                                        .filter(|p: &&Value| {
+                                            p.get("dt")
+                                                .and_then(|v| v.as_str())
+                                                .map(|d| allowed.contains(d))
+                                                .unwrap_or(false)
+                                        })
+                                        .count() as i64
+                                })
+                                .unwrap_or(0)
+                        })
+                        .sum()
+                })
+                .unwrap_or(0);
+        }
+        if dates.is_empty() || show_count <= 0 {
+            continue;
+        }
+        matches.push(Match {
+            cinema_id: cid.clone(),
+            cinema_name,
+            show_count,
+            earliest: dates.first().cloned().unwrap_or_default(),
+            latest: dates.last().cloned().unwrap_or_default(),
+        });
+    }
+
+    let info = WatchInfo {
+        name: if movie_name.is_empty() {
+            movie_id.to_string()
+        } else {
+            movie_name.clone()
+        },
+        matches: matches.clone(),
+        cinema_names,
+        show_dates,
+        errors,
+    };
+    if !any_listed {
+        WatchStatus::NotListed(info)
+    } else if matches.is_empty() {
+        WatchStatus::NoShows(info)
+    } else {
+        WatchStatus::Open(info)
+    }
+}
+
+// ----------------- Monitor 主循环 -----------------
+
+pub struct Monitor {
+    pub cfg: Value,
+    pub events: Arc<Mutex<VecDeque<String>>>,
+    pub stats: Arc<Mutex<Stats>>,
+    stop: Arc<Notify>,
+    force_flag: Arc<AtomicBool>,
+    #[allow(dead_code)]
+    watch_filter: Vec<String>,
+}
+
+#[derive(Debug, Default, Clone)]
+pub struct Stats {
+    pub started_at: f64,
+    pub check_count: u64,
+    pub per_watch_last: HashMap<String, f64>,
+}
+
+impl Monitor {
+    pub fn new(watch_filter: Option<Vec<String>>) -> Result<Self> {
+        let cfg = config::load_or_init()?;
+        // 应用 watch_filter：只保留指定的 watch id
+        let mut cfg = cfg;
+        if let Some(ref ids) = watch_filter {
+            let id_set: std::collections::HashSet<&str> = ids.iter().map(|s| s.as_str()).collect();
+            if let Some(arr) = cfg.get_mut("watches").and_then(|v| v.as_array_mut()) {
+                arr.retain(|w| {
+                    w.get("id")
+                        .and_then(|v| v.as_str())
+                        .map(|s| id_set.contains(s))
+                        .unwrap_or(false)
+                });
+            }
+        }
+        let started_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        Ok(Self {
+            cfg,
+            events: Arc::new(Mutex::new(VecDeque::with_capacity(64))),
+            stats: Arc::new(Mutex::new(Stats {
+                started_at,
+                check_count: 0,
+                per_watch_last: HashMap::new(),
+            })),
+            stop: Arc::new(Notify::new()),
+            force_flag: Arc::new(AtomicBool::new(false)),
+            watch_filter: watch_filter.unwrap_or_default(),
+        })
+    }
+
+    pub async fn push_event(&self, line: String) {
+        let ts = chrono::Local::now().format("%H:%M:%S");
+        let entry = format!("[{}] {}", ts, line);
+        let mut q = self.events.lock().await;
+        if q.len() >= 64 {
+            q.pop_back();
+        }
+        q.push_front(entry);
+    }
+
+    pub fn stop(&self) {
+        self.stop.notify_waiters();
+    }
+
+    pub fn force_check(&self) {
+        self.force_flag.store(true, Ordering::SeqCst);
+    }
+
+    pub async fn run(&mut self) {
+        // 预先快照所有 cfg 字段（owned），避免后续可变借用冲突
+        let n = self
+            .cfg
+            .get("watches")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+        let interval = self
+            .cfg
+            .get("check_interval")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(90);
+        let quiet_w = self
+            .cfg
+            .get("quiet_window")
+            .and_then(|v| v.as_str())
+            .unwrap_or("01:00-06:00")
+            .to_string();
+        let phone_w = self
+            .cfg
+            .get("phone_only_window")
+            .and_then(|v| v.as_str())
+            .unwrap_or("06:00-09:00")
+            .to_string();
+        let webhook: Option<String> = self
+            .cfg
+            .get("discord_webhook")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let hb_interval = self
+            .cfg
+            .get("heartbeat_interval_sec")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(3600);
+
+        let msg = if n == 0 {
+            "无监视项。请 tt watch add 或在 TUI 里按 a 添加。".to_string()
+        } else {
+            format!(
+                "监视项 {} 条｜间隔 {}s｜时段 quiet={} phone_only={}",
+                n, interval, quiet_w, phone_w
+            )
+        };
+        let _ = notify::notify_discord_async(
+            webhook.as_deref(),
+            "ticket-tracker 已启动 ✅",
+            &msg,
+            None,
+        )
+        .await;
+
+        let mut last_heartbeat = std::time::Instant::now();
+        loop {
+            // 时段判定
+            let now_h = chrono::Local::now().format("%H").to_string();
+            let hour: u32 = now_h.parse().unwrap_or(0);
+            let mode = config::current_mode(&quiet_w, &phone_w, hour).unwrap_or(config::Mode::Normal);
+            if mode == config::Mode::Quiet {
+                self.push_event("进入静默时段：暂停抓取/推送".into()).await;
+                if self.wait_with_stop(Duration::from_secs(60)).await {
+                    break;
+                }
+                continue;
+            }
+
+            // 强制检查？
+            let force = self.force_flag.swap(false, Ordering::SeqCst);
+            if force {
+                self.push_event("· 手动触发一轮检查…".into()).await;
+            }
+
+            let did = self.tick(mode, force).await;
+            if did {
+                let mut s = self.stats.lock().await;
+                s.check_count += 1;
+            }
+
+            if force {
+                continue;
+            }
+
+            // heartbeat
+            if last_heartbeat.elapsed() >= Duration::from_secs(hb_interval) {
+                let any_enabled = self
+                    .cfg
+                    .get("watches")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().any(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)))
+                    .unwrap_or(false);
+                if any_enabled {
+                    self.send_heartbeat().await;
+                }
+                last_heartbeat = std::time::Instant::now();
+            }
+
+            // loop 间隔：取 enabled 中最小 interval，否则默认
+            let eff = self.effective_interval_secs();
+            if self.wait_with_stop(Duration::from_secs(eff.max(1))).await {
+                break;
+            }
+        }
+
+        // 已停止推送
+        let started = self.stats.lock().await.started_at;
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+            - started;
+        let uptime = format_uptime(elapsed as u64);
+        let check_count = self.stats.lock().await.check_count;
+        let _ = notify::notify_discord_async(
+            self.cfg.get("discord_webhook").and_then(|v| v.as_str()),
+            "ticket-tracker 已停止 🛑",
+            &format!("运行时长 {}｜累计检查 {} 次", uptime, check_count),
+            None,
+        )
+        .await;
+    }
+
+    async fn wait_with_stop(&self, d: Duration) -> bool {
+        tokio::select! {
+            _ = tokio::time::sleep(d) => false,
+            _ = self.stop.notified() => true,
+        }
+    }
+
+    fn effective_interval_secs(&self) -> u64 {
+        let default = self
+            .cfg
+            .get("check_interval")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(90);
+        let enabled: Vec<&Value> = self
+            .cfg
+            .get("watches")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if enabled.is_empty() {
+            return default;
+        }
+        enabled
+            .iter()
+            .filter_map(|w| {
+                w.get("interval")
+                    .and_then(|v| v.as_u64())
+                    .or(Some(default))
+            })
+            .min()
+            .unwrap_or(default)
+    }
+
+    /// 主 tick 一轮
+    async fn tick(&mut self, mode: config::Mode, force: bool) -> bool {
+        let mut any_done = false;
+        let mut cinema_cache: HashMap<String, Value> = HashMap::new();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        // 一次性克隆所有 watch（避免借用 cfg 同时改 cfg）
+        let watch_count = self
+            .cfg
+            .get("watches")
+            .and_then(|v| v.as_array())
+            .map(|a| a.len())
+            .unwrap_or(0);
+
+        for i in 0..watch_count {
+            // 拿 watch 的 clone
+            let Some(watch) = self
+                .cfg
+                .get("watches")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(i).cloned())
+            else {
+                continue;
+            };
+            if !watch.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+                continue;
+            }
+            let wid = watch.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            // 独立 interval 节流
+            if !force {
+                let w_interval = watch.get("interval").and_then(|v| v.as_u64());
+                if let Some(secs) = w_interval {
+                    let mut s = self.stats.lock().await;
+                    let last = s.per_watch_last.get(&wid).copied().unwrap_or(0.0);
+                    if (now - last) < secs as f64 {
+                        drop(s);
+                        continue;
+                    }
+                    s.per_watch_last.insert(wid.clone(), now);
+                }
+            }
+
+            let status = check_watch(&watch, &mut cinema_cache).await;
+            let status_code = status.code().to_string();
+            let info = status.info();
+            let any_status_non_error = status_code != S_ERROR;
+            any_done = any_done || any_status_non_error;
+
+            let movie_id = watch.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
+            let label = format!("{}({})", info.name, movie_id);
+
+            // 写 _last_status / _last_payload
+            if let Some(arr) = self.cfg.get_mut("watches").and_then(|v| v.as_array_mut()) {
+                if let Some(w) = arr.get_mut(i) {
+                    w["_last_status"] = json!(status_code);
+                    // _last_payload: 与 Python 字段对齐
+                    w["_last_payload"] = json!({
+                        "name": info.name,
+                        "matches": info.matches.iter().map(|m| json!({
+                            "cinema_id": m.cinema_id,
+                            "cinema_name": m.cinema_name,
+                            "show_count": m.show_count,
+                            "earliest": m.earliest,
+                            "latest": m.latest,
+                        })).collect::<Vec<_>>(),
+                        "cinema_names": info.cinema_names,
+                        "show_dates": info.show_dates,
+                        "errors": info.errors.iter().map(|(a,b)| json!([a,b])).collect::<Vec<_>>(),
+                    });
+                }
+            }
+
+            if status_code == S_OPEN {
+                let lines: Vec<String> = info
+                    .matches
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "{}({}场, {} 起)",
+                            m.cinema_name, m.show_count, m.earliest
+                        )
+                    })
+                    .collect();
+                self.push_event(format!(
+                    "✓ {} 预售开启！{}",
+                    label,
+                    lines.join(" / ")
+                ))
+                .await;
+                for m in &info.matches {
+                    let cid = &m.cinema_id;
+                    let already = self
+                        .cfg
+                        .get("watches")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.get(i))
+                        .and_then(|w| w.get("fired_cinemas"))
+                        .and_then(|v| v.as_array())
+                        .map(|arr| arr.iter().any(|x| x.as_str() == Some(cid.as_str())))
+                        .unwrap_or(false);
+                    if already {
+                        continue;
+                    }
+                    let buy_url = maoyan::buy_pc_url_owned(cid);
+                    let alert = format!(
+                        "{}｜{}：{} 场｜{} 至 {}",
+                        info.name, m.cinema_name, m.show_count, m.earliest, m.latest
+                    );
+                    let _ = notify::notify_discord_async(
+                        self.cfg.get("discord_webhook").and_then(|v| v.as_str()),
+                        "预售开启 🎬",
+                        &alert,
+                        Some(&buy_url),
+                    )
+                    .await;
+                    if mode == config::Mode::Normal {
+                        let dur = self
+                            .cfg
+                            .get("alert_duration_sec")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(60);
+                        notify::notify_macos("预售开启 🎬", &alert, true, Some(&buy_url), dur);
+                    }
+                    let _ = config::mark_presale_fired(&mut self.cfg, &wid, cid);
+                }
+                // 自动停用
+                let all_cinemas: std::collections::HashSet<String> = self
+                    .cfg
+                    .get("watches")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.get(i))
+                    .and_then(|w| w.get("cinemas"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                let fired_set: std::collections::HashSet<String> = self
+                    .cfg
+                    .get("watches")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.get(i))
+                    .and_then(|w| w.get("fired_cinemas"))
+                    .and_then(|v| v.as_array())
+                    .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                    .unwrap_or_default();
+                if !all_cinemas.is_empty() && all_cinemas.is_subset(&fired_set) {
+                    if let Some(arr) = self.cfg.get_mut("watches").and_then(|v| v.as_array_mut()) {
+                        if let Some(w) = arr.get_mut(i) {
+                            w["enabled"] = json!(false);
+                        }
+                    }
+                    self.push_event(format!(
+                        "· {} 全 {} 个影院已触发，自动停用",
+                        wid,
+                        all_cinemas.len()
+                    ))
+                    .await;
+                    self.push_event(format!("✓ {} 已停用（任务完成）", label))
+                        .await;
+                }
+            } else if status_code == S_NOT_LISTED {
+                self.push_event(format!("· {} 影院列表中尚未出现", label))
+                    .await;
+            } else if status_code == S_NO_SHOWS {
+                self.push_event(format!(
+                    "· {} 列表有但未开售符合条件的场次",
+                    label
+                ))
+                .await;
+            } else {
+                let errs = info
+                    .errors
+                    .iter()
+                    .map(|(c, e)| format!("{}: {}", c, e))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                self.push_event(format!(
+                    "✗ {} 检查出错: {}",
+                    label,
+                    if errs.is_empty() { "未知".into() } else { errs }
+                ))
+                .await;
+            }
+        }
+
+        let _ = config::save(&self.cfg);
+        any_done
+    }
+
+    async fn send_heartbeat(&mut self) {
+        let mut enabled: Vec<Value> = Vec::new();
+        if let Some(arr) = self
+            .cfg
+            .get("watches")
+            .and_then(|v| v.as_array())
+        {
+            for w in arr {
+                if w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    enabled.push(w.clone());
+                }
+            }
+        }
+        let has_open = enabled
+            .iter()
+            .any(|w| w.get("_last_status").and_then(|v| v.as_str()) == Some(S_OPEN));
+        let title = if has_open {
+            "🎬 检测到开售"
+        } else {
+            "✅ 例行报告（未开售）"
+        };
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0)
+            - self.stats.lock().await.started_at;
+        let uptime = format_uptime(elapsed as u64);
+        let mode_h = chrono::Local::now().format("%H").to_string();
+        let hour: u32 = mode_h.parse().unwrap_or(0);
+        let qw = self
+            .cfg
+            .get("quiet_window")
+            .and_then(|v| v.as_str())
+            .unwrap_or("01:00-06:00");
+        let pw = self
+            .cfg
+            .get("phone_only_window")
+            .and_then(|v| v.as_str())
+            .unwrap_or("06:00-09:00");
+        let mode = config::current_mode(qw, pw, hour).unwrap_or(config::Mode::Normal);
+        let mode_label = match mode {
+            config::Mode::Normal => "正常",
+            config::Mode::PhoneOnly => "只推手机",
+            config::Mode::Quiet => "静默",
+        };
+        let check_count = self.stats.lock().await.check_count;
+        let mut lines = vec![format!(
+            "⏱ {}｜🔍 {} 次｜📡 {}｜活跃 {} 条",
+            uptime,
+            check_count,
+            mode_label,
+            enabled.len()
+        )];
+        if enabled.is_empty() {
+            lines.push("（无启用中的监视项）".to_string());
+        }
+        for w in &enabled {
+            lines.push(watch_summary_line(w));
+        }
+        let body = lines.join("\n");
+        let _ = notify::notify_discord_async(
+            self.cfg.get("discord_webhook").and_then(|v| v.as_str()),
+            title,
+            &body,
+            None,
+        )
+        .await;
+    }
+}
+
+// ----------------- Discord 单条 watch 报告格式 -----------------
+
+fn status_icon(code: &str) -> &'static str {
+    match code {
+        S_OPEN => "🟢 已开售",
+        S_NOT_LISTED => "⚫ 未上架",
+        S_NO_SHOWS => "🟡 排片中",
+        S_ERROR => "🔴 出错",
+        _ => "⚪ 待查",
+    }
+}
+
+fn watch_summary_line(w: &Value) -> String {
+    let icon = status_icon(w.get("_last_status").and_then(|v| v.as_str()).unwrap_or(""));
+    let name = w
+        .get("movie_name")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .unwrap_or_else(|| format!("movie_{}", w.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0)));
+    let wid = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+    let cinema_ids: Vec<String> = w
+        .get("cinemas")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let payload = w.get("_last_payload").cloned().unwrap_or(json!({}));
+    let matches: Vec<Value> = payload
+        .get("matches")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let cinema_names: HashMap<String, String> = serde_json::from_value(
+        payload.get("cinema_names").cloned().unwrap_or(json!({})),
+    )
+    .unwrap_or_default();
+    let show_dates: HashMap<String, Vec<String>> = serde_json::from_value(
+        payload.get("show_dates").cloned().unwrap_or(json!({})),
+    )
+    .unwrap_or_default();
+    let allowed: Vec<String> = w
+        .get("dates")
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let cinema_label = if cinema_ids.is_empty() {
+        "?".to_string()
+    } else {
+        cinema_ids
+            .iter()
+            .map(|c| format!("{} ({})", cinema_names.get(c).cloned().unwrap_or_else(|| "?".into()), c))
+            .collect::<Vec<_>>()
+            .join(" + ")
+    };
+
+    if !matches.is_empty() {
+        let m0 = &matches[0];
+        let earliest = m0.get("earliest").and_then(|v| v.as_str()).unwrap_or("?");
+        let latest = m0.get("latest").and_then(|v| v.as_str()).unwrap_or("?");
+        let show = m0.get("show_count").and_then(|v| v.as_i64()).unwrap_or(0);
+        let cinema = m0.get("cinema_name").and_then(|v| v.as_str()).unwrap_or("?");
+        let detail = if matches.len() > 1 {
+            format!("{} 等 {} 家 · {} 场 · {}~{}", cinema, matches.len(), show, earliest, latest)
+        } else {
+            format!("{} · {} 场 · {}~{}", cinema, show, earliest, latest)
+        };
+        return format!("{} {} ({}) [{}] {}", icon, name, wid, cinema_label, detail);
+    }
+
+    let status = w.get("_last_status").and_then(|v| v.as_str()).unwrap_or("");
+    if status == S_NOT_LISTED {
+        return format!(
+            "{} {} ({}) [{}] 影院列表中暂无此电影",
+            icon, name, wid, cinema_label
+        );
+    }
+    if cinema_ids.is_empty() {
+        return format!("{} {} ({}) [{}] 尚未排片", icon, name, wid, cinema_label);
+    }
+    let allowed_set: std::collections::HashSet<String> = allowed.iter().cloned().collect();
+    let single = cinema_ids.len() == 1;
+    let mut parts = Vec::new();
+    for cid in &cinema_ids {
+        let cn = cinema_names.get(cid).cloned().unwrap_or_else(|| "?".into());
+        let prefix = if single { "" } else { &format!("{} ", cn) };
+        let ds = show_dates.get(cid).cloned().unwrap_or_default();
+        if ds.is_empty() {
+            parts.push(format!("{}已上架未排片", prefix));
+        } else if allowed.is_empty() {
+            parts.push(format!(
+                "{}已排 {} 天，最早 {}, 但未触发开售",
+                prefix,
+                ds.len(),
+                ds[0]
+            ));
+        } else {
+            let overlap: Vec<&String> = ds.iter().filter(|d| allowed_set.contains(*d)).collect();
+            if !overlap.is_empty() {
+                let oe = overlap[0];
+                parts.push(format!(
+                    "{}限定内已有 {} 等 {} 天",
+                    prefix,
+                    oe,
+                    overlap.len()
+                ));
+            } else {
+                parts.push(format!(
+                    "{}限定 {} 无场次；最早开售 {}",
+                    prefix,
+                    allowed.join("/"),
+                    ds[0]
+                ));
+            }
+        }
+    }
+    format!("{} {} ({}) [{}] {}", icon, name, wid, cinema_label, parts.join("；"))
+}
+
+// ----------------- 时间格式 -----------------
+
+pub fn format_uptime(sec: u64) -> String {
+    let h = sec / 3600;
+    let m = (sec % 3600) / 60;
+    let s = sec % 60;
+    if h > 0 {
+        format!("{}小时{}分", h, m)
+    } else if m > 0 {
+        format!("{}分{}秒", m, s)
+    } else {
+        format!("{}秒", s)
+    }
+}
