@@ -11,7 +11,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Cell, List, ListItem, Paragraph, Row, Table, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::Frame;
 use serde_json::Value;
 
@@ -111,7 +111,9 @@ pub fn draw_watches(app: &mut App, f: &mut Frame, area: Rect) {
 }
 
 /// detail 列：watch 完整基本信息（名称 / 影院 id+name / 日期 / 间隔 / 启用 / 触发）
-/// + 子表（最近一场 cinema match）+ per-watch 操作按钮行（仅 In 模式高亮）。
+/// + per-watch 操作按钮行（仅 In 模式高亮当前按钮）。
+///
+/// 已移除 cinemas 子表。
 pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
     let focused = app.focus == Focus::Detail;
     let cfg = app.monitor.cfg_snapshot();
@@ -146,13 +148,12 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
     }
     let w = watch_opt.unwrap();
 
-    // 三段：info (顶部固定) / 子表 (中部 Min) / 按钮行 (底部固定 3 行)
+    // 两段：info (Min) / 按钮行 (Length 3)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(11), // info
-            Constraint::Min(1),     // 子表
-            Constraint::Length(3),  // 操作按钮行（标题 + 2 行按钮）
+            Constraint::Min(1),    // info 区（含影院列表，按影院数自动撑开）
+            Constraint::Length(3), // 操作按钮行（标题 + 2 行按钮）
         ])
         .split(area);
 
@@ -188,7 +189,7 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         .map(|n| format!("{}s", n))
         .unwrap_or_else(|| "(默认)".into());
 
-    // info lines（含影院列表）
+    // info lines（含影院列表，每个影院一行 "name (id)" 或纯 id）
     let mut info_lines: Vec<Line> = Vec::new();
     info_lines.push(Line::from(vec![
         Span::styled("名称    ", Style::default().fg(Color::DarkGray)),
@@ -197,7 +198,6 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
             Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
         ),
     ]));
-    // 影院：每行一个 "name (id)" —— name 缺则只显 id
     info_lines.push(Line::from(vec![Span::styled(
         "影院    ",
         Style::default().fg(Color::DarkGray),
@@ -241,58 +241,8 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         .wrap(Wrap { trim: false });
     f.render_widget(info, chunks[0]);
 
-    // ---- cinema 子表：基于 _last_payload.matches ----
-    let matches: Vec<Value> = payload
-        .get("matches")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let header = Row::new(vec![
-        Cell::from("cinema").style(Style::default().fg(Color::DarkGray)),
-        Cell::from("shows").style(Style::default().fg(Color::DarkGray)),
-        Cell::from("range").style(Style::default().fg(Color::DarkGray)),
-    ]);
-    let rows: Vec<Row> = if matches.is_empty() {
-        // 占位行（避免空表渲染异常）
-        vec![Row::new(vec![
-            Cell::from("(暂无)").style(Style::default().fg(Color::DarkGray)),
-            Cell::from("—"),
-            Cell::from("—"),
-        ])]
-    } else {
-        matches
-            .iter()
-            .map(|m| {
-                let n = m.get("cinema_name").and_then(|v| v.as_str()).unwrap_or("?");
-                let sc = m.get("show_count").and_then(|v| v.as_i64()).unwrap_or(0);
-                let e = m.get("earliest").and_then(|v| v.as_str()).unwrap_or("");
-                let l = m.get("latest").and_then(|v| v.as_str()).unwrap_or("");
-                Row::new(vec![
-                    Cell::from(n.to_string()),
-                    Cell::from(sc.to_string()),
-                    Cell::from(format!("{} → {}", e, l)),
-                ])
-            })
-            .collect()
-    };
-    let sub_block = Block::default()
-        .borders(Borders::TOP)
-        .border_style(border(focused))
-        .title(Span::styled(" cinemas ", border(focused)));
-    let table = Table::new(
-        rows,
-        [
-            Constraint::Percentage(50),
-            Constraint::Length(8),
-            Constraint::Percentage(40),
-        ],
-    )
-    .header(header)
-    .block(sub_block);
-    f.render_widget(table, chunks[1]);
-
     // ---- per-watch 按钮行（仅 Detail In 模式下高亮当前按钮） ----
-    draw_detail_buttons(app, f, chunks[2]);
+    draw_detail_buttons(app, f, chunks[1]);
 }
 
 /// 渲染 detail 列底部 per-watch 按钮行。

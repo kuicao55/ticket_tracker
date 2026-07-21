@@ -1,8 +1,13 @@
 //! 键盘事件分发。
 //!
-//! 导航模型（Top ↔ In）：
-//! - **Top**：方向键在 4 区块间循环；`↓` 或 `Enter` 进入当前区块（→ In）；`Esc` / `q` / `Ctrl+C` 退出
-//! - **In**：方向键在当前区块内操作；`Enter` 触发；`Esc` 退回 Top；`Tab` 循环到下一区块并保持 In
+//! 导航模型：方向键 = 选择；Enter = 进入子内容 / 触发；Esc = 返回上一级
+//! - Top 模式：4 个方向键在 4 个区块（Watches / Detail / Logs / Menu）间循环
+//!   Enter 进入当前区块（→ In 模式）
+//!   Esc / q / Ctrl+C 退出
+//! - In 模式：方向键在当前区块的子内容里选择
+//!   Enter 触发（或从 Watches 进入 Detail 区块）
+//!   Esc 退回 Top 模式
+//! - 帮助 / 确认 / 命令行输入模式独立优先
 
 use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -26,7 +31,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
         } else {
             match key.code {
                 KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    // 确认执行删除
                     let wid_text = c.text.clone();
                     let wid = extract_wid_from_confirm(&wid_text);
                     app.confirm = None;
@@ -46,7 +50,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     if app.input_mode == InputMode::Cmd {
         return handle_prompt_mode(app, key);
     }
-    // 4. 普通焦点模式（Top / In 分支）
+    // 4. 普通导航（Top / In）
     match app.focus_mode {
         FocusMode::Top => handle_top_mode(app, key),
         FocusMode::In => handle_in_mode(app, key),
@@ -62,7 +66,7 @@ fn extract_wid_from_confirm(text: &str) -> Option<String> {
     rest.split_whitespace().next().map(String::from)
 }
 
-/// 顶层模式：方向键循环 4 区块；`↓` 或 `Enter` 进当前区块；`Esc` 退出。
+/// Top 模式：4 个方向键都用来选区块（按固定顺序循环）；Enter 进入子内容。
 fn handle_top_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     let no_ctrl = !key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
@@ -71,24 +75,15 @@ fn handle_top_mode(app: &mut App, key: KeyEvent) -> Result<()> {
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.request_quit()
         }
-        KeyCode::Left | KeyCode::Char('h') if no_ctrl => {
-            app.focus = app.focus.prev();
-        }
-        KeyCode::Right | KeyCode::Char('l') if no_ctrl => {
-            app.focus = app.focus.next();
-        }
-        KeyCode::Tab => {
-            app.focus = app.focus.next();
-            app.focus_mode = FocusMode::In;
-        }
-        KeyCode::BackTab => {
-            app.focus = app.focus.prev();
-            app.focus_mode = FocusMode::In;
-        }
-        KeyCode::Down | KeyCode::Char('j') if no_ctrl => {
-            app.focus_mode = FocusMode::In;
-        }
+        // 4 个方向键都用来在 4 区块间循环选择
+        KeyCode::Left | KeyCode::Char('h') if no_ctrl => app.focus = app.focus.prev(),
+        KeyCode::Right | KeyCode::Char('l') if no_ctrl => app.focus = app.focus.next(),
+        KeyCode::Up | KeyCode::Char('k') if no_ctrl => app.focus = app.focus.prev(),
+        KeyCode::Down | KeyCode::Char('j') if no_ctrl => app.focus = app.focus.next(),
+        KeyCode::Tab => app.focus = app.focus.next(),
+        KeyCode::BackTab => app.focus = app.focus.prev(),
         KeyCode::Enter => {
+            // 进入当前区块的子内容
             app.focus_mode = FocusMode::In;
         }
         KeyCode::Char('?') => app.show_help = !app.show_help,
@@ -97,23 +92,14 @@ fn handle_top_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     Ok(())
 }
 
-/// In 区块模式：方向键在当前区块内操作；Enter 触发；Esc 退回 Top；Tab 跳下一区块。
+/// In 模式：方向键在当前区块子内容里操作；Enter 触发；Esc 退回 Top。
 fn handle_in_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     let no_ctrl = !key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
         KeyCode::Esc => {
-            // 退回 Top
+            // 退回 Top 模式
             app.focus_mode = FocusMode::Top;
-            // 关闭状态信息（保留旧语义）
             app.status_msg = None;
-            return Ok(());
-        }
-        KeyCode::Tab => {
-            app.focus = app.focus.next();
-            return Ok(());
-        }
-        KeyCode::BackTab => {
-            app.focus = app.focus.prev();
             return Ok(());
         }
         KeyCode::Char('?') => {
@@ -122,7 +108,6 @@ fn handle_in_mode(app: &mut App, key: KeyEvent) -> Result<()> {
         }
         _ => {}
     }
-
     match app.focus {
         Focus::Watches => handle_watches_in(app, key, no_ctrl),
         Focus::Detail => handle_detail_in(app, key, no_ctrl),
@@ -131,6 +116,7 @@ fn handle_in_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     }
 }
 
+/// Watches 子内容：方向键选 watch；Enter = 触发（自动更新 detail 显示并把焦点切到 Detail）。
 fn handle_watches_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if no_ctrl => {
@@ -150,7 +136,9 @@ fn handle_watches_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> 
             }
         }
         KeyCode::Enter => {
-            // 已在 In，Enter 不触发额外动作
+            // 触发：detail 显示由 watch_idx 同步；这里把焦点切到 Detail 区块
+            // （用户下一步可直接用方向键操控 detail 的操作按钮）
+            app.focus = Focus::Detail;
         }
         KeyCode::Char('q') => app.request_quit(),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -161,11 +149,11 @@ fn handle_watches_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> 
     Ok(())
 }
 
+/// Detail 子内容：方向键选 per-watch 按钮；Enter 触发当前按钮。
 fn handle_detail_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
     let n = actions::DETAIL_BUTTONS.len();
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if no_ctrl => {
-            // 上滚（暂用作按钮循环，可改 cinema sub-table 滚动）
             if n > 0 {
                 app.detail_btn_idx = (app.detail_btn_idx + n - 1) % n;
             }
@@ -197,6 +185,7 @@ fn handle_detail_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
     Ok(())
 }
 
+/// Logs 子内容：方向键滚动事件列表；Enter 无操作（事件只读）。
 fn handle_events_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
     match key.code {
         KeyCode::Up | KeyCode::Char('k') if no_ctrl => {
@@ -224,6 +213,7 @@ fn handle_events_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
     Ok(())
 }
 
+/// Menu 子内容：方向键选全局按钮；Enter 触发当前按钮。
 fn handle_actions_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
     let n_buttons = actions::BUTTONS.len();
     match key.code {
@@ -245,12 +235,6 @@ fn handle_actions_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> 
         KeyCode::Down | KeyCode::Char('j') if no_ctrl => {
             if n_buttons > 0 {
                 app.action_idx = (app.action_idx + 1) % n_buttons;
-            }
-        }
-        KeyCode::Home if no_ctrl => app.action_idx = 0,
-        KeyCode::End if no_ctrl => {
-            if n_buttons > 0 {
-                app.action_idx = n_buttons - 1;
             }
         }
         KeyCode::Enter => {
@@ -277,7 +261,6 @@ fn handle_prompt_mode(app: &mut App, key: KeyEvent) -> Result<()> {
             app.input_buf.pop();
         }
         KeyCode::Char(c) => {
-            // 不允许 Ctrl 组合键写到 buf
             if !key.modifiers.contains(KeyModifiers::CONTROL) {
                 app.input_buf.push(c);
             }

@@ -231,7 +231,7 @@ fn draw_statusbar(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
 }
 
 fn default_tips() -> String {
-    "←/→ 选区块 (Top)   ↓ 进区块 (In)   Enter 触发   Esc 退回上一级   ? 帮助   q 退出".into()
+    "方向键 选区块/选项目   Enter 进入/触发   Esc 退回上一级   ? 帮助   q 退出".into()
 }
 
 fn draw_input_line(app: &App, f: &mut ratatui::Frame, status: Rect) {
@@ -283,23 +283,31 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
         Line::from("  左：watches    右上：details    右下：logs    底：menu (全局按钮)"),
         Line::from(""),
         Line::from(Span::styled(
+            "导航规则：",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::from("  · 方向键 = 选择"),
+        Line::from("  · Enter = 进入子内容 或 触发"),
+        Line::from("  · Esc   = 返回上一级"),
+        Line::from(""),
+        Line::from(Span::styled(
             "Top 模式（标题栏写 TOP）：",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  ←/→ 选区块（Watches/Detail/Logs/Menu）"),
-        Line::from("  ↓ 或 Enter 进入当前区块（→ In 模式）"),
-        Line::from("  Esc / q / Ctrl+C 退出"),
+        Line::from("  ←/→/↑/↓ 在 4 区块间选（Watches/Detail/Logs/Menu）"),
+        Line::from("  Enter 进入当前区块的子内容（→ In 模式）"),
+        Line::from("  q / Ctrl+C 退出"),
         Line::from(""),
         Line::from(Span::styled(
             "In 模式（标题栏写 IN）：",
             Style::default().add_modifier(Modifier::BOLD),
         )),
-        Line::from("  Watches: ↑/↓ 切 watch"),
-        Line::from("  Detail:  ↑/↓ / ←/→ 切 per-watch 按钮；Enter 触发"),
+        Line::from("  Watches: ↑/↓ 选 watch；Enter = 触发并跳到 Detail"),
+        Line::from("  Detail:  ↑/↓/←/→ 选 per-watch 按钮；Enter 触发"),
         Line::from("           [◉ 启停] [~ 影院] [~ 日期] [~ 间隔] [r 检查] [- 删除]"),
-        Line::from("  Logs:    ↑/↓ 滚事件（最近 12 条）"),
-        Line::from("  Menu:    ←/→ 切全局按钮；Enter 触发"),
-        Line::from("  Esc 退回 Top；Tab 跳下一区块并保持 In"),
+        Line::from("  Logs:    ↑/↓ 滚事件（最近 12 条，只读）"),
+        Line::from("  Menu:    ↑/↓/←/→ 选全局按钮；Enter 触发"),
+        Line::from("  Esc 退回 Top"),
         Line::from(""),
         Line::from(Span::styled(
             "Menu 全局按钮：",
