@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "discord_webhook": "https://discord.com/api/webhooks/YOUR/WEBHOOK",
+  "quiet_window": "01:00-06:00",
+  "phone_only_window": "06:00-09:00",
+  "check_interval": 90,
+  "alert_duration_sec": 60,
+  "heartbeat_interval_sec": 3600,
+  "cinemas": [
+    {"id": "37534", "name": "MOViE MOViE 影城（前滩太古里店）"},
+    {"id": "2127",  "name": "大光明影院（南京西路）"}
+  ],
+  "watches": [
+    {
+      "id": "w_a1b2c3",
+      "cinema_id": "37534",
+      "movie_id": 1490607,
+      "movie_name": "蜘蛛侠：崭新之日",
+      "interval": null,
+      "enabled": true,
+      "presale_fired": false
+    }
+  ]
+}

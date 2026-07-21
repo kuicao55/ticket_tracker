@@ -1,0 +1,33 @@
+# Python 产物
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# 虚拟环境
+.venv/
+venv/
+env/
+
+# 运行期产物（XDG 路径之外、可能被误放进仓库的）
+*.log
+*.pid
+state.json
+
+# ❌ 顶层真 config.json（不要把含 webhook 的本地配置误提交进去）
+# 例子里的是 examples/config.example.json，安全
+/config.json
+!/examples/config.example.json
+
+# 环境变量 / IDE / 编辑器
+.env
+.env.*
+.idea/
+.vscode/
+*.swp
+.DS_Store
+
+# 已废弃的旧版本文件（防止误加回来）
+monitor_spiderman.py
+spiderman.sh
