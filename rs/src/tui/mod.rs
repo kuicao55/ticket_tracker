@@ -14,6 +14,7 @@ pub mod actions;
 pub mod cmd;
 pub mod focus;
 pub mod input;
+pub mod modal;
 pub mod panes;
 pub mod ui;
 
@@ -57,6 +58,8 @@ pub struct App {
     pub status_msg_until: Option<std::time::Instant>,
     pub show_help: bool,
     pub confirm: Option<ConfirmPrompt>,
+    /// 当前打开的表单 / 搜索 / 影院选择弹窗
+    pub modal: Option<modal::Modal>,
     pub should_quit: bool,
     pub last_tick: std::time::Instant,
     // 缓存：避免在 render 里 async 锁
@@ -158,6 +161,7 @@ impl App {
             status_msg_until: None,
             show_help: false,
             confirm: None,
+            modal: None,
             should_quit: false,
             last_tick: std::time::Instant::now(),
             cached_started_at: started_at,
@@ -177,6 +181,12 @@ impl App {
     pub fn sigint_pending(&self) -> bool {
         self.sigint_flag.load(Ordering::SeqCst)
     }
+
+    /// 每帧推进弹窗里的后台请求状态。
+    pub fn pump_async(&mut self) {
+        modal::pump(self);
+    }
+
     /// 每帧刷新缓存（cheap，纯同步读）
     pub fn refresh_caches(&mut self) {
         let stats: Stats = self.monitor.stats_snapshot();
@@ -185,9 +195,19 @@ impl App {
             Ok(v) => v,
             Err(_) => return,
         };
-        let qw = cfg.get("quiet_window").and_then(|v| v.as_str()).unwrap_or("01:00-06:00");
-        let pw = cfg.get("phone_only_window").and_then(|v| v.as_str()).unwrap_or("06:00-09:00");
-        let h: u32 = chrono::Local::now().format("%H").to_string().parse().unwrap_or(0);
+        let qw = cfg
+            .get("quiet_window")
+            .and_then(|v| v.as_str())
+            .unwrap_or("01:00-06:00");
+        let pw = cfg
+            .get("phone_only_window")
+            .and_then(|v| v.as_str())
+            .unwrap_or("06:00-09:00");
+        let h: u32 = chrono::Local::now()
+            .format("%H")
+            .to_string()
+            .parse()
+            .unwrap_or(0);
         self.cached_mode = crate::config::current_mode(qw, pw, h)
             .map(|m| match m {
                 crate::config::Mode::Quiet => "quiet",
@@ -289,6 +309,7 @@ fn run_event_loop(
             break;
         }
         app.refresh_caches();
+        app.pump_async();
         terminal.draw(|f| ui::render(app, f))?;
         if crossterm::event::poll(Duration::from_millis(100))? {
             if let crossterm::event::Event::Key(key) = crossterm::event::read()? {

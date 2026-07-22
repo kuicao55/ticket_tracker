@@ -247,10 +247,17 @@ fn cmd_add(rest: &[&str], _app: &mut App) -> Result<String, String> {
     Ok(format!("添加 watch {}", id))
 }
 
-fn cmd_rm(rest: &[&str], _app: &mut App) -> Result<String, String> {
+fn cmd_rm(rest: &[&str], app: &mut App) -> Result<String, String> {
     let id = rest.first().ok_or_else(|| "用法: :rm <watch_id>".to_string())?;
-    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     if config::remove_watch(&mut cfg, id).map_err(|e| e.to_string())? {
+        let remaining = cfg
+            .get("watches")
+            .and_then(|v| v.as_array())
+            .map(|watches| watches.len())
+            .unwrap_or(0);
+        drop(cfg);
+        app.watch_idx = app.watch_idx.min(remaining.saturating_sub(1));
         Ok(format!("已删除 {}", id))
     } else {
         Err(format!("watch 不存在: {}", id))
@@ -338,7 +345,7 @@ fn cmd_edit(rest: &[&str], _app: &mut App) -> Result<String, String> {
 /// 反转当前 watch 的 enabled 状态。无 wid 时报错。
 fn cmd_toggle(_rest: &[&str], app: &mut App) -> Result<String, String> {
     let wid = current_wid(app).ok_or_else(|| "当前没有选中的 watch".to_string())?;
-    let mut cfg = config::load_or_init().map_err(|e| e.to_string())?;
+    let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     let cur = config::find_watch_mut(&mut cfg, &wid)
         .and_then(|w| w.get("enabled").and_then(|v| v.as_bool()))
         .unwrap_or(false);

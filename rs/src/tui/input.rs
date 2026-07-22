@@ -13,13 +13,13 @@ use anyhow::Result;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use super::actions;
+use super::modal;
 use super::{App, Focus, FocusMode, InputMode};
 
 pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
     // 1. help 覆盖层优先生效
     if app.show_help {
-        if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?'))
-        {
+        if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('?')) {
             app.show_help = false;
         }
         return Ok(());
@@ -46,11 +46,16 @@ pub fn handle_key(app: &mut App, key: KeyEvent) -> Result<()> {
             return Ok(());
         }
     }
-    // 3. prompt 期间
+    // 3. modal 表单 / 搜索 / 影院选择器优先于命令行输入
+    if app.modal.is_some() {
+        modal::handle_key(app, key);
+        return Ok(());
+    }
+    // 4. prompt 期间
     if app.input_mode == InputMode::Cmd {
         return handle_prompt_mode(app, key);
     }
-    // 4. 普通导航（Top / In）
+    // 5. 普通导航（Top / In）
     match app.focus_mode {
         FocusMode::Top => handle_top_mode(app, key),
         FocusMode::In => handle_in_mode(app, key),
@@ -72,9 +77,7 @@ fn handle_top_mode(app: &mut App, key: KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc => app.request_quit(),
         KeyCode::Char('q') => app.request_quit(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.request_quit()
-        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.request_quit(),
         // 4 个方向键都用来在 4 区块间循环选择
         KeyCode::Left | KeyCode::Char('h') if no_ctrl => app.focus = app.focus.prev(),
         KeyCode::Right | KeyCode::Char('l') if no_ctrl => app.focus = app.focus.next(),
@@ -151,9 +154,7 @@ fn handle_watches_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> 
             app.focus = Focus::Detail;
         }
         KeyCode::Char('q') => app.request_quit(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.request_quit()
-        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.request_quit(),
         _ => {}
     }
     Ok(())
@@ -187,9 +188,7 @@ fn handle_detail_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
             actions::dispatch_detail_action(app, app.detail_btn_idx);
         }
         KeyCode::Char('q') => app.request_quit(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.request_quit()
-        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.request_quit(),
         _ => {}
     }
     Ok(())
@@ -215,9 +214,7 @@ fn handle_events_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> {
             }
         }
         KeyCode::Char('q') => app.request_quit(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.request_quit()
-        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.request_quit(),
         _ => {}
     }
     Ok(())
@@ -251,9 +248,7 @@ fn handle_actions_in(app: &mut App, key: KeyEvent, no_ctrl: bool) -> Result<()> 
             actions::dispatch(app);
         }
         KeyCode::Char('q') => app.request_quit(),
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            app.request_quit()
-        }
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => app.request_quit(),
         _ => {}
     }
     Ok(())

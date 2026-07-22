@@ -3,19 +3,19 @@
 //! - `dispatch(app)`：Enter 在 Action Bar 触发时调用
 //! - `dispatch_prompt_submit(app)`：prompt 期间 Enter 提交时调用
 
-use crate::tui::{cmd, App, ConfirmPrompt, InputMode, PromptTarget};
+use crate::tui::{cmd, modal, App, ConfirmPrompt, InputMode, PromptTarget};
 
 /// 底部 Menu Bar：全部是**全局动作**。per-watch 动作（如启停单条、删除单条）
 /// 全部放在 Detail 列内的 per-watch 按钮行；这里不放。
 pub const BUTTONS: &[(&str, &str)] = &[
-    ("A", "添加"),       // add watch (global)
-    ("D", "删除"),       // delete current watch (or dialog if none selected)
-    ("R", "立即检查"),   // force check all
-    ("I", "间隔"),       // global check_interval
-    ("W", "webhook"),    // global discord_webhook
-    ("Q", "静默"),       // global quiet_window
-    ("P", "手机"),       // global phone_only_window
-    ("H", "报告"),       // global heartbeat_interval_sec
+    ("A", "添加"),     // add watch (global)
+    ("D", "删除"),     // delete current watch (or dialog if none selected)
+    ("R", "立即检查"), // force check all
+    ("I", "间隔"),     // global check_interval
+    ("W", "webhook"),  // global discord_webhook
+    ("Q", "静默"),     // global quiet_window
+    ("P", "手机"),     // global phone_only_window
+    ("H", "报告"),     // global heartbeat_interval_sec
     ("?", "帮助"),
     ("q", "退出"),
 ];
@@ -34,11 +34,8 @@ pub const DETAIL_BUTTONS: &[(&str, &str)] = &[
 pub fn dispatch(app: &mut App) {
     match app.action_idx {
         0 => {
-            // 添加 watch：开 prompt，让用户输入 `<movie_id> [-c ...] [-d ...] [--name ...]`
-            app.input_mode = InputMode::Cmd;
-            app.prompt_target = None;
-            app.input_buf = "add ".into();
-            cmd::push_status(app, "请输入 watch 参数：movie_id [-c cinema ...] [-d date ...] [--name ...]".into(), 8);
+            // 添加 watch：打开表单，可从电影搜索与影院收藏夹中选择。
+            modal::open_add_watch(app);
         }
         1 => {
             // 删除当前 watch（走 confirm）
@@ -59,23 +56,23 @@ pub fn dispatch(app: &mut App) {
         }
         3 => {
             // 全局检查间隔
-            open_global_prompt(app, "interval", "检查间隔（秒）", true);
+            modal::open_global_settings(app, 1);
         }
         4 => {
             // 全局 Discord webhook
-            open_global_prompt(app, "webhook", "Discord webhook URL（留空=clear）", false);
+            modal::open_global_settings(app, 0);
         }
         5 => {
             // 全局静默时段
-            open_global_prompt(app, "quiet", "静默时段 HH:MM-HH:MM", true);
+            modal::open_global_settings(app, 2);
         }
         6 => {
             // 全局只推手机时段
-            open_global_prompt(app, "phone", "只推手机时段 HH:MM-HH:MM", true);
+            modal::open_global_settings(app, 3);
         }
         7 => {
             // 全局报告间隔
-            open_global_prompt(app, "report", "Discord 报告间隔（秒）", true);
+            modal::open_global_settings(app, 4);
         }
         8 => {
             // 帮助
@@ -87,15 +84,6 @@ pub fn dispatch(app: &mut App) {
         }
         _ => {}
     }
-}
-
-/// 全局 cfg 字段编辑：开 prompt，buf 预填 "<cmd> "。
-/// `prefill_current` = true 时尝试从 cfg 读当前值作为 hint（不写到 buf，仅给提示用）。
-fn open_global_prompt(app: &mut App, cmd_name: &str, hint: &str, _prefill_current: bool) {
-    app.input_mode = InputMode::Cmd;
-    app.prompt_target = None;
-    app.input_buf = format!("{} ", cmd_name);
-    cmd::push_status(app, format!("{} —— 输入新值，回车提交，Esc 取消", hint), 8);
 }
 
 /// prompt 期间 Enter 提交时调用：把 input_buf 翻译成 `cmd::execute(...)` 调用。
@@ -132,7 +120,10 @@ pub fn dispatch_prompt_submit(app: &mut App) {
         app.input_buf.clear();
         cmd::push_status(
             app,
-            format!("配置项：当前 = {}（回车提交 → 跳下一项，Esc 退出）", next_label),
+            format!(
+                "配置项：当前 = {}（回车提交 → 跳下一项，Esc 退出）",
+                next_label
+            ),
             8,
         );
         return;
@@ -179,43 +170,16 @@ pub fn dispatch_detail_action(app: &mut App, btn_idx: usize) {
             cmd::execute(app, "toggle");
         }
         1 => {
-            // 编辑影院：开 prompt `edit <wid> cinemas > `
-            app.input_mode = InputMode::Cmd;
-            app.prompt_target = None;
-            app.input_buf = format!("edit {} cinemas ", wid);
-            cmd::push_status(
-                app,
-                format!(
-                    "编辑 {} 影院 ID（空格分隔；只输 clear 清空）",
-                    wid
-                ),
-                8,
-            );
+            // 编辑影院：打开 watch 表单并聚焦影院字段。
+            modal::open_edit_watch(app, &wid, 0);
         }
         2 => {
-            // 编辑日期
-            app.input_mode = InputMode::Cmd;
-            app.prompt_target = None;
-            app.input_buf = format!("edit {} dates ", wid);
-            cmd::push_status(
-                app,
-                format!(
-                    "编辑 {} 日期 YYYY-MM-DD（空格分隔；只输 clear 清空）",
-                    wid
-                ),
-                8,
-            );
+            // 编辑日期：打开 watch 表单并聚焦日期字段。
+            modal::open_edit_watch(app, &wid, 1);
         }
         3 => {
-            // 编辑间隔
-            app.input_mode = InputMode::Cmd;
-            app.prompt_target = None;
-            app.input_buf = format!("edit {} interval ", wid);
-            cmd::push_status(
-                app,
-                format!("编辑 {} 间隔（秒，default 用全局）", wid),
-                8,
-            );
+            // 编辑间隔：打开 watch 表单并聚焦间隔字段。
+            modal::open_edit_watch(app, &wid, 2);
         }
         4 => {
             // per-watch 立即检查

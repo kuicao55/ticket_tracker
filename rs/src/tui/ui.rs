@@ -15,12 +15,14 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, BorderType, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap,
+};
 use ratatui::Terminal;
 use serde_json::Value;
 use std::io::Stdout;
 
-use super::{actions, panes, App, Focus, FocusMode, InputMode};
+use super::{actions, modal, panes, App, Focus, FocusMode, InputMode};
 use ratatui::layout::Margin;
 
 pub fn render(app: &mut App, f: &mut ratatui::Frame) {
@@ -34,9 +36,9 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
                 Constraint::Length(1),
                 Constraint::Length(if area.height >= 8 { 6 } else { 3 }), // watches
                 Constraint::Length(if area.height >= 8 { 4 } else { 2 }), // details
-                Constraint::Min(1),                                        // logs
-                Constraint::Length(4),                                     // menu（带边框）
-                Constraint::Length(1),                                     // status
+                Constraint::Min(1),                                       // logs
+                Constraint::Length(4),                                    // menu（带边框）
+                Constraint::Length(1),                                    // status
             ])
             .split(area);
         draw_header(app, f, chunks[0]);
@@ -54,9 +56,14 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
             let confirm_area = Rect::new(area.x, row, area.width, 1);
             let line = Paragraph::new(Line::from(Span::styled(
                 format!(" {}", c.text),
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
             )));
             f.render_widget(line, confirm_area);
+        }
+        if app.modal.is_some() {
+            draw_modal(app, f, area);
         }
         return;
     }
@@ -104,9 +111,14 @@ pub fn render(app: &mut App, f: &mut ratatui::Frame) {
         let confirm_area = Rect::new(area.x, row, area.width, 1);
         let line = Paragraph::new(Line::from(Span::styled(
             format!(" {}", c.text),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         )));
         f.render_widget(line, confirm_area);
+    }
+    if app.modal.is_some() {
+        draw_modal(app, f, area);
     }
 }
 
@@ -131,7 +143,9 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     let line = Line::from(vec![
         Span::styled(
             "ticket-tracker",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw("   "),
         Span::raw(now),
@@ -267,7 +281,9 @@ fn draw_input_line(app: &App, f: &mut ratatui::Frame, status: Rect) {
     let line = Paragraph::new(Line::from(vec![
         Span::styled(
             prefix,
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::raw(buf_display),
         Span::styled("▮", Style::default().fg(Color::Cyan)),
@@ -281,7 +297,9 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
     let text = vec![
         Line::from(Span::styled(
             "ticket-tracker 帮助",
-            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
         Line::from(Span::styled(
@@ -343,6 +361,315 @@ fn draw_help(f: &mut ratatui::Frame, area: Rect) {
     f.render_widget(p, popup);
 }
 
+fn draw_modal(app: &App, f: &mut ratatui::Frame, area: Rect) {
+    let Some(modal) = app.modal.as_ref() else {
+        return;
+    };
+    match modal {
+        modal::Modal::Form(form) => draw_form_modal(f, area, form),
+        modal::Modal::MovieSearch(search) => draw_movie_search_modal(f, area, search),
+        modal::Modal::CinemaPicker(picker) => draw_cinema_picker_modal(f, area, picker),
+    }
+}
+
+fn draw_form_modal(f: &mut ratatui::Frame, area: Rect, form: &modal::FormModal) {
+    let popup = centered_rect(70, 75, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(Span::styled(
+            form.title.as_str(),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(block, popup);
+
+    let inner = popup.inner(Margin {
+        horizontal: 2,
+        vertical: 1,
+    });
+    let editing = matches!(form.mode, modal::FormMode::Editing { .. });
+    let mut lines = Vec::with_capacity(form.fields.len() + 3);
+    for (idx, field) in form.fields.iter().enumerate() {
+        let focused = idx == form.focus;
+        let is_button = matches!(
+            field.kind,
+            modal::FieldKind::Submit | modal::FieldKind::Cancel
+        );
+        let text = if is_button {
+            format!("[{}]", field.label)
+        } else {
+            let value = if field.value.is_empty() {
+                if focused && editing {
+                    ""
+                } else {
+                    "(空)"
+                }
+            } else {
+                field.value.as_str()
+            };
+            format!("{}: {}", field.label, value)
+        };
+        let mut spans = vec![Span::styled(
+            if focused {
+                format!("> {}", text)
+            } else {
+                format!("  {}", text)
+            },
+            if focused {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if is_button {
+                Style::default().fg(Color::Yellow)
+            } else {
+                Style::default().fg(Color::White)
+            },
+        )];
+        if focused && editing && !is_button {
+            spans.push(Span::styled("▮", Style::default().fg(Color::Cyan)));
+        }
+        lines.push(Line::from(spans));
+    }
+    lines.push(Line::from(""));
+    if let Some(error) = &form.error {
+        lines.push(Line::from(Span::styled(
+            format!("错误：{}", error),
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )));
+    }
+    lines.push(Line::from(Span::styled(
+        form.hint(),
+        Style::default().fg(Color::DarkGray),
+    )));
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn draw_movie_search_modal(f: &mut ratatui::Frame, area: Rect, search: &modal::MovieSearchModal) {
+    let popup = centered_rect(80, 75, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(Span::styled(
+            " 选择电影 ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(block, popup);
+    let inner = popup.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let hot_style = if search.show_type == 1 {
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    let coming_style = if search.show_type == 2 {
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(" [正在热映] ", hot_style),
+            Span::raw("  "),
+            Span::styled(" [即将上映] ", coming_style),
+        ])),
+        rows[0],
+    );
+
+    let status = match &search.state {
+        modal::SearchState::Loading(_) => "加载中…（Esc 返回）".to_string(),
+        modal::SearchState::Ready(list) => format!("共 {} 部，↑↓ 选择，Enter 回填", list.len()),
+        modal::SearchState::Error(error) => format!("加载失败：{}（r 重试）", error),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            status,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[1],
+    );
+
+    if let modal::SearchState::Ready(movies) = &search.state {
+        let items: Vec<ListItem> = movies
+            .iter()
+            .map(|(id, name)| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(id.clone(), Style::default().fg(Color::Yellow)),
+                    Span::raw("  "),
+                    Span::raw(name.clone()),
+                ]))
+            })
+            .collect();
+        let mut state = ListState::default();
+        if !items.is_empty() {
+            state.select(Some(search.selected.min(items.len() - 1)));
+        }
+        let list = List::new(items).highlight_style(
+            Style::default()
+                .bg(Color::Cyan)
+                .fg(Color::Black)
+                .add_modifier(Modifier::BOLD),
+        );
+        f.render_stateful_widget(list, rows[2], &mut state);
+    } else {
+        f.render_widget(Paragraph::new(""), rows[2]);
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "←/→ 切换分类 · ↑↓ 选择 · Enter 选中 · Esc 返回",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[3],
+    );
+}
+
+fn draw_cinema_picker_modal(f: &mut ratatui::Frame, area: Rect, picker: &modal::CinemaPickerModal) {
+    let popup = centered_rect(80, 75, area);
+    f.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+        .title(Span::styled(
+            " 影院收藏夹 ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+    f.render_widget(block, popup);
+    let inner = popup.inner(Margin {
+        horizontal: 1,
+        vertical: 1,
+    });
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let items: Vec<ListItem> = picker
+        .cinemas
+        .iter()
+        .map(|cinema| {
+            let mark = if cinema.selected { "[x]" } else { "[ ]" };
+            let builtin = if cinema.builtin { " ★" } else { "" };
+            let name = if cinema.name.is_empty() {
+                cinema.id.clone()
+            } else {
+                format!("{} ({})", cinema.name, cinema.id)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("{}{} ", mark, builtin),
+                    Style::default().fg(if cinema.selected {
+                        Color::Green
+                    } else {
+                        Color::DarkGray
+                    }),
+                ),
+                Span::raw(name),
+            ]))
+        })
+        .collect();
+    let mut list_state = ListState::default();
+    if !items.is_empty() {
+        list_state.select(Some(picker.selected.min(items.len() - 1)));
+    }
+    let list = List::new(items).highlight_style(
+        Style::default()
+            .bg(Color::Cyan)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_stateful_widget(list, rows[0], &mut list_state);
+
+    let add_prefix = if picker.mode == modal::CinemaMode::AddInput {
+        "> 添加影院 ID: "
+    } else {
+        "  添加影院 ID: "
+    };
+    let add_value = if picker.mode == modal::CinemaMode::AddInput {
+        format!("{}▮", picker.add_input)
+    } else {
+        picker.add_input.clone()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled(
+                add_prefix,
+                Style::default().fg(if picker.mode == modal::CinemaMode::AddInput {
+                    Color::Cyan
+                } else {
+                    Color::DarkGray
+                }),
+            ),
+            Span::raw(add_value),
+        ])),
+        rows[1],
+    );
+
+    let status = match &picker.state {
+        modal::CinemaState::Ready => "Enter 确定 · Tab 输入影院 ID".to_string(),
+        modal::CinemaState::Loading(_) => "加载中…（Esc 返回列表）".to_string(),
+        modal::CinemaState::Error(error) => format!("加载失败：{}（Enter 重试）", error),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            status,
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[2],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            "↑↓ 选择 · Space 勾选 · Enter 确定 · Esc 返回",
+            Style::default().fg(Color::DarkGray),
+        ))),
+        rows[3],
+    );
+}
 pub(crate) fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
     let popup_layout = Layout::default()
         .direction(Direction::Vertical)
