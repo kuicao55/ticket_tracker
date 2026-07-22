@@ -16,11 +16,13 @@ use ratatui::Frame;
 use serde_json::Value;
 
 use super::{actions, App, Focus, FocusMode};
-use crate::monitor::{S_ERROR, S_NO_SHOWS, S_NOT_LISTED, S_OPEN};
+use crate::monitor::{S_ERROR, S_NOT_LISTED, S_NO_SHOWS, S_OPEN};
 
 fn border(focused: bool) -> Style {
     if focused {
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
     } else {
         Style::default().fg(Color::DarkGray)
     }
@@ -171,21 +173,47 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
     let cinemas: Vec<String> = w
         .get("cinemas")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let dates: Vec<String> = w
         .get("dates")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let interval = w.get("interval").and_then(|v| v.as_u64());
     let enabled = w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
-    let fired_n = w.get("fired_cinemas").and_then(|v| v.as_array()).map(|a| a.len()).unwrap_or(0);
+    let wid = w.get("id").and_then(|v| v.as_str()).unwrap_or("");
+    let check_count = app
+        .monitor
+        .stats_snapshot()
+        .per_watch_check_count
+        .get(wid)
+        .copied()
+        .unwrap_or(0);
+    let fired_n = w
+        .get("fired_cinemas")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
     let total_cinemas = cinemas.len();
     // 影院 id+name：从 _last_payload.cinema_names 兜底
-    let payload = w.get("_last_payload").cloned().unwrap_or(serde_json::json!({}));
+    let payload = w
+        .get("_last_payload")
+        .cloned()
+        .unwrap_or(serde_json::json!({}));
     let names_map: std::collections::HashMap<String, String> = serde_json::from_value(
-        payload.get("cinema_names").cloned().unwrap_or(serde_json::json!({})),
+        payload
+            .get("cinema_names")
+            .cloned()
+            .unwrap_or(serde_json::json!({})),
     )
     .unwrap_or_default();
     let dates_str = if dates.is_empty() {
@@ -203,7 +231,9 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         Span::styled("名称    ", Style::default().fg(Color::DarkGray)),
         Span::styled(
             format!("{} ({})", name, mid),
-            Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
         ),
     ]));
     info_lines.push(Line::from(vec![Span::styled(
@@ -236,13 +266,25 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         Span::raw(interval_str),
         Span::raw("    "),
         Span::styled(
-            if enabled { "✓ enabled" } else { "× disabled" },
-            Style::default().fg(if enabled { Color::Green } else { Color::DarkGray }),
+            if enabled {
+                "✓ enabled"
+            } else {
+                "× disabled"
+            },
+            Style::default().fg(if enabled {
+                Color::Green
+            } else {
+                Color::DarkGray
+            }),
         ),
     ]));
     info_lines.push(Line::from(vec![
         Span::styled("触发    ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(" {}/{}", fired_n, total_cinemas)),
+    ]));
+    info_lines.push(Line::from(vec![
+        Span::styled("检查    ", Style::default().fg(Color::DarkGray)),
+        Span::raw(format!(" {} 次", check_count)),
     ]));
     let info = Paragraph::new(info_lines)
         .block(Block::default().borders(Borders::NONE))
@@ -282,7 +324,11 @@ fn draw_detail_buttons(app: &mut App, f: &mut Frame, area: Rect) {
     ]);
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
+        ])
         .split(area);
     f.render_widget(Paragraph::new(title_line), rows[0]);
 
@@ -324,7 +370,11 @@ fn draw_detail_buttons(app: &mut App, f: &mut Frame, area: Rect) {
     let mut used2 = 0usize;
     let max_w2 = second_row.width as usize;
     let mut spans2: Vec<Span> = Vec::new();
-    for (i, (icon, label)) in actions::DETAIL_BUTTONS.iter().enumerate().skip(buttons_per_row) {
+    for (i, (icon, label)) in actions::DETAIL_BUTTONS
+        .iter()
+        .enumerate()
+        .skip(buttons_per_row)
+    {
         let text = format!(" [{}] {} ", icon, label);
         let w = text.chars().count();
         if used2 + w > max_w2 {

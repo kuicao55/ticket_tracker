@@ -258,7 +258,9 @@ impl FormModal {
         match self.mode {
             FormMode::Editing { .. } => "输入中：Enter 确认  Esc 取消本项",
             FormMode::Navigation => match self.fields.get(self.focus).map(|f| f.kind) {
-                Some(FieldKind::MovieId) => "↑↓ 选择  Enter 搜索电影  Esc 关闭",
+                Some(FieldKind::MovieId) => {
+                    "↑↓ 选择  Enter 搜索电影  i 手动输入  Esc 关闭"
+                }
                 Some(FieldKind::CinemaList) => "↑↓ 选择  Enter 影院收藏夹  Esc 关闭",
                 Some(FieldKind::Submit) | Some(FieldKind::Cancel) => {
                     "↑↓ 选择  Enter 触发  Esc 关闭"
@@ -296,7 +298,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     app.modal = match modal {
         Modal::Form(f) => handle_form_key(app, f, key),
         Modal::MovieSearch(m) => handle_movie_key(m, key),
-        Modal::CinemaPicker(c) => handle_cinema_key(c, key),
+        Modal::CinemaPicker(c) => handle_cinema_key(app, c, key),
     };
 }
 
@@ -332,6 +334,11 @@ fn handle_form_key(app: &mut App, mut f: FormModal, key: KeyEvent) -> Option<Mod
         }
         KeyCode::Down | KeyCode::Char('j') => {
             f.focus = (f.focus + 1) % n;
+            Some(Modal::Form(f))
+        }
+        KeyCode::Char('i') if f.fields[f.focus].kind == FieldKind::MovieId => {
+            let original = f.fields[f.focus].value.clone();
+            f.mode = FormMode::Editing { original };
             Some(Modal::Form(f))
         }
         KeyCode::Enter => match f.fields[f.focus].kind {
@@ -404,7 +411,7 @@ fn handle_movie_key(mut m: MovieSearchModal, key: KeyEvent) -> Option<Modal> {
     Some(Modal::MovieSearch(m))
 }
 
-fn handle_cinema_key(mut c: CinemaPickerModal, key: KeyEvent) -> Option<Modal> {
+fn handle_cinema_key(app: &mut App, mut c: CinemaPickerModal, key: KeyEvent) -> Option<Modal> {
     if c.mode == CinemaMode::AddInput {
         match key.code {
             KeyCode::Esc => {
@@ -439,6 +446,31 @@ fn handle_cinema_key(mut c: CinemaPickerModal, key: KeyEvent) -> Option<Modal> {
         KeyCode::Char(' ') => {
             if let Some(ch) = c.cinemas.get_mut(c.selected) {
                 ch.selected = !ch.selected;
+            }
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            if let Some((id, builtin)) = c
+                .cinemas
+                .get(c.selected)
+                .map(|ch| (ch.id.clone(), ch.builtin))
+            {
+                if builtin {
+                    c.state = CinemaState::Error("内置影院不能删除".into());
+                } else {
+                    let result = {
+                        let mut cfg = app.monitor.shared.cfg.lock().unwrap();
+                        config::remove_cinema(&mut cfg, &id)
+                    };
+                    match result {
+                        Ok(true) => {
+                            c.cinemas.remove(c.selected);
+                            c.selected = c.selected.min(c.cinemas.len().saturating_sub(1));
+                            c.state = CinemaState::Ready;
+                        }
+                        Ok(false) => c.state = CinemaState::Error("影院收藏不存在".into()),
+                        Err(e) => c.state = CinemaState::Error(e.to_string()),
+                    }
+                }
             }
         }
         KeyCode::Enter => {
@@ -765,9 +797,13 @@ fn pump_cinema(app: &App, c: &mut CinemaPickerModal) {
     match state {
         CinemaState::Loading(rx) => match rx.try_recv() {
             Ok(Ok((id, name))) => {
-                {
+                let save_result = {
                     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
-                    let _ = config::add_cinema(&mut cfg, &id, Some(&name));
+                    config::add_cinema(&mut cfg, &id, Some(&name))
+                };
+                if let Err(e) = save_result {
+                    c.state = CinemaState::Error(e.to_string());
+                    return;
                 }
                 if let Some(ch) = c.cinemas.iter_mut().find(|x| x.id == id) {
                     ch.selected = true;

@@ -79,10 +79,7 @@ impl WatchStatus {
 // ----------------- 单个 watch 检查 -----------------
 
 pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value>) -> WatchStatus {
-    let movie_id = watch
-        .get("movie_id")
-        .and_then(|v| v.as_i64())
-        .unwrap_or(0);
+    let movie_id = watch.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
     let movie_name = watch
         .get("movie_name")
         .and_then(|v| v.as_str())
@@ -182,10 +179,12 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
 
         // 日期过滤
         let mut dates = all_dates.clone();
-        let allowed: Option<BTreeSet<String>> = watch
-            .get("dates")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+        let allowed: Option<BTreeSet<String>> =
+            watch.get("dates").and_then(|v| v.as_array()).map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            });
         if let Some(ref allowed) = allowed {
             dates.retain(|d| allowed.contains(d));
             // 重算限定内 show_count
@@ -283,6 +282,7 @@ pub struct Stats {
     pub started_at: f64,
     pub check_count: u64,
     pub per_watch_last: HashMap<String, f64>,
+    pub per_watch_check_count: HashMap<String, u64>,
 }
 
 impl Monitor {
@@ -312,6 +312,7 @@ impl Monitor {
                     started_at,
                     check_count: 0,
                     per_watch_last: HashMap::new(),
+                    per_watch_check_count: HashMap::new(),
                 }),
             }),
             stop: Arc::new(Notify::new()),
@@ -328,13 +329,7 @@ impl Monitor {
 
     /// TUI 线程用：拿 events 的**快照**。
     pub fn events_snapshot(&self) -> Vec<String> {
-        self.shared
-            .events
-            .lock()
-            .unwrap()
-            .iter()
-            .cloned()
-            .collect()
+        self.shared.events.lock().unwrap().iter().cloned().collect()
     }
 
     /// TUI 线程用：拿 stats 的**快照**。
@@ -462,7 +457,8 @@ impl Monitor {
             // 时段判定
             let now_h = chrono::Local::now().format("%H").to_string();
             let hour: u32 = now_h.parse().unwrap_or(0);
-            let mode = config::current_mode(&quiet_w, &phone_w, hour).unwrap_or(config::Mode::Normal);
+            let mode =
+                config::current_mode(&quiet_w, &phone_w, hour).unwrap_or(config::Mode::Normal);
             if mode == config::Mode::Quiet {
                 self.push_event("进入静默时段：暂停抓取/推送".into()).await;
                 if self.wait_with_stop(Duration::from_secs(60)).await {
@@ -479,7 +475,8 @@ impl Monitor {
                 self.push_event("· 手动触发一轮检查…".into()).await;
             }
             if !force_set.is_empty() && !force_all {
-                self.push_event(format!("· 手动触发 {} 条 watch 检查…", force_set.len())).await;
+                self.push_event(format!("· 手动触发 {} 条 watch 检查…", force_set.len()))
+                    .await;
             }
 
             let did = self.tick(mode, force, &force_set).await;
@@ -498,7 +495,11 @@ impl Monitor {
                     let g = self.shared.cfg.lock().unwrap();
                     g.get("watches")
                         .and_then(|v| v.as_array())
-                        .map(|a| a.iter().any(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)))
+                        .map(|a| {
+                            a.iter().any(|w| {
+                                w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
+                            })
+                        })
                         .unwrap_or(false)
                 };
                 if any_enabled {
@@ -561,9 +562,7 @@ impl Monitor {
                 .and_then(|v| v.as_array())
                 .map(|a| {
                     a.iter()
-                        .filter(|w| {
-                            w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
-                        })
+                        .filter(|w| w.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false))
                         .filter_map(|w| w.get("interval").and_then(|v| v.as_u64()))
                         .map(Some)
                         .collect()
@@ -574,11 +573,7 @@ impl Monitor {
         if intervals.is_empty() {
             return default;
         }
-        intervals
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or(default)
+        intervals.into_iter().flatten().min().unwrap_or(default)
     }
 
     /// 主 tick 一轮
@@ -615,10 +610,18 @@ impl Monitor {
             let Some(watch) = watch_opt else {
                 continue;
             };
-            if !watch.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false) {
+            if !watch
+                .get("enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+            {
                 continue;
             }
-            let wid = watch.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let wid = watch
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
 
             // per-watch 强制检查（即使 force 全局为 false）
             let per_wid_force = force_set.contains(&wid);
@@ -643,6 +646,10 @@ impl Monitor {
             let info = status.info();
             let any_status_non_error = status_code != S_ERROR;
             any_done = any_done || any_status_non_error;
+            if any_status_non_error {
+                let mut stats = self.shared.stats.lock().unwrap();
+                *stats.per_watch_check_count.entry(wid.clone()).or_insert(0) += 1;
+            }
 
             let movie_id = watch.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
             let label = format!("{}({})", info.name, movie_id);
@@ -682,19 +689,10 @@ impl Monitor {
                 let lines: Vec<String> = info
                     .matches
                     .iter()
-                    .map(|m| {
-                        format!(
-                            "{}({}场, {} 起)",
-                            m.cinema_name, m.show_count, m.earliest
-                        )
-                    })
+                    .map(|m| format!("{}({}场, {} 起)", m.cinema_name, m.show_count, m.earliest))
                     .collect();
-                self.push_event(format!(
-                    "✓ {} 预售开启！{}",
-                    label,
-                    lines.join(" / ")
-                ))
-                .await;
+                self.push_event(format!("✓ {} 预售开启！{}", label, lines.join(" / ")))
+                    .await;
                 for m in &info.matches {
                     let cid = &m.cinema_id;
                     let already = {
@@ -751,7 +749,11 @@ impl Monitor {
                         .and_then(|a| a.get(i))
                         .and_then(|w| w.get("cinemas"))
                         .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default()
                 };
                 let fired_set: std::collections::HashSet<String> = {
@@ -761,7 +763,11 @@ impl Monitor {
                         .and_then(|a| a.get(i))
                         .and_then(|w| w.get("fired_cinemas"))
                         .and_then(|v| v.as_array())
-                        .map(|arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
                         .unwrap_or_default()
                 };
                 if !all_cinemas.is_empty() && all_cinemas.is_subset(&fired_set) {
@@ -786,11 +792,8 @@ impl Monitor {
                 self.push_event(format!("· {} 影院列表中尚未出现", label))
                     .await;
             } else if status_code == S_NO_SHOWS {
-                self.push_event(format!(
-                    "· {} 列表有但未开售符合条件的场次",
-                    label
-                ))
-                .await;
+                self.push_event(format!("· {} 列表有但未开售符合条件的场次", label))
+                    .await;
             } else {
                 let errs = info
                     .errors
@@ -801,7 +804,11 @@ impl Monitor {
                 self.push_event(format!(
                     "✗ {} 检查出错: {}",
                     label,
-                    if errs.is_empty() { "未知".into() } else { errs }
+                    if errs.is_empty() {
+                        "未知".into()
+                    } else {
+                        errs
+                    }
                 ))
                 .await;
             }
@@ -907,12 +914,21 @@ fn watch_summary_line(w: &Value) -> String {
         .get("movie_name")
         .and_then(|v| v.as_str())
         .map(String::from)
-        .unwrap_or_else(|| format!("movie_{}", w.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0)));
+        .unwrap_or_else(|| {
+            format!(
+                "movie_{}",
+                w.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0)
+            )
+        });
     let wid = w.get("id").and_then(|v| v.as_str()).unwrap_or("?");
     let cinema_ids: Vec<String> = w
         .get("cinemas")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let payload = w.get("_last_payload").cloned().unwrap_or(json!({}));
     let matches: Vec<Value> = payload
@@ -920,25 +936,33 @@ fn watch_summary_line(w: &Value) -> String {
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let cinema_names: HashMap<String, String> = serde_json::from_value(
-        payload.get("cinema_names").cloned().unwrap_or(json!({})),
-    )
-    .unwrap_or_default();
-    let show_dates: HashMap<String, Vec<String>> = serde_json::from_value(
-        payload.get("show_dates").cloned().unwrap_or(json!({})),
-    )
-    .unwrap_or_default();
+    let cinema_names: HashMap<String, String> =
+        serde_json::from_value(payload.get("cinema_names").cloned().unwrap_or(json!({})))
+            .unwrap_or_default();
+    let show_dates: HashMap<String, Vec<String>> =
+        serde_json::from_value(payload.get("show_dates").cloned().unwrap_or(json!({})))
+            .unwrap_or_default();
     let allowed: Vec<String> = w
         .get("dates")
         .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let cinema_label = if cinema_ids.is_empty() {
         "?".to_string()
     } else {
         cinema_ids
             .iter()
-            .map(|c| format!("{} ({})", cinema_names.get(c).cloned().unwrap_or_else(|| "?".into()), c))
+            .map(|c| {
+                format!(
+                    "{} ({})",
+                    cinema_names.get(c).cloned().unwrap_or_else(|| "?".into()),
+                    c
+                )
+            })
             .collect::<Vec<_>>()
             .join(" + ")
     };
@@ -948,9 +972,19 @@ fn watch_summary_line(w: &Value) -> String {
         let earliest = m0.get("earliest").and_then(|v| v.as_str()).unwrap_or("?");
         let latest = m0.get("latest").and_then(|v| v.as_str()).unwrap_or("?");
         let show = m0.get("show_count").and_then(|v| v.as_i64()).unwrap_or(0);
-        let cinema = m0.get("cinema_name").and_then(|v| v.as_str()).unwrap_or("?");
+        let cinema = m0
+            .get("cinema_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("?");
         let detail = if matches.len() > 1 {
-            format!("{} 等 {} 家 · {} 场 · {}~{}", cinema, matches.len(), show, earliest, latest)
+            format!(
+                "{} 等 {} 家 · {} 场 · {}~{}",
+                cinema,
+                matches.len(),
+                show,
+                earliest,
+                latest
+            )
         } else {
             format!("{} · {} 场 · {}~{}", cinema, show, earliest, latest)
         };
@@ -1003,7 +1037,14 @@ fn watch_summary_line(w: &Value) -> String {
             }
         }
     }
-    format!("{} {} ({}) [{}] {}", icon, name, wid, cinema_label, parts.join("；"))
+    format!(
+        "{} {} ({}) [{}] {}",
+        icon,
+        name,
+        wid,
+        cinema_label,
+        parts.join("；")
+    )
 }
 
 // ----------------- 时间格式 -----------------

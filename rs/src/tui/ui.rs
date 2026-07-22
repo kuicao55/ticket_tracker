@@ -653,7 +653,10 @@ fn draw_cinema_picker_modal(f: &mut ratatui::Frame, area: Rect, picker: &modal::
     let status = match &picker.state {
         modal::CinemaState::Ready => "Enter 确定 · Tab 输入影院 ID".to_string(),
         modal::CinemaState::Loading(_) => "加载中…（Esc 返回列表）".to_string(),
-        modal::CinemaState::Error(error) => format!("加载失败：{}（Enter 重试）", error),
+        modal::CinemaState::Error(error) if picker.mode == modal::CinemaMode::AddInput => {
+            format!("操作失败：{}（Enter 重试）", error)
+        }
+        modal::CinemaState::Error(error) => format!("操作失败：{}", error),
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -664,7 +667,7 @@ fn draw_cinema_picker_modal(f: &mut ratatui::Frame, area: Rect, picker: &modal::
     );
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(
-            "↑↓ 选择 · Space 勾选 · Enter 确定 · Esc 返回",
+            "↑↓ 选择 · Space 勾选 · d/Delete 删除收藏 · Enter 确定 · Esc 返回",
             Style::default().fg(Color::DarkGray),
         ))),
         rows[3],
