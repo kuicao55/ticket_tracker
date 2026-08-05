@@ -169,6 +169,7 @@ impl FormModal {
             FormField::new("独立间隔", FieldKind::OptionalInteger, false),
             FormField::new("通知 webhook", FieldKind::Webhook, false),
             FormField::new("通知邮箱", FieldKind::Text, false),
+            FormField::new("通知 xhs 群名", FieldKind::Text, false),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
         ];
@@ -231,6 +232,12 @@ impl FormModal {
                 FieldKind::Text,
                 false,
                 opt_str("notify_email_to"),
+            ),
+            FormField::with_value(
+                "通知 xhs 群名",
+                FieldKind::Text,
+                false,
+                opt_str("xhs_group"),
             ),
             FormField::button("测试通知", FieldKind::TestNotify),
             FormField::button("确定", FieldKind::Submit),
@@ -678,6 +685,10 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         let t = f.fields[8].value.trim();
         if t.is_empty() { None } else { Some(t.to_string()) }
     };
+    let xhs_group = {
+        let t = f.fields[9].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     let cref: Vec<&str> = cinemas.iter().map(String::as_str).collect();
     let id = config::add_watch(
@@ -691,6 +702,7 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         time_window.as_deref(),
         notify_webhook.as_deref(),
         notify_email_to.as_deref(),
+        xhs_group.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     Ok(format!("已添加 watch {}", id))
@@ -711,6 +723,10 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
     };
     let notify_email_to = {
         let t = f.fields[6].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
+    let xhs_group = {
+        let t = f.fields[7].value.trim();
         if t.is_empty() { None } else { Some(t.to_string()) }
     };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
@@ -763,6 +779,14 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
         None => {
             if let Some(o) = w.as_object_mut() {
                 o.remove("notify_email_to");
+            }
+        }
+    }
+    match &xhs_group {
+        Some(s) => w["xhs_group"] = serde_json::Value::String(s.clone()),
+        None => {
+            if let Some(o) = w.as_object_mut() {
+                o.remove("xhs_group");
             }
         }
     }
@@ -821,11 +845,12 @@ fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {
 ///
 /// 表单字段索引（按 `edit_watch` 现在的布局）：
 ///   0 cinemas | 1 dates | 2 time_window | 3 mode | 4 interval
-///   5 notify_webhook | 6 notify_email_to | 7 测试通知 | 8 确定 | 9 取消
+///   5 notify_webhook | 6 notify_email_to | 7 通知 xhs 群名 | 8 测试通知 | 9 确定 | 10 取消
 fn trigger_test_notify(f: &FormModal) -> String {
-    // 索引 5/6 才是真的 webhook / email；之前 4/5 是把 interval 当 webhook 误读
+    // 索引 5/6/7 才是真的 webhook / email / xhs 群名
     let webhook = f.fields.get(5).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let email = f.fields.get(6).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let xhs_group = f.fields.get(7).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let cinemas_in_form = f.fields.get(0).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let dates_in_form = f.fields.get(1).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let tw_in_form = f.fields.get(2).map(|x| x.value.trim().to_string()).unwrap_or_default();
@@ -947,6 +972,11 @@ fn trigger_test_notify(f: &FormModal) -> String {
     } else {
         email.clone()
     };
+    let xhs_preview = if xhs_group.is_empty() {
+        "（未填）".to_string()
+    } else {
+        xhs_group.clone()
+    };
 
     let title = "🎬 ticket-tracker · 测试通知".to_string();
     let msg = format!(
@@ -964,6 +994,7 @@ fn trigger_test_notify(f: &FormModal) -> String {
          ── 通知通道 ──\n\
          Webhook    : {webhook}\n\
          邮箱       : {email}\n\
+         XHS 群     : {xhs}\n\
          \n\
          ── 触发信息 ──\n\
          触发人     : ticket-tracker（手动测试）\n\
@@ -981,6 +1012,7 @@ fn trigger_test_notify(f: &FormModal) -> String {
         interval = interval_display,
         webhook = webhook_preview,
         email = email_preview,
+        xhs = xhs_preview,
         now = now_str,
     );
 
@@ -1014,9 +1046,25 @@ fn trigger_test_notify(f: &FormModal) -> String {
             "邮箱 ✗ msmtp 未安装或配置有误".to_string()
         });
     }
+    if xhs_group.is_empty() {
+        results.push("XHS 群 未填（不测试）".to_string());
+    } else {
+        let xhs_body = format!(
+            "【ticket-tracker 自动化测试通知】本条消息由 ticket-tracker 监控服务自动发出,用于验证小红书群通知通道配置。｜ 任务 ID: {wid} ｜ 影片: {movie_name} ｜ 影院: {cinemas} ｜ 收到本消息无需任何操作,正式告警将沿用相同通道发送。｜ 如非本人操作或频繁收到此类消息,请联系管理员。",
+            wid = wid_str,
+            movie_name = movie_name,
+            cinemas = cinemas_display
+        );
+        let ok = crate::notify::notify_xhs(&xhs_group, "ticket-tracker 自动化测试通知", &xhs_body, None);
+        results.push(if ok {
+            "XHS 群 ✓ 已发送".to_string()
+        } else {
+            "XHS 群 ✗ 发送失败（看 stderr）".to_string()
+        });
+    }
     let any_failed = results
         .iter()
-        .any(|s| s.starts_with("webhook ✗") || s.starts_with("邮箱 ✗"));
+        .any(|s| s.starts_with("webhook ✗") || s.starts_with("邮箱 ✗") || s.starts_with("XHS 群 ✗"));
     let prefix = if any_failed { "部分通道失败： " } else { "" };
     format!("{prefix}{}", results.join("  "))
 }

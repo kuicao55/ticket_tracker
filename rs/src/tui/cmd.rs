@@ -285,6 +285,7 @@ fn cmd_add(rest: &[&str], _app: &mut App) -> Result<String, String> {
         time_window.as_deref(),
         notify_webhook.as_deref(),
         notify_email.as_deref(),
+        None, // TUI 命令面板暂不暴露 xhs_group
     )
     .map_err(|e| e.to_string())?;
     Ok(format!("添加 watch {}", id))

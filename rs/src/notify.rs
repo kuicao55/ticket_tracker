@@ -171,6 +171,51 @@ pub fn notify_results_email(
     }
 }
 
+// ----------------- 小红书群聊通知（per-watch xhs_group） -----------------
+
+/// 通过本地 xhs-notify.py 脚本把通知推送到小红书指定群聊。
+/// 脚本路径在编译期定死 (`$CARGO_MANIFEST_DIR/scripts/xhs-notify.py`),
+/// 部署到新位置需重新 `cargo build`。
+///
+/// 行为约定:
+/// - 群名为空 / 脚本文件不存在 → 静默返回 false,并在 stderr 留一行提示(配置问题要让用户看见)
+/// - 脚本运行失败(agent-browser 超时、找不到群聊等)→ 静默 false,不刷屏(运行时问题)
+pub fn notify_xhs(group: &str, title: &str, body: &str, url: Option<&str>) -> bool {
+    let group = group.trim();
+    if group.is_empty() {
+        return false;
+    }
+    let script = format!("{}/scripts/xhs-notify.py", env!("CARGO_MANIFEST_DIR"));
+    if !std::path::Path::new(&script).exists() {
+        eprintln!(
+            "⚠ xhs-notify.py 未找到: {} (请确认 rs/scripts/ 目录已复制脚本)",
+            script
+        );
+        return false;
+    }
+    let mut cmd = Command::new("python3");
+    cmd.arg(&script)
+        .arg("--group")
+        .arg(group)
+        .arg("--title")
+        .arg(title)
+        .arg("--body")
+        .arg(body);
+    if let Some(u) = url {
+        if !u.is_empty() {
+            cmd.arg("--url").arg(u);
+        }
+    }
+    let result = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
+    match result {
+        Ok(mut child) => match child.wait() {
+            Ok(s) if s.success() => true,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
 // ----------------- macOS 电脑通知 -----------------
 
 /// 在 macOS 上发系统通知 + 周期性响铃 + 语音 + 自动打开购票页。

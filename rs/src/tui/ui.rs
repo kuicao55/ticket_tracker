@@ -142,7 +142,7 @@ fn draw_header(app: &mut App, f: &mut ratatui::Frame, area: Rect) {
     };
     let line = Line::from(vec![
         Span::styled(
-            "ticket-tracker",
+            format!("ticket-tracker v{}", env!("CARGO_PKG_VERSION")),
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),

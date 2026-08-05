@@ -427,6 +427,7 @@ pub fn add_watch(
     time_window: Option<&str>,
     notify_webhook: Option<&str>,
     notify_email_to: Option<&str>,
+    xhs_group: Option<&str>,
 ) -> Result<String> {
     let cinemas_v: Vec<String> = cinemas.iter().map(|s| s.to_string()).collect();
     for cid in &cinemas_v {
@@ -457,6 +458,7 @@ pub fn add_watch(
         "time_window": tw_str.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
         "notify_webhook": notify_webhook.map(String::from).map(Value::String).unwrap_or(Value::Null),
         "notify_email_to": notify_email_to.map(String::from).map(Value::String).unwrap_or(Value::Null),
+        "xhs_group": xhs_group.map(str::trim).filter(|s| !s.is_empty()).map(String::from).map(Value::String).unwrap_or(Value::Null),
         "enabled": true,
         "presale_fired": false,
         "created_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),

@@ -30,6 +30,9 @@ pub enum WatchAction {
         /// 仅告警时触发的结果通知邮箱（通过本地 msmtp 发）
         #[arg(long = "notify-email")]
         notify_email: Option<String>,
+        /// 仅告警时触发的小红书群聊通知（群名，留空 = 关闭）
+        #[arg(long = "xhs-group")]
+        xhs_group: Option<String>,
     },
     Show { id: String },
     Edit {
@@ -54,6 +57,9 @@ pub enum WatchAction {
         /// 留空字符串 `""` 表示清空；不传则不改
         #[arg(long = "notify-email", allow_hyphen_values = true)]
         notify_email: Option<String>,
+        /// 留空字符串 `""` 表示清空；不传则不改
+        #[arg(long = "xhs-group", allow_hyphen_values = true)]
+        xhs_group: Option<String>,
     },
     Remove { id: String },
     Enable { id: String },
@@ -73,6 +79,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             time_window,
             notify_webhook,
             notify_email,
+            xhs_group,
         } => add(
             movie_id,
             &cinema,
@@ -83,6 +90,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             time_window.as_deref(),
             notify_webhook.as_deref(),
             notify_email.as_deref(),
+            xhs_group.as_deref(),
         ),
         WatchAction::Show { id } => show(&id),
         WatchAction::Edit {
@@ -95,6 +103,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             time_window,
             notify_webhook,
             notify_email,
+            xhs_group,
         } => edit(
             &id,
             &cinema,
@@ -105,6 +114,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             time_window.as_deref(),
             notify_webhook.as_deref(),
             notify_email.as_deref(),
+            xhs_group.as_deref(),
         ),
         WatchAction::Remove { id } => remove(&id),
         WatchAction::Enable { id } => set_enabled(&id, true),
@@ -140,6 +150,7 @@ fn add(
     time_window: Option<&str>,
     notify_webhook: Option<&str>,
     notify_email: Option<&str>,
+    xhs_group: Option<&str>,
 ) -> Result<()> {
     if mode != config::MODE_PRESALE && mode != config::MODE_INCREMENTAL {
         return Err(anyhow!(
@@ -161,6 +172,7 @@ fn add(
         time_window,
         notify_webhook,
         notify_email,
+        xhs_group,
     )?;
     println!("✓ 已添加 watch: {}", id);
     Ok(())
@@ -183,6 +195,7 @@ fn edit(
     time_window: Option<&str>,
     notify_webhook: Option<&str>,
     notify_email: Option<&str>,
+    xhs_group: Option<&str>,
 ) -> Result<()> {
     if let Some(m) = mode {
         if m != config::MODE_PRESALE && m != config::MODE_INCREMENTAL {
@@ -246,6 +259,14 @@ fn edit(
             updates.insert("notify_email_to".into(), serde_json::Value::Null);
         } else {
             updates.insert("notify_email_to".into(), serde_json::json!(v));
+        }
+    }
+    // xhs_group: 同上,区分「没传」/「传空」/「传具体值」
+    if let Some(v) = xhs_group {
+        if v.is_empty() {
+            updates.insert("xhs_group".into(), serde_json::Value::Null);
+        } else {
+            updates.insert("xhs_group".into(), serde_json::json!(v));
         }
     }
     // 影院/日期/时段/模式一变，旧的 seqNo 基线就对不上了 —— 清空让下一轮重新静默建线，

@@ -791,6 +791,10 @@ impl Monitor {
                     .get("notify_email_to")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                let watch_xhs_group = watch_snapshot
+                    .get("xhs_group")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 for m in &info.matches {
                     let cid = &m.cinema_id;
                     let already = {
@@ -841,6 +845,16 @@ impl Monitor {
                         &alert,
                         Some(&buy_url),
                     );
+                    // 小红书群聊: 群名为空则静默跳过
+                    if let Some(ref g) = watch_xhs_group {
+                        if !g.is_empty() {
+                            let xhs_body = format!(
+                                "{}｜{}｜{} 场｜{} 至 {}\n{}",
+                                info.name, m.cinema_name, m.show_count, m.earliest, m.latest, buy_url
+                            );
+                            notify::notify_xhs(g, "预售开启 🎬", &xhs_body, Some(&buy_url));
+                        }
+                    }
                     if mode == config::Mode::Normal {
                         let dur = {
                             let g = self.shared.cfg.lock().unwrap();
@@ -968,6 +982,10 @@ impl Monitor {
             .get("notify_email_to")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let watch_xhs_group = watch_snapshot
+            .get("xhs_group")
+            .and_then(|v| v.as_str())
+            .map(String::from);
 
         let no_shows: Vec<maoyan::ShowInfo> = Vec::new();
         let mut any_event = false;
@@ -1083,6 +1101,20 @@ impl Monitor {
                 &alert,
                 Some(&buy_url),
             );
+            // 小红书群聊: 群名为空则静默跳过
+            if let Some(ref g) = watch_xhs_group {
+                if !g.is_empty() {
+                    let xhs_body = format!(
+                        "{}｜{}\n新增 {} 场:\n{}\n{}",
+                        info.name,
+                        m.cinema_name,
+                        fresh.len(),
+                        detail.join("\n"),
+                        buy_url
+                    );
+                    notify::notify_xhs(g, "新增场次 🎟", &xhs_body, Some(&buy_url));
+                }
+            }
             if mode == config::Mode::Normal {
                 let dur = {
                     let g = self.shared.cfg.lock().unwrap();
