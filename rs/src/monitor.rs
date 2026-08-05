@@ -46,6 +46,9 @@ pub struct WatchInfo {
     pub all_cinemas: Vec<Match>,
     pub cinema_names: HashMap<String, String>,
     pub show_dates: HashMap<String, Vec<String>>,
+    /// 每个 cinema 在 `dates` 过滤后的场次明细，增场监控靠它做 seqNo diff。
+    /// 只有成功抓到且影片在架的 cinema 才有条目。
+    pub shows: HashMap<String, Vec<maoyan::ShowInfo>>,
     pub errors: Vec<(String, String)>,
 }
 
@@ -106,6 +109,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
             all_cinemas: vec![],
             cinema_names: HashMap::new(),
             show_dates: HashMap::new(),
+            shows: HashMap::new(),
             errors: vec![("?".into(), "该 watch 未指定影院".into())],
         };
         return WatchStatus::Error(info);
@@ -117,6 +121,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
     let mut any_listed = false;
     let mut cinema_names = HashMap::new();
     let mut show_dates = HashMap::new();
+    let mut shows_map: HashMap<String, Vec<maoyan::ShowInfo>> = HashMap::new();
 
     for cid in &cinema_ids {
         if !cinema_cache.contains_key(cid) {
@@ -187,7 +192,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
             });
         if let Some(ref allowed) = allowed {
             dates.retain(|d| allowed.contains(d));
-            // 重算限定内 show_count
+            // 重算限定内 show_count（同时按 time_window 过滤）
             show_count = movie
                 .get("shows")
                 .and_then(|v| v.as_array())
@@ -200,10 +205,17 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
                                     plist
                                         .iter()
                                         .filter(|p: &&Value| {
-                                            p.get("dt")
+                                            let d_ok = p
+                                                .get("dt")
                                                 .and_then(|v| v.as_str())
                                                 .map(|d| allowed.contains(d))
-                                                .unwrap_or(false)
+                                                .unwrap_or(false);
+                                            let t_ok = p
+                                                .get("tm")
+                                                .and_then(|v| v.as_str())
+                                                .map(|t| config::in_time_window(watch, t))
+                                                .unwrap_or(true);
+                                            d_ok && t_ok
                                         })
                                         .count() as i64
                                 })
@@ -212,6 +224,44 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
                         .sum()
                 })
                 .unwrap_or(0);
+        } else if config::watch_time_window(watch).is_some() {
+            // 没限定日期但限定了时段 —— 只按 tm 过滤
+            show_count = movie
+                .get("shows")
+                .and_then(|v| v.as_array())
+                .map(|arr: &Vec<Value>| {
+                    arr.iter()
+                        .map(|s: &Value| {
+                            s.get("plist")
+                                .and_then(|v| v.as_array())
+                                .map(|plist: &Vec<Value>| {
+                                    plist
+                                        .iter()
+                                        .filter(|p: &&Value| {
+                                            p.get("tm")
+                                                .and_then(|v| v.as_str())
+                                                .map(|t| config::in_time_window(watch, t))
+                                                .unwrap_or(true)
+                                        })
+                                        .count() as i64
+                                })
+                                .unwrap_or(0)
+                        })
+                        .sum()
+                })
+                .unwrap_or(0);
+        }
+        // 场次明细（同样受 dates + time_window 过滤）——增场监控的 diff 依据。
+        // 必须在下面的 early-continue 之前记录：即使限定日内当前 0 场，也要留个
+        // 空条目，否则首轮建线会把这个 cinema 当成"没查过"。
+        {
+            let mut cshows = maoyan::movie_shows(movie);
+            if let Some(ref allowed) = allowed {
+                cshows.retain(|s| allowed.contains(&s.dt));
+            }
+            // 时段窗口过滤：在允许日期内再按 HH:MM 截一刀。
+            cshows.retain(|s| config::in_time_window(watch, &s.tm));
+            shows_map.insert(cid.clone(), cshows);
         }
         if dates.is_empty() || show_count <= 0 {
             // 影院有但限定日内无场次——同样占位
@@ -245,6 +295,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
         all_cinemas: all_cinemas.clone(),
         cinema_names,
         show_dates,
+        shows: shows_map,
         errors,
     };
     if !any_listed {
@@ -256,8 +307,22 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
     }
 }
 
-// ----------------- Monitor 主循环 -----------------
+/// `dates` 全部早于今天 → 这条增场监控已无意义，自动停用避免永久空转。
+/// `dates` 为 null / 空（不限日期）时永远返回 false。
+fn dates_all_past(watch: &Value) -> bool {
+    let Some(arr) = watch.get("dates").and_then(|v| v.as_array()) else {
+        return false;
+    };
+    if arr.is_empty() {
+        return false;
+    }
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    arr.iter()
+        .filter_map(|v| v.as_str())
+        .all(|d| d < today.as_str())
+}
 
+// ----------------- Monitor 主循环 -----------------
 /// Monitor 共享状态：cfg/events/stats 用 `std::sync::Mutex` 包装，并通过
 /// `Arc` 让 TUI 的渲染线程可以**零 async** 地读，避免 tokio::sync::Mutex 被
 /// run() 永久占用导致 try_lock 永远失败的旧 bug。
@@ -685,7 +750,23 @@ impl Monitor {
                 }
             }
 
-            if status_code == S_OPEN {
+            if config::watch_mode(&watch) == config::MODE_INCREMENTAL
+                && status_code != S_ERROR
+            {
+                self.handle_incremental(i, &wid, &label, info, mode).await;
+                if dates_all_past(&watch) {
+                    {
+                        let mut g = self.shared.cfg.lock().unwrap();
+                        if let Some(arr) = g.get_mut("watches").and_then(|v| v.as_array_mut()) {
+                            if let Some(w) = arr.get_mut(i) {
+                                w["enabled"] = json!(false);
+                            }
+                        }
+                    }
+                    self.push_event(format!("✓ {} 监控日期已全部过去，自动停用", label))
+                        .await;
+                }
+            } else if status_code == S_OPEN {
                 let lines: Vec<String> = info
                     .matches
                     .iter()
@@ -693,6 +774,23 @@ impl Monitor {
                     .collect();
                 self.push_event(format!("✓ {} 预售开启！{}", label, lines.join(" / ")))
                     .await;
+                // 读 watch 自身的通知配置（per-watch 字段）
+                let watch_snapshot = {
+                    let g = self.shared.cfg.lock().unwrap();
+                    g.get("watches")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.get(i))
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                };
+                let watch_results_wh = watch_snapshot
+                    .get("notify_webhook")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let watch_results_email = watch_snapshot
+                    .get("notify_email_to")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 for m in &info.matches {
                     let cid = &m.cinema_id;
                     let already = {
@@ -719,6 +817,9 @@ impl Monitor {
                             .and_then(|v| v.as_str())
                             .map(String::from)
                     };
+                    // 结果通道（仅告警）按 watch 自身配置取；没配就不发
+                    let results_wh = watch_results_wh.clone();
+                    let results_email = watch_results_email.clone();
                     let _ = notify::notify_discord_async(
                         webhook.as_deref(),
                         "预售开启 🎬",
@@ -726,6 +827,20 @@ impl Monitor {
                         Some(&buy_url),
                     )
                     .await;
+                    // 结果通知：与 discord_webhook 不同，只在告警里发，不发心跳
+                    let _ = notify::notify_results_webhook_async(
+                        results_wh.as_deref(),
+                        "预售开启 �",
+                        &alert,
+                        Some(&buy_url),
+                    )
+                    .await;
+                    let _ = notify::notify_results_email(
+                        results_email.as_deref(),
+                        "预售开启 �",
+                        &alert,
+                        Some(&buy_url),
+                    );
                     if mode == config::Mode::Normal {
                         let dur = {
                             let g = self.shared.cfg.lock().unwrap();
@@ -822,6 +937,179 @@ impl Monitor {
         any_done
     }
 
+    /// 增场监控：对比每个影院的 `seqNo` 集合，只报"这一轮新出现的场次"。
+    ///
+    /// 与开票提醒的区别是**不写 `fired_cinemas`、不自动停用** —— 这条 watch 会一直
+    /// 盯着，直到监控日期全部过去或用户手动停用。
+    ///
+    /// cfg 的改动不在这里落盘，由 tick 末尾统一 save。
+    async fn handle_incremental(
+        &self,
+        idx: usize,
+        wid: &str,
+        label: &str,
+        info: &WatchInfo,
+        mode: config::Mode,
+    ) {
+        // 读 watch 自身的通知配置（per-watch 字段）
+        let watch_snapshot = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("watches")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(idx))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        let watch_results_wh = watch_snapshot
+            .get("notify_webhook")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        let watch_results_email = watch_snapshot
+            .get("notify_email_to")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+
+        let no_shows: Vec<maoyan::ShowInfo> = Vec::new();
+        let mut any_event = false;
+        let mut total_seqs: usize = 0;
+        // all_cinemas 只包含本轮成功抓到的影院；抓取失败的在 info.errors 里，跳过它们
+        // 才不会把"没抓到"误当成"场次消失"而污染基线。
+        for m in &info.all_cinemas {
+            let cid = &m.cinema_id;
+            let current = info.shows.get(cid).unwrap_or(&no_shows);
+            let current_seqs: BTreeSet<String> =
+                current.iter().map(|s| s.seq_no.clone()).collect();
+            total_seqs += current_seqs.len();
+
+            let baseline = {
+                let g = self.shared.cfg.lock().unwrap();
+                g.get("watches")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.get(idx))
+                    .and_then(|w| config::seen_shows(w, cid))
+            };
+
+            let Some(baseline) = baseline else {
+                // 首轮静默建线。用户通常是在"已经开了一场但抢不到"时才建这条 watch，
+                // 把已知场次当成新增会立刻误报一次。
+                {
+                    let mut g = self.shared.cfg.lock().unwrap();
+                    config::set_seen_shows(&mut g, wid, cid, &current_seqs);
+                }
+                self.push_event(format!(
+                    "· {} {} 已建立基线（已知 {} 场）",
+                    label,
+                    m.cinema_name,
+                    current_seqs.len()
+                ))
+                .await;
+                any_event = true;
+                continue;
+            };
+
+            let fresh: Vec<&maoyan::ShowInfo> = current
+                .iter()
+                .filter(|s| !baseline.contains(&s.seq_no))
+                .collect();
+
+            // 无论有无新增都回写：本轮消失的场次要同步移出基线，否则撤场后又复排
+            // 会被认成"老场次"而漏报。
+            {
+                let mut g = self.shared.cfg.lock().unwrap();
+                config::set_seen_shows(&mut g, wid, cid, &current_seqs);
+            }
+
+            if fresh.is_empty() {
+                continue;
+            }
+
+            let detail: Vec<String> = fresh.iter().map(|s| format!("  {}", s.label())).collect();
+            let brief = fresh
+                .iter()
+                .take(3)
+                .map(|s| s.label())
+                .collect::<Vec<_>>()
+                .join("、");
+            self.push_event(format!(
+                "🎟 {} {} 新增 {} 场：{}",
+                label,
+                m.cinema_name,
+                fresh.len(),
+                brief
+            ))
+            .await;
+            any_event = true;
+
+            let buy_url = maoyan::buy_pc_url_owned(cid);
+            let alert = format!(
+                "{}｜{}\n新增 {} 场：\n{}",
+                info.name,
+                m.cinema_name,
+                fresh.len(),
+                detail.join("\n")
+            );
+            let short = format!(
+                "{}｜{}：新增 {} 场（{}）",
+                info.name,
+                m.cinema_name,
+                fresh.len(),
+                brief
+            );
+            let webhook = {
+                let g = self.shared.cfg.lock().unwrap();
+                g.get("discord_webhook")
+                    .and_then(|v| v.as_str())
+                    .map(String::from)
+            };
+            let results_wh = watch_results_wh.clone();
+            let results_email = watch_results_email.clone();
+            let _ = notify::notify_discord_async(
+                webhook.as_deref(),
+                "新增场次 🎟",
+                &alert,
+                Some(&buy_url),
+            )
+            .await;
+            let _ = notify::notify_results_webhook_async(
+                results_wh.as_deref(),
+                "新增场次 🎟",
+                &alert,
+                Some(&buy_url),
+            )
+            .await;
+            let _ = notify::notify_results_email(
+                results_email.as_deref(),
+                "新增场次 �",
+                &alert,
+                Some(&buy_url),
+            );
+            if mode == config::Mode::Normal {
+                let dur = {
+                    let g = self.shared.cfg.lock().unwrap();
+                    g.get("alert_duration_sec")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(60)
+                };
+                notify::notify_macos("新增场次 🎟", &short, true, Some(&buy_url), dur);
+            }
+            {
+                let mut g = self.shared.cfg.lock().unwrap();
+                config::touch_last_alert(&mut g, wid);
+            }
+        }
+        // 静默 tick 兜底：基线已建好且本轮无新增时，打一条"仍在盯"的心跳，
+        // 否则用户看着 detail 检查计数在涨、logs 面板却空会以为程序卡死。
+        if !any_event && !info.all_cinemas.is_empty() {
+            self.push_event(format!(
+                "· {} 增场监控中（{} 个影院共 {} 场）",
+                label,
+                info.all_cinemas.len(),
+                total_seqs
+            ))
+            .await;
+        }
+    }
+
     async fn send_heartbeat(&self) {
         let mut enabled: Vec<Value> = Vec::new();
         {
@@ -834,9 +1122,11 @@ impl Monitor {
                 }
             }
         }
-        let has_open = enabled
-            .iter()
-            .any(|w| w.get("_last_status").and_then(|v| v.as_str()) == Some(S_OPEN));
+        // 标题只反映「开票提醒」模式的告警；增场监控下 S_OPEN 只是影院列了这部片，不算
+        let has_open = enabled.iter().any(|w| {
+            config::watch_mode(w) == config::MODE_PRESALE
+                && w.get("_last_status").and_then(|v| v.as_str()) == Some(S_OPEN)
+        });
         let title = if has_open {
             "🎬 检测到开售"
         } else {
@@ -898,9 +1188,14 @@ impl Monitor {
 
 // ----------------- Discord 单条 watch 报告格式 -----------------
 
-fn status_icon(code: &str) -> &'static str {
+fn status_icon(w: &Value) -> &'static str {
+    let code = w.get("_last_status").and_then(|v| v.as_str()).unwrap_or("");
+    // 增场监控模式下 S_OPEN 只是「影院列表里能看到这个电影」，不代表有新场次 —— 不要误报
+    if config::watch_mode(w) == config::MODE_INCREMENTAL && code == S_OPEN {
+        return "📡 监控中";
+    }
     match code {
-        S_OPEN => "🟢 已开售",
+        S_OPEN => "� 已开售",
         S_NOT_LISTED => "⚫ 未上架",
         S_NO_SHOWS => "🟡 排片中",
         S_ERROR => "🔴 出错",
@@ -909,7 +1204,7 @@ fn status_icon(code: &str) -> &'static str {
 }
 
 fn watch_summary_line(w: &Value) -> String {
-    let icon = status_icon(w.get("_last_status").and_then(|v| v.as_str()).unwrap_or(""));
+    let icon = status_icon(w);
     let name = w
         .get("movie_name")
         .and_then(|v| v.as_str())
@@ -1059,5 +1354,164 @@ pub fn format_uptime(sec: u64) -> String {
         format!("{}分{}秒", m, s)
     } else {
         format!("{}秒", s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::parse_window;
+    use serde_json::json;
+
+    /// 构造一个形如 `fetch_cinema_async` 产出的 payload：包一个 movie，movie
+    /// 里直接给若干场次（覆盖多个时间段）。
+    fn cinema_payload_with_shows(movie_id: i64, plist: &[(&str, &str, &str)]) -> Value {
+        // plist: [(seqNo, dt, tm), ...]
+        let plist_json: Vec<Value> = plist
+            .iter()
+            .map(|(seq, dt, tm)| {
+                json!({
+                    "seqNo": seq,
+                    "dt": dt,
+                    "tm": tm,
+                    "th": "IMAX 激光厅",
+                    "tp": "IMAX2D",
+                })
+            })
+            .collect();
+        let movie = json!({
+            "id": movie_id,
+            "nm": "Test Movie",
+            "showCount": plist.len(),
+            "shows": [
+                { "showDate": "2026-08-08", "plist": plist_json }
+            ]
+        });
+        json!({
+            "cinema_id": "37534",
+            "cinema_name": "测试影院",
+            "movies": [movie]
+        })
+    }
+
+    fn watch_with(cinema_id: &str, movie_id: i64, time_window: Option<&str>) -> Value {
+        let mut w = json!({
+            "id": "w_test",
+            "movie_id": movie_id,
+            "movie_name": "Test Movie",
+            "cinemas": [cinema_id],
+            "enabled": true,
+            "mode": "presale",
+        });
+        if let Some(tw) = time_window {
+            w["time_window"] = json!(tw);
+        }
+        w
+    }
+
+    /// 端到端：time_window 不同时，info.shows 是否真的只留下窗口内的场次、
+    /// 状态码是不是预期的（S_OPEN / S_NO_SHOWS）。
+    #[tokio::test]
+    async fn check_watch_filters_by_time_window() {
+        let plist = [
+            ("s1", "2026-08-08", "15:40"),
+            ("s2", "2026-08-08", "19:30"),
+            ("s3", "2026-08-08", "21:50"),
+        ];
+        let payload = cinema_payload_with_shows(1545360, &plist);
+        let mut cache: HashMap<String, Value> =
+            HashMap::from([("37534".to_string(), payload)]);
+
+        // --- 窗口 19:00-22:00：s2 + s3 命中，s1 被剔 ---
+        let w = watch_with("37534", 1545360, Some("19:00-22:00"));
+        let st = check_watch(&w, &mut cache).await;
+        assert_eq!(st.code(), S_OPEN, "19:00-22:00 应有场次，命中 s2/s3");
+        let info = st.info();
+        let got_seqs: BTreeSet<String> = info.shows["37534"]
+            .iter()
+            .map(|s| s.seq_no.clone())
+            .collect();
+        let want: BTreeSet<String> = ["s2", "s3"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(got_seqs, want, "窗口 19-22 应仅含 19:30 / 21:50");
+        assert_eq!(info.matches[0].show_count, 2, "show_count 应重算为 2");
+
+        // --- 窗口 15:00-16:00：只命中 s1 ---
+        let w = watch_with("37534", 1545360, Some("15:00-16:00"));
+        let st = check_watch(&w, &mut cache).await;
+        assert_eq!(st.code(), S_OPEN);
+        let info = st.info();
+        let got_seqs: BTreeSet<String> = info.shows["37534"]
+            .iter()
+            .map(|s| s.seq_no.clone())
+            .collect();
+        assert_eq!(got_seqs, ["s1"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(info.matches[0].show_count, 1);
+
+        // --- 窗口 00:00-01:00：全被过滤，状态 S_NO_SHOWS ---
+        let w = watch_with("37534", 1545360, Some("00:00-01:00"));
+        let st = check_watch(&w, &mut cache).await;
+        assert_eq!(
+            st.code(),
+            S_NO_SHOWS,
+            "00:00-01:00 没有场次，应报 S_NO_SHOWS"
+        );
+        let info = st.info();
+        assert!(
+            info.shows["37534"].is_empty(),
+            "窗口内 0 场，info.shows 也必须为空"
+        );
+        // all_cinemas 占位仍在，但 matches 为空，S_NO_SHOWS 路径走的就是这里
+        assert!(info.matches.is_empty());
+    }
+
+    /// 端到端：time_window 起点含终点不含 —— 19:00 命中，19:00 ≤ t < 22:00
+    #[tokio::test]
+    async fn check_watch_time_window_end_exclusive() {
+        let plist = [
+            ("e1", "2026-08-08", "19:00"), // 边界：起点，含
+            ("e2", "2026-08-08", "21:59"), // 上界前最后 1 分钟，含
+            ("e3", "2026-08-08", "22:00"), // 上界本身，不含
+        ];
+        let payload = cinema_payload_with_shows(1545360, &plist);
+        let mut cache: HashMap<String, Value> =
+            HashMap::from([("37534".to_string(), payload)]);
+        let w = watch_with("37534", 1545360, Some("19:00-22:00"));
+        let st = check_watch(&w, &mut cache).await;
+        let got: BTreeSet<String> = st.info().shows["37534"]
+            .iter()
+            .map(|s| s.seq_no.clone())
+            .collect();
+        let want: BTreeSet<String> = ["e1", "e2"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want, "起点含终点不含：19:00 含、22:00 不含");
+    }
+
+    /// 端到端：HH:MM 解析失败时不应崩，整条放行（按"窗口不限"处理）。
+    /// 这是为什么 maoyan 偶尔给我 `null` 或空串时不能让它炸一片 watch。
+    #[test]
+    fn parse_window_rejects_garbage() {
+        assert!(parse_window("25:00-10:00").is_err());
+        assert!(parse_window("abc").is_err());
+    }
+
+    /// 不设 time_window 时，三场全在
+    #[tokio::test]
+    async fn check_watch_no_time_window_includes_all() {
+        let plist = [
+            ("a", "2026-08-08", "09:00"),
+            ("b", "2026-08-08", "15:40"),
+            ("c", "2026-08-08", "23:30"),
+        ];
+        let payload = cinema_payload_with_shows(1545360, &plist);
+        let mut cache: HashMap<String, Value> =
+            HashMap::from([("37534".to_string(), payload)]);
+        let w = watch_with("37534", 1545360, None);
+        let st = check_watch(&w, &mut cache).await;
+        assert_eq!(st.code(), S_OPEN);
+        let got: BTreeSet<String> = st.info().shows["37534"]
+            .iter()
+            .map(|s| s.seq_no.clone())
+            .collect();
+        let want: BTreeSet<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(got, want);
     }
 }

@@ -204,12 +204,32 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         .map(|a| a.len())
         .unwrap_or(0);
     let total_cinemas = cinemas.len();
-    // 影院 id+name：从 _last_payload.cinema_names 兜底
+    // 影院 id+name 的两层兜底：
+    //   1) cfg.cinemas[] 注册表（watch 一旦 add 就会有，名称来自 cinema picker 的 fetch）
+    //   2) _last_payload.cinema_names（首轮 check 后才更新）
+    let registry_names: std::collections::HashMap<String, String> = cfg
+        .get("cinemas")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|c| {
+                    let id = c.get("id").and_then(|v| v.as_str())?;
+                    let n = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    if n.is_empty() || n.starts_with("影城 ") {
+                        // 跳过"影城 {id}"占位名，避免拿占位当真名展示
+                        None
+                    } else {
+                        Some((id.to_string(), n.to_string()))
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let payload = w
         .get("_last_payload")
         .cloned()
         .unwrap_or(serde_json::json!({}));
-    let names_map: std::collections::HashMap<String, String> = serde_json::from_value(
+    let payload_names: std::collections::HashMap<String, String> = serde_json::from_value(
         payload
             .get("cinema_names")
             .cloned()
@@ -225,7 +245,7 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         .map(|n| format!("{}s", n))
         .unwrap_or_else(|| "(默认)".into());
 
-    // info lines（含影院列表，每个影院一行 "name (id)" 或纯 id）
+    // info lines —— 与「名称」对齐：标签 + 值同行内联，cinema 列表用「、」分隔
     let mut info_lines: Vec<Line> = Vec::new();
     info_lines.push(Line::from(vec![
         Span::styled("名称    ", Style::default().fg(Color::DarkGray)),
@@ -236,30 +256,77 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
-    info_lines.push(Line::from(vec![Span::styled(
-        "影院    ",
-        Style::default().fg(Color::DarkGray),
-    )]));
-    if cinemas.is_empty() {
-        info_lines.push(Line::from(Span::styled(
-            "  （无）",
-            Style::default().fg(Color::DarkGray),
-        )));
+    let cinemas_str: String = if cinemas.is_empty() {
+        "（无）".to_string()
     } else {
-        for cid in &cinemas {
-            let display = match names_map.get(cid) {
-                Some(n) if !n.is_empty() => format!("  {} ({})", n, cid),
-                _ => format!("  {}", cid),
-            };
-            info_lines.push(Line::from(Span::styled(
-                display,
-                Style::default().fg(Color::White),
-            )));
-        }
-    }
+        cinemas
+            .iter()
+            .map(|cid| {
+                // 优先注册表名 → 其次最近一轮 payload 名 → 都没有就裸 id
+                let nm = registry_names
+                    .get(cid)
+                    .cloned()
+                    .or_else(|| payload_names.get(cid).cloned())
+                    .unwrap_or_default();
+                if nm.is_empty() {
+                    cid.clone()
+                } else {
+                    format!("{} ({})", nm, cid)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    info_lines.push(Line::from(vec![
+        Span::styled("影院    ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            cinemas_str,
+            Style::default().fg(Color::White),
+        ),
+    ]));
     info_lines.push(Line::from(vec![
         Span::styled("日期    ", Style::default().fg(Color::DarkGray)),
         Span::raw(dates_str),
+    ]));
+    // 时段窗口：紧贴在「日期」下面，让「日期下面的某个时段」语义一目了然
+    let time_window = w
+        .get("time_window")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    info_lines.push(Line::from(vec![
+        Span::styled("时段    ", Style::default().fg(Color::DarkGray)),
+        if let Some(tw) = time_window {
+            Span::styled(
+                tw.to_string(),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            )
+        } else {
+            Span::styled(
+                "不限",
+                Style::default().fg(Color::DarkGray),
+            )
+        },
+        Span::styled(
+            "  （起点含终点不含）",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ]));
+    let is_incremental = crate::config::watch_mode(&w) == crate::config::MODE_INCREMENTAL;
+    info_lines.push(Line::from(vec![
+        Span::styled("模式    ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            if is_incremental {
+                "增场监控（持续盯新增场次）"
+            } else {
+                "开票提醒（首次开售即报）"
+            },
+            Style::default().fg(if is_incremental {
+                Color::Magenta
+            } else {
+                Color::White
+            }),
+        ),
     ]));
     info_lines.push(Line::from(vec![
         Span::styled("间隔    ", Style::default().fg(Color::DarkGray)),
@@ -278,10 +345,28 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
             }),
         ),
     ]));
-    info_lines.push(Line::from(vec![
-        Span::styled("触发    ", Style::default().fg(Color::DarkGray)),
-        Span::raw(format!(" {}/{}", fired_n, total_cinemas)),
-    ]));
+    if is_incremental {
+        // 增场模式不用 fired_cinemas，改报基线里已记住多少场
+        let known: usize = w
+            .get("seen_shows")
+            .and_then(|v| v.as_object())
+            .map(|o| {
+                o.values()
+                    .filter_map(|v| v.as_array())
+                    .map(|a| a.len())
+                    .sum()
+            })
+            .unwrap_or(0);
+        info_lines.push(Line::from(vec![
+            Span::styled("基线    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" 已知 {} 场", known)),
+        ]));
+    } else {
+        info_lines.push(Line::from(vec![
+            Span::styled("触发    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(format!(" {}/{}", fired_n, total_cinemas)),
+        ]));
+    }
     info_lines.push(Line::from(vec![
         Span::styled("检查    ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(" {} 次", check_count)),

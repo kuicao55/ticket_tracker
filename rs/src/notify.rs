@@ -67,6 +67,110 @@ pub fn notify_discord(
     rt.block_on(notify_discord_async(webhook, title, message, url))
 }
 
+// ----------------- 结果通知（仅告警，不发心跳） -----------------
+
+/// 通过 webhook 发「结果通知」。与 `discord_webhook` 的关键区别：
+/// 这条通道**只**在告警事件里被调（开票提醒 / 增场新增），不会发每小时的例行报告。
+///
+/// URL 形如 `https://discord.com/api/webhooks/...` 时走 Discord 格式；
+/// 其他 URL（飞书 / Slack / Bark / 自建服务）按通用 JSON `{title, content, url}` 发。
+/// 返回 `Ok(true)` 表示至少一次请求成功。
+pub async fn notify_results_webhook_async(
+    url: Option<&str>,
+    title: &str,
+    message: &str,
+    click_url: Option<&str>,
+) -> Result<bool> {
+    let Some(u) = url else {
+        return Ok(false);
+    };
+    if u.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let payload: serde_json::Value = if u.starts_with(DISCORD_HOST) {
+        let mut content = format!("**{}**\n{}", title, message);
+        if let Some(link) = click_url {
+            content.push_str(&format!("\n👉 {}", link));
+        }
+        serde_json::json!({ "content": content })
+    } else {
+        serde_json::json!({
+            "title": title,
+            "content": message,
+            "url": click_url,
+        })
+    };
+
+    let cli = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .timeout(Duration::from_secs(15))
+        .danger_accept_invalid_certs(true)
+        .build()?;
+    let mut last: Option<String> = None;
+    for i in 0..3 {
+        match cli.post(u).json(&payload).send().await {
+            Ok(r) if r.status().is_success() => return Ok(true),
+            Ok(r) => last = Some(format!("HTTP {}", r.status())),
+            Err(e) => last = Some(format!("req: {}", e)),
+        }
+        if i + 1 < 3 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+        }
+    }
+    let _ = last;
+    Ok(false)
+}
+
+/// 通过本地 `msmtp` 子进程发「结果通知」邮件。
+/// 收件人从 config 的 `notify_email_to` 读，SMTP 凭证 / 发件人由用户在自己
+/// 的 `~/.msmtprc` 里配置（`brew install msmtp` 一次，永久免维护）。
+/// `msmtp` 不在 PATH / 未安装时静默失败（不抛错），避免告警被吞。
+pub fn notify_results_email(
+    to_addr: Option<&str>,
+    title: &str,
+    message: &str,
+    click_url: Option<&str>,
+) -> bool {
+    let Some(addr) = to_addr else {
+        return false;
+    };
+    if addr.trim().is_empty() {
+        return false;
+    }
+    let mut body = format!(
+        "From: ticket-tracker <ticket-tracker@localhost>\n\
+         To: {}\n\
+         Subject: {}\n\
+         Content-Type: text/plain; charset=UTF-8\n\
+         \n\
+         {}",
+        addr, title, message
+    );
+    if let Some(u) = click_url {
+        body.push_str(&format!("\n\n👉 {}", u));
+    }
+    let result = Command::new("msmtp")
+        .arg(addr)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match result {
+        Ok(mut child) => {
+            if let Some(stdin) = child.stdin.as_mut() {
+                use std::io::Write;
+                let _ = stdin.write_all(body.as_bytes());
+            }
+            match child.wait() {
+                Ok(s) if s.success() => true,
+                _ => false,
+            }
+        }
+        Err(_) => false,
+    }
+}
+
 // ----------------- macOS 电脑通知 -----------------
 
 /// 在 macOS 上发系统通知 + 周期性响铃 + 语音 + 自动打开购票页。

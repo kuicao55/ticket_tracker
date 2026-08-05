@@ -185,14 +185,18 @@ fn cmd_doctor() -> Result<String, String> {
 
 fn cmd_add(rest: &[&str], _app: &mut App) -> Result<String, String> {
     if rest.is_empty() {
-        return Err("用法: :add <movie_id> [-c <cinema>...] [-d <date>...] [--name ...]".into());
+        return Err("用法: :add <movie_id> [-c <cinema>...] [-d <date>...] [--time-window HH:MM-HH:MM] [--name ...] [--mode presale|incremental] [--notify-webhook URL] [--notify-email ADDR]".into());
     }
     let movie_id: i64 = rest[0].parse().map_err(|_| "movie_id 必须是数字".to_string())?;
-    // 简化解析：剩余参数识别 -c / -d / --name / --interval
+    // 简化解析：剩余参数识别 -c / -d / --name / --interval / --mode / --time-window / --notify-webhook / --notify-email
     let mut cinemas: Vec<String> = vec![];
     let mut dates: Vec<String> = vec![];
     let mut name: Option<String> = None;
     let mut interval: Option<u64> = None;
+    let mut mode: String = config::MODE_PRESALE.to_string();
+    let mut time_window: Option<String> = None;
+    let mut notify_webhook: Option<String> = None;
+    let mut notify_email: Option<String> = None;
     let mut i = 1;
     while i < rest.len() {
         match rest[i] {
@@ -228,6 +232,41 @@ fn cmd_add(rest: &[&str], _app: &mut App) -> Result<String, String> {
                     return Err("--interval 缺参数".into());
                 }
             }
+            "--mode" => {
+                if let Some(v) = rest.get(i + 1) {
+                    if *v != config::MODE_PRESALE && *v != config::MODE_INCREMENTAL {
+                        return Err("--mode 只能是 presale 或 incremental".into());
+                    }
+                    mode = v.to_string();
+                    i += 2;
+                } else {
+                    return Err("--mode 缺参数".into());
+                }
+            }
+            "--time-window" => {
+                if let Some(v) = rest.get(i + 1) {
+                    time_window = Some(v.to_string());
+                    i += 2;
+                } else {
+                    return Err("--time-window 缺参数".into());
+                }
+            }
+            "--notify-webhook" => {
+                if let Some(v) = rest.get(i + 1) {
+                    notify_webhook = Some(v.to_string());
+                    i += 2;
+                } else {
+                    return Err("--notify-webhook 缺参数".into());
+                }
+            }
+            "--notify-email" => {
+                if let Some(v) = rest.get(i + 1) {
+                    notify_email = Some(v.to_string());
+                    i += 2;
+                } else {
+                    return Err("--notify-email 缺参数".into());
+                }
+            }
             other => {
                 return Err(format!("未知参数: {}", other));
             }
@@ -242,6 +281,10 @@ fn cmd_add(rest: &[&str], _app: &mut App) -> Result<String, String> {
         if dates.is_empty() { None } else { Some(&dates) },
         name.as_deref(),
         interval,
+        &mode,
+        time_window.as_deref(),
+        notify_webhook.as_deref(),
+        notify_email.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     Ok(format!("添加 watch {}", id))

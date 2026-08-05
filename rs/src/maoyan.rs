@@ -107,6 +107,78 @@ pub fn movie_dates(movie: &Value) -> Vec<String> {
     ds.into_iter().collect()
 }
 
+/// 单个场次的明细。`seq_no` 是猫眼给每个场次的唯一编号（如 `202608090008709`），
+/// 增场监控靠它做 diff。
+#[derive(Debug, Clone)]
+pub struct ShowInfo {
+    pub seq_no: String,
+    /// 日期 YYYY-MM-DD
+    pub dt: String,
+    /// 开场时间 HH:MM
+    pub tm: String,
+    /// 影厅，如「IMAX 激光厅」
+    pub th: String,
+    /// 制式，如「IMAX2D」
+    pub tp: String,
+}
+
+impl ShowInfo {
+    /// 通知里用的一行描述：`08-09 19:30 IMAX 激光厅 IMAX2D`
+    pub fn label(&self) -> String {
+        let date = self.dt.get(5..).unwrap_or(self.dt.as_str());
+        let mut s = format!("{} {}", date, self.tm);
+        if !self.th.is_empty() {
+            s.push(' ');
+            s.push_str(&self.th);
+        }
+        if !self.tp.is_empty() {
+            s.push(' ');
+            s.push_str(&self.tp);
+        }
+        s
+    }
+}
+
+/// 摊平 `shows[].plist[]`，返回全部场次明细。没有 `seqNo` 的条目会被跳过
+/// （无法参与 diff）。结果按 (日期, 时间) 排序。
+pub fn movie_shows(movie: &Value) -> Vec<ShowInfo> {
+    let mut out = Vec::new();
+    let Some(shows) = movie.get("shows").and_then(|v| v.as_array()) else {
+        return out;
+    };
+    for s in shows {
+        let Some(plist) = s.get("plist").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for p in plist {
+            // seqNo 可能是字符串或数字，两种都收
+            let seq_no = match p.get("seqNo") {
+                Some(Value::String(s)) => s.clone(),
+                Some(Value::Number(n)) => n.to_string(),
+                _ => continue,
+            };
+            if seq_no.is_empty() {
+                continue;
+            }
+            let get = |k: &str| {
+                p.get(k)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            };
+            out.push(ShowInfo {
+                seq_no,
+                dt: get("dt"),
+                tm: get("tm"),
+                th: get("th"),
+                tp: get("tp"),
+            });
+        }
+    }
+    out.sort_by(|a, b| (&a.dt, &a.tm).cmp(&(&b.dt, &b.tm)));
+    out
+}
+
 pub fn find_movie<'a>(cinema_payload: &'a Value, movie_id: i64, keywords: &[&str]) -> Option<&'a Value> {
     let movies = cinema_payload.get("movies")?.as_array()?;
     // 精确 id 匹配
@@ -209,3 +281,60 @@ pub fn buy_pc_url(cinema_id: &str) -> String {
 pub fn buy_pc_url_owned(cinema_id: &str) -> String {
     buy_pc_url(cinema_id)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 取自 `cinemaDetail?cinemaId=37534` 的真实响应片段（奥德赛）。
+    fn sample_movie() -> Value {
+        json!({
+            "id": 1545360,
+            "nm": "奥德赛",
+            "showCount": 3,
+            "shows": [
+                { "showDate": "2026-08-08", "plist": [
+                    { "seqNo": "202608080026845", "dt": "2026-08-08", "tm": "15:40",
+                      "th": "IMAX 激光厅", "tp": "IMAX2D" }
+                ]},
+                { "showDate": "2026-08-09", "plist": [
+                    { "seqNo": "202608090008709", "dt": "2026-08-09", "tm": "15:40",
+                      "th": "IMAX 激光厅", "tp": "IMAX2D" },
+                    // 没有 seqNo 的条目无法参与 diff，必须跳过
+                    { "dt": "2026-08-09", "tm": "20:00" }
+                ]}
+            ]
+        })
+    }
+
+    #[test]
+    fn movie_shows_extracts_seq_no_and_skips_entries_without_it() {
+        let shows = movie_shows(&sample_movie());
+        let seqs: Vec<&str> = shows.iter().map(|s| s.seq_no.as_str()).collect();
+        assert_eq!(seqs, vec!["202608080026845", "202608090008709"]);
+    }
+
+    #[test]
+    fn movie_shows_sorts_by_date_then_time() {
+        let m = json!({ "shows": [{ "plist": [
+            { "seqNo": "b", "dt": "2026-08-09", "tm": "22:15" },
+            { "seqNo": "c", "dt": "2026-08-10", "tm": "09:00" },
+            { "seqNo": "a", "dt": "2026-08-09", "tm": "19:30" },
+        ]}]});
+        let shows = movie_shows(&m);
+        let seqs: Vec<&str> = shows.iter().map(|s| s.seq_no.as_str()).collect();
+        assert_eq!(seqs, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn label_is_human_readable() {
+        let shows = movie_shows(&sample_movie());
+        assert_eq!(shows[1].label(), "08-09 15:40 IMAX 激光厅 IMAX2D");
+    }
+
+    #[test]
+    fn movie_shows_on_movie_without_shows_is_empty() {
+        assert!(movie_shows(&json!({ "nm": "x" })).is_empty());
+    }
+}
+

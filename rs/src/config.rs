@@ -136,6 +136,7 @@ pub fn load_or_init() -> Result<Value> {
 
     migrate_legacy_state(&mut cfg)?;
     migrate_watch_schema(&mut cfg)?;
+    migrate_per_watch_notify(&mut cfg)?;
     Ok(cfg)
 }
 
@@ -253,6 +254,53 @@ fn migrate_watch_schema(cfg: &mut Value) -> Result<()> {
     Ok(())
 }
 
+/// v1 全局通知 → v2 per-watch 通知迁移：
+/// - 老的 `notify_webhook` / `notify_email_to` 在 cfg 顶层
+/// - 现在搬到每个 watch 上，没填的默认继承全局值
+/// - 迁移完删掉全局键
+fn migrate_per_watch_notify(cfg: &mut Value) -> Result<()> {
+    if cfg.get("_per_watch_notify_migrated") == Some(&json!(true)) {
+        return Ok(());
+    }
+    let global_wh = cfg
+        .get("notify_webhook")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .filter(|s| !s.is_empty());
+    let global_email = cfg
+        .get("notify_email_to")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+        .filter(|s| !s.is_empty());
+    let needs_save = global_wh.is_some() || global_email.is_some();
+    if let Some(watches) = cfg.get_mut("watches").and_then(|v| v.as_array_mut()) {
+        for w in watches.iter_mut() {
+            // 没有 per-watch 字段、或显式 null，都用全局兜底
+            let has_wh = w.get("notify_webhook").map(|v| !v.is_null()).unwrap_or(false);
+            let has_email = w.get("notify_email_to").map(|v| !v.is_null()).unwrap_or(false);
+            if !has_wh {
+                if let Some(ref g) = global_wh {
+                    w["notify_webhook"] = json!(g);
+                }
+            }
+            if !has_email {
+                if let Some(ref g) = global_email {
+                    w["notify_email_to"] = json!(g);
+                }
+            }
+        }
+    }
+    if let Some(obj) = cfg.as_object_mut() {
+        obj.remove("notify_webhook");
+        obj.remove("notify_email_to");
+    }
+    cfg["_per_watch_notify_migrated"] = json!(true);
+    if needs_save {
+        save(cfg)?;
+    }
+    Ok(())
+}
+
 // ----------------- 影院操作 -----------------
 
 pub fn find_cinema<'a>(cfg: &'a Value, cinema_id: &str) -> Option<&'a Value> {
@@ -304,6 +352,48 @@ pub fn remove_cinema(cfg: &mut Value, cinema_id: &str) -> Result<bool> {
 
 // ----------------- 监视项操作 -----------------
 
+/// watch 模式：开票提醒（首次开售即报，报完自动停用）。缺省值。
+pub const MODE_PRESALE: &str = "presale";
+/// watch 模式：增场监控（首轮静默存基线，之后每次出现新场次就报，不自动停用）。
+pub const MODE_INCREMENTAL: &str = "incremental";
+
+/// 读 watch 的模式，缺省 / 非法值一律按 `presale` 处理（向后兼容旧配置）。
+pub fn watch_mode(watch: &Value) -> &'static str {
+    match watch.get("mode").and_then(|v| v.as_str()) {
+        Some(MODE_INCREMENTAL) => MODE_INCREMENTAL,
+        _ => MODE_PRESALE,
+    }
+}
+
+/// 读 watch 的时段窗口（如 `"19:00-22:00"`）。null / 空 / 非法 → None（不限）。
+pub fn watch_time_window(watch: &Value) -> Option<(u32, u32, u32, u32)> {
+    watch
+        .get("time_window")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .and_then(|s| parse_window(s).ok())
+}
+
+/// 给定场次的 `"HH:MM"` 时间，判断是否落在 watch 的时段窗口内。
+/// 无窗口配置 → 一律 true（向后兼容旧 watch）。
+/// `tm` 解析失败也按 true 处理，宁可多报不要漏报。
+pub fn in_time_window(watch: &Value, tm: &str) -> bool {
+    let Some((sh, sm, eh, em)) = watch_time_window(watch) else {
+        return true;
+    };
+    let Some((hh, mm)) = tm.split_once(':') else {
+        return true;
+    };
+    let (Ok(h), Ok(m)) = (hh.parse::<u32>(), mm.parse::<u32>()) else {
+        return true;
+    };
+    let t = h * 60 + m;
+    let lo = sh * 60 + sm;
+    let hi = eh * 60 + em;
+    (lo..hi).contains(&t)
+}
+
 pub fn list_watches(cfg: &Value) -> Vec<Value> {
     cfg.get("watches")
         .and_then(|v| v.as_array())
@@ -333,6 +423,10 @@ pub fn add_watch(
     dates: Option<&[String]>,
     name: Option<&str>,
     interval: Option<u64>,
+    mode: &str,
+    time_window: Option<&str>,
+    notify_webhook: Option<&str>,
+    notify_email_to: Option<&str>,
 ) -> Result<String> {
     let cinemas_v: Vec<String> = cinemas.iter().map(|s| s.to_string()).collect();
     for cid in &cinemas_v {
@@ -340,7 +434,13 @@ pub fn add_watch(
             add_cinema(cfg, cid, None)?;
         }
     }
+    if let Some(tw) = time_window {
+        if !tw.trim().is_empty() {
+            parse_window(tw).map_err(|e| anyhow!("time_window 格式错误: {}", e))?;
+        }
+    }
     let watch_id = format!("w_{}", &Uuid::new_v4().to_string()[..6]);
+    let tw_str = time_window.map(str::trim).filter(|s| !s.is_empty());
     let watch = json!({
         "id": watch_id,
         "movie_id": movie_id,
@@ -353,6 +453,10 @@ pub fn add_watch(
             Value::Array(v.into_iter().map(Value::String).collect())
         }).unwrap_or(Value::Null),
         "interval": interval.map(|n| json!(n)).unwrap_or(Value::Null),
+        "mode": if mode == MODE_INCREMENTAL { MODE_INCREMENTAL } else { MODE_PRESALE },
+        "time_window": tw_str.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
+        "notify_webhook": notify_webhook.map(String::from).map(Value::String).unwrap_or(Value::Null),
+        "notify_email_to": notify_email_to.map(String::from).map(Value::String).unwrap_or(Value::Null),
         "enabled": true,
         "presale_fired": false,
         "created_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -404,6 +508,59 @@ pub fn mark_presale_fired(cfg: &mut Value, watch_id: &str, cinema_id: &str) -> R
     Ok(())
 }
 
+// ----------------- 增场监控基线 -----------------
+
+/// 读某 watch 在某影院已记录的场次 `seqNo` 基线。
+///
+/// 返回 `None` 表示**从未建立过基线**（该 watch 刚建/刚切到增场模式），调用方应当
+/// 静默建线而不是把当前所有场次都当成"新增"。返回 `Some(空集)` 表示建过线但当时
+/// 一场都没有，此时任何场次都是真新增。
+pub fn seen_shows(watch: &Value, cinema_id: &str) -> Option<std::collections::BTreeSet<String>> {
+    let arr = watch
+        .get("seen_shows")
+        .and_then(|v| v.as_object())?
+        .get(cinema_id)?
+        .as_array()?;
+    Some(
+        arr.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect(),
+    )
+}
+
+/// 覆写某 watch 某影院的 `seqNo` 基线。返回是否真的发生了变化 —— 调用方据此决定
+/// 是否落盘，避免每轮 tick（默认 90s）都无谓地重写 config.json。本函数**不** save。
+pub fn set_seen_shows(
+    cfg: &mut Value,
+    watch_id: &str,
+    cinema_id: &str,
+    seqs: &std::collections::BTreeSet<String>,
+) -> bool {
+    let Some(w) = find_watch_mut(cfg, watch_id) else {
+        return false;
+    };
+    let changed = match seen_shows(w, cinema_id) {
+        Some(old) => &old != seqs,
+        None => true,
+    };
+    if !changed {
+        return false;
+    }
+    if !w.get("seen_shows").map(|v| v.is_object()).unwrap_or(false) {
+        w["seen_shows"] = json!({});
+    }
+    let list: Vec<Value> = seqs.iter().cloned().map(Value::String).collect();
+    w["seen_shows"][cinema_id] = Value::Array(list);
+    true
+}
+
+/// 增场提醒发出后打时间戳（增场模式不写 `fired_cinemas`，也不自动停用）。
+pub fn touch_last_alert(cfg: &mut Value, watch_id: &str) {
+    if let Some(w) = find_watch_mut(cfg, watch_id) {
+        w["last_alert_at"] = json!(chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string());
+    }
+}
+
 // ----------------- 运行期 -----------------
 
 pub fn set_runtime(cfg: &mut Value, started_at: f64) {
@@ -419,3 +576,130 @@ pub fn set_runtime(cfg: &mut Value, started_at: f64) {
 
 /// `Config` 实际就是 `serde_json::Value`；类型别名仅为语义可读。
 pub type Config = Value;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn set(items: &[&str]) -> BTreeSet<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn cfg_with_watch(watch: Value) -> Value {
+        json!({ "watches": [watch] })
+    }
+
+    #[test]
+    fn watch_mode_defaults_to_presale_for_legacy_watches() {
+        // 老配置里根本没有 mode 字段，必须按开票提醒处理，行为不能变
+        assert_eq!(watch_mode(&json!({ "id": "w_1" })), MODE_PRESALE);
+        assert_eq!(watch_mode(&json!({ "mode": "乱写" })), MODE_PRESALE);
+        assert_eq!(
+            watch_mode(&json!({ "mode": "incremental" })),
+            MODE_INCREMENTAL
+        );
+    }
+
+    /// 这是整个增场逻辑最关键的区分：
+    /// "从没建过线"（None）要静默建线，"建过线但当时 0 场"（空集）要照常报新增。
+    #[test]
+    fn seen_shows_distinguishes_never_baselined_from_empty_baseline() {
+        assert_eq!(seen_shows(&json!({ "id": "w_1" }), "37534"), None);
+        // seen_shows 存在但没有这个影院 → 同样算没建过线
+        assert_eq!(
+            seen_shows(&json!({ "seen_shows": { "999": [] } }), "37534"),
+            None
+        );
+        assert_eq!(
+            seen_shows(&json!({ "seen_shows": { "37534": [] } }), "37534"),
+            Some(BTreeSet::new())
+        );
+        assert_eq!(
+            seen_shows(&json!({ "seen_shows": { "37534": ["a"] } }), "37534"),
+            Some(set(&["a"]))
+        );
+    }
+
+    #[test]
+    fn set_seen_shows_reports_no_change_when_identical() {
+        let mut cfg = cfg_with_watch(json!({
+            "id": "w_1",
+            "seen_shows": { "37534": ["202608090008709"] }
+        }));
+        assert!(!set_seen_shows(
+            &mut cfg,
+            "w_1",
+            "37534",
+            &set(&["202608090008709"])
+        ));
+    }
+
+    #[test]
+    fn set_seen_shows_creates_baseline_on_first_call() {
+        let mut cfg = cfg_with_watch(json!({ "id": "w_1" }));
+        assert!(set_seen_shows(&mut cfg, "w_1", "37534", &set(&["a", "b"])));
+        let w = find_watch(&cfg, "w_1").unwrap();
+        assert_eq!(seen_shows(w, "37534"), Some(set(&["a", "b"])));
+    }
+
+    /// 场次撤掉后要同步移出基线，否则同一个 seqNo 复排时会被当成老场次而漏报。
+    #[test]
+    fn set_seen_shows_prunes_disappeared_showtimes() {
+        let mut cfg = cfg_with_watch(json!({
+            "id": "w_1",
+            "seen_shows": { "37534": ["a", "b"] }
+        }));
+        assert!(set_seen_shows(&mut cfg, "w_1", "37534", &set(&["b"])));
+        let w = find_watch(&cfg, "w_1").unwrap();
+        assert_eq!(seen_shows(w, "37534"), Some(set(&["b"])));
+    }
+
+    #[test]
+    fn set_seen_shows_keeps_other_cinemas_untouched() {
+        let mut cfg = cfg_with_watch(json!({
+            "id": "w_1",
+            "seen_shows": { "37534": ["a"], "42020": ["z"] }
+        }));
+        set_seen_shows(&mut cfg, "w_1", "37534", &set(&["a", "new"]));
+        let w = find_watch(&cfg, "w_1").unwrap();
+        assert_eq!(seen_shows(w, "42020"), Some(set(&["z"])));
+    }
+
+    fn watch_with_tw(tw: &str) -> Value {
+        json!({ "id": "w_1", "time_window": tw })
+    }
+
+    #[test]
+    fn watch_time_window_parses_or_returns_none() {
+        assert_eq!(watch_time_window(&watch_with_tw("19:00-22:00")), Some((19, 0, 22, 0)));
+        assert_eq!(watch_time_window(&watch_with_tw("")), None);
+        assert_eq!(watch_time_window(&watch_with_tw("  ")), None);
+        assert_eq!(watch_time_window(&json!({})), None);
+        assert_eq!(watch_time_window(&json!({"time_window": null})), None);
+        assert_eq!(watch_time_window(&watch_with_tw("乱写")), None); // 解析失败容错
+    }
+
+    /// `in_time_window` 是真正的过滤函数：无窗口 / 解析失败 → 全放行（向后兼容）
+    #[test]
+    fn in_time_window_open_when_unset_or_malformed() {
+        let w_no = json!({});
+        for tm in ["00:00", "12:00", "23:59"] {
+            assert!(in_time_window(&w_no, tm));
+        }
+        let w_bad = watch_with_tw("乱写");
+        assert!(in_time_window(&w_bad, "12:00"));
+        let w_bad_tm = json!({});
+        assert!(in_time_window(&w_bad_tm, "not-a-time"));
+    }
+
+    #[test]
+    fn in_time_window_inclusive_lo_exclusive_hi() {
+        let w = watch_with_tw("19:00-22:00");
+        assert!(in_time_window(&w, "19:00"));  // 起点包含
+        assert!(in_time_window(&w, "21:59"));
+        assert!(!in_time_window(&w, "22:00")); // 终点不含（与 Python range 一致）
+        assert!(!in_time_window(&w, "18:59"));
+        assert!(!in_time_window(&w, "23:00"));
+    }
+}

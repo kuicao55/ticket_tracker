@@ -63,8 +63,28 @@ pub enum FieldKind {
     Webhook,
     MovieId,    // Enter → 打开 MovieSearch
     CinemaList, // Enter → 打开 CinemaPicker
+    Mode,       // Enter / ←→ 在「开票提醒」「增场监控」之间切换
+    TestNotify, // 仅 edit_watch：Enter → 给 webhook/邮箱各发一条测试消息
     Submit,
     Cancel,
+}
+
+/// 「模式」字段在表单里显示的中文标签。
+pub fn mode_label(mode: &str) -> &'static str {
+    if mode == config::MODE_INCREMENTAL {
+        "增场监控"
+    } else {
+        "开票提醒"
+    }
+}
+
+/// 表单里的「模式」文字 → config 里存储的 mode 值。
+pub fn label_to_mode(label: &str) -> &'static str {
+    if label == "增场监控" {
+        config::MODE_INCREMENTAL
+    } else {
+        config::MODE_PRESALE
+    }
 }
 
 pub enum SearchState {
@@ -143,8 +163,12 @@ impl FormModal {
             FormField::new("电影 ID", FieldKind::MovieId, true),
             FormField::new("影院", FieldKind::CinemaList, true),
             FormField::new("日期", FieldKind::DateList, false),
+            FormField::new("时段", FieldKind::TimeWindow, false),
+            FormField::with_value("模式", FieldKind::Mode, false, "开票提醒".into()),
             FormField::new("电影名", FieldKind::Text, false),
             FormField::new("独立间隔", FieldKind::OptionalInteger, false),
+            FormField::new("通知 webhook", FieldKind::Webhook, false),
+            FormField::new("通知邮箱", FieldKind::Text, false),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
         ];
@@ -172,6 +196,12 @@ impl FormModal {
                 })
                 .unwrap_or_default()
         };
+        let opt_str = |key: &str| -> String {
+            w.get(key)
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
         let cinemas = join_arr("cinemas");
         let dates = join_arr("dates");
         let interval = w
@@ -182,7 +212,27 @@ impl FormModal {
         let fields = vec![
             FormField::with_value("影院", FieldKind::CinemaList, true, cinemas),
             FormField::with_value("日期", FieldKind::DateList, false, dates),
+            FormField::with_value("时段", FieldKind::TimeWindow, false, opt_str("time_window")),
+            FormField::with_value(
+                "模式",
+                FieldKind::Mode,
+                false,
+                mode_label(crate::config::watch_mode(w)).to_string(),
+            ),
             FormField::with_value("独立间隔", FieldKind::OptionalInteger, false, interval),
+            FormField::with_value(
+                "通知 webhook",
+                FieldKind::Webhook,
+                false,
+                opt_str("notify_webhook"),
+            ),
+            FormField::with_value(
+                "通知邮箱",
+                FieldKind::Text,
+                false,
+                opt_str("notify_email_to"),
+            ),
+            FormField::button("测试通知", FieldKind::TestNotify),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
         ];
@@ -346,6 +396,21 @@ fn handle_form_key(app: &mut App, mut f: FormModal, key: KeyEvent) -> Option<Mod
             FieldKind::Cancel => None,
             FieldKind::MovieId => Some(open_movie_search(f)),
             FieldKind::CinemaList => Some(open_cinema_picker(f)),
+            FieldKind::Mode => {
+                // Enter 在「开票提醒 / 增场监控」间切换
+                let cur = &f.fields[f.focus].value;
+                f.fields[f.focus].value = if cur == "增场监控" {
+                    "开票提醒".to_string()
+                } else {
+                    "增场监控".to_string()
+                };
+                Some(Modal::Form(f))
+            }
+            FieldKind::TestNotify => {
+                let msg = trigger_test_notify(&f);
+                cmd::push_status(app, msg, 6);
+                Some(Modal::Form(f))
+            }
             _ => {
                 let original = f.fields[f.focus].value.clone();
                 f.mode = FormMode::Editing { original };
@@ -595,15 +660,24 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         return Err("至少填一个影院 ID".into());
     }
     let dates = parse_dates(&f.fields[2].value)?;
-    let name = {
+    let time_window = {
         let t = f.fields[3].value.trim();
-        if t.is_empty() {
-            None
-        } else {
-            Some(t.to_string())
-        }
+        if t.is_empty() { None } else { Some(t.to_string()) }
     };
-    let interval = parse_opt_u64(&f.fields[4].value, "间隔")?;
+    let mode = label_to_mode(f.fields[4].value.trim());
+    let name = {
+        let t = f.fields[5].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
+    let interval = parse_opt_u64(&f.fields[6].value, "间隔")?;
+    let notify_webhook = {
+        let t = f.fields[7].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
+    let notify_email_to = {
+        let t = f.fields[8].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     let cref: Vec<&str> = cinemas.iter().map(String::as_str).collect();
     let id = config::add_watch(
@@ -613,6 +687,10 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         dates.as_deref(),
         name.as_deref(),
         interval,
+        mode,
+        time_window.as_deref(),
+        notify_webhook.as_deref(),
+        notify_email_to.as_deref(),
     )
     .map_err(|e| e.to_string())?;
     Ok(format!("已添加 watch {}", id))
@@ -621,7 +699,20 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
 fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, String> {
     let cinemas = split_ids(&f.fields[0].value);
     let dates = parse_dates(&f.fields[1].value)?;
-    let interval = parse_opt_u64(&f.fields[2].value, "间隔")?;
+    let time_window = {
+        let t = f.fields[2].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
+    let mode = label_to_mode(f.fields[3].value.trim());
+    let interval = parse_opt_u64(&f.fields[4].value, "间隔")?;
+    let notify_webhook = {
+        let t = f.fields[5].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
+    let notify_email_to = {
+        let t = f.fields[6].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     // 注册尚未收藏的影院
     for cid in &cinemas {
@@ -636,12 +727,51 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
         Some(d) => serde_json::json!(d),
         None => Value::Null,
     };
+    // 时段窗口：空 = 移除配置；非空 = 落盘
+    let tw = &time_window;
+    match tw {
+        Some(s) if !s.trim().is_empty() => {
+            config::parse_window(s).map_err(|e| format!("时段格式错误: {}", e))?;
+            w["time_window"] = serde_json::Value::String(s.clone());
+        }
+        _ => {
+            if let Some(o) = w.as_object_mut() {
+                o.remove("time_window");
+            }
+        }
+    }
+    w["mode"] = serde_json::json!(mode);
     match interval {
         Some(secs) => w["interval"] = serde_json::json!(secs),
         None => {
             if let Some(o) = w.as_object_mut() {
                 o.remove("interval");
             }
+        }
+    }
+    // 通知通道
+    match &notify_webhook {
+        Some(s) => w["notify_webhook"] = serde_json::Value::String(s.clone()),
+        None => {
+            if let Some(o) = w.as_object_mut() {
+                o.remove("notify_webhook");
+            }
+        }
+    }
+    match &notify_email_to {
+        Some(s) => w["notify_email_to"] = serde_json::Value::String(s.clone()),
+        None => {
+            if let Some(o) = w.as_object_mut() {
+                o.remove("notify_email_to");
+            }
+        }
+    }
+    // 影院/日期/时段/模式变化 → 清 seen_shows（与 cli 行为对齐）
+    let _ = w; // suppress unused warning if not used below
+    let any_baseline_change = true; // 简化：保存路径上无 seen_shows diff，记住清一次
+    if any_baseline_change {
+        if let Some(o) = w.as_object_mut() {
+            o.remove("seen_shows");
         }
     }
     config::save(&cfg).map_err(|e| e.to_string())?;
@@ -686,7 +816,210 @@ fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {
     Ok("全局设置已保存".into())
 }
 
-// ------------------------- 解析工具 -------------------------
+/// 编辑表单里的「测试通知」按钮：给当前表单里配的 webhook / 邮箱各发一条
+/// 客户可读的测试消息。返回值交给底部 status bar 显示执行结果。
+///
+/// 表单字段索引（按 `edit_watch` 现在的布局）：
+///   0 cinemas | 1 dates | 2 time_window | 3 mode | 4 interval
+///   5 notify_webhook | 6 notify_email_to | 7 测试通知 | 8 确定 | 9 取消
+fn trigger_test_notify(f: &FormModal) -> String {
+    // 索引 5/6 才是真的 webhook / email；之前 4/5 是把 interval 当 webhook 误读
+    let webhook = f.fields.get(5).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let email = f.fields.get(6).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let cinemas_in_form = f.fields.get(0).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let dates_in_form = f.fields.get(1).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let tw_in_form = f.fields.get(2).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let mode_label_in_form = f.fields.get(3).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let interval_in_form = f.fields.get(4).map(|x| x.value.trim().to_string()).unwrap_or_default();
+
+    // 从 config 里捞 movie_name / movie_id（form 不显示这两个），
+    // 同时拿两层兜底的影院名（注册表 → _last_payload）。
+    let (movie_name, movie_id, wid_str, registry_names, payload_names) = match &f.kind {
+        FormKind::EditWatch { wid } => {
+            if let Ok(cfg) = crate::config::load_or_init() {
+                if let Some(w) = crate::config::find_watch(&cfg, wid) {
+                    let n = w
+                        .get("movie_name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(未命名)")
+                        .to_string();
+                    let id = w.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                    let reg: std::collections::HashMap<String, String> = cfg
+                        .get("cinemas")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|c| {
+                                    let id = c.get("id").and_then(|v| v.as_str())?;
+                                    let n = c.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                                    if n.is_empty() || n.starts_with("影城 ") {
+                                        None
+                                    } else {
+                                        Some((id.to_string(), n.to_string()))
+                                    }
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let pay: std::collections::HashMap<String, String> = w
+                        .get("_last_payload")
+                        .and_then(|p| p.get("cinema_names"))
+                        .and_then(|c| c.as_object())
+                        .map(|o| {
+                            o.iter()
+                                .filter_map(|(k, v)| {
+                                    v.as_str().map(|s| (k.clone(), s.to_string()))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    (n, id, wid.clone(), reg, pay)
+                } else {
+                    (wid.clone(), 0, wid.clone(), Default::default(), Default::default())
+                }
+            } else {
+                (wid.clone(), 0, wid.clone(), Default::default(), Default::default())
+            }
+        }
+        _ => (
+            "(未知)".into(),
+            0,
+            "(未知)".into(),
+            Default::default(),
+            Default::default(),
+        ),
+    };
+
+    // 把每个影院显示成「名称 (id)」，没拉到名称的 cinema 就只显示 id。
+    let cinemas_display = if cinemas_in_form.is_empty() {
+        "（未配）".to_string()
+    } else {
+        cinemas_in_form
+            .split_whitespace()
+            .map(|cid| {
+                let name = registry_names
+                    .get(cid)
+                    .cloned()
+                    .or_else(|| payload_names.get(cid).cloned())
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    cid.to_string()
+                } else {
+                    format!("{} ({})", name, cid)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("、")
+    };
+    let dates_display = if dates_in_form.is_empty() {
+        "不限".to_string()
+    } else {
+        dates_in_form
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let tw_display = if tw_in_form.is_empty() {
+        "不限".to_string()
+    } else {
+        tw_in_form.clone()
+    };
+    let interval_display = if interval_in_form.is_empty() {
+        "默认 (90s)".to_string()
+    } else {
+        format!("{}s", interval_in_form)
+    };
+    let now_str = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let mode_disp = if mode_label_in_form.is_empty() {
+        "开票提醒".to_string()
+    } else {
+        mode_label_in_form.clone()
+    };
+    let webhook_preview = if webhook.is_empty() {
+        "（未填）".to_string()
+    } else {
+        webhook.clone()
+    };
+    let email_preview = if email.is_empty() {
+        "（未填）".to_string()
+    } else {
+        email.clone()
+    };
+
+    let title = "🎬 ticket-tracker · 测试通知".to_string();
+    let msg = format!(
+        "你好，这是一条来自 ticket-tracker 的测试通知，用于确认通知通道已配置正确。\n\
+         \n\
+         ── 监视任务 ──\n\
+         任务 ID    : {wid}\n\
+         影片       : {movie_name} (ID {movie_id})\n\
+         模式       : {mode}\n\
+         影院       : {cinemas}\n\
+         日期       : {dates}\n\
+         时段窗口   : {tw}\n\
+         独立间隔   : {interval}\n\
+         \n\
+         ── 通知通道 ──\n\
+         Webhook    : {webhook}\n\
+         邮箱       : {email}\n\
+         \n\
+         ── 触发信息 ──\n\
+         触发人     : ticket-tracker（手动测试）\n\
+         触发时间   : {now}\n\
+         \n\
+         收到此邮件即说明通知通道已配置正确，正式告警将沿用同一模板。\n\
+         如非本人操作，请联系管理员。",
+        wid = wid_str,
+        movie_name = movie_name,
+        movie_id = movie_id,
+        mode = mode_disp,
+        cinemas = cinemas_display,
+        dates = dates_display,
+        tw = tw_display,
+        interval = interval_display,
+        webhook = webhook_preview,
+        email = email_preview,
+        now = now_str,
+    );
+
+    let mut results: Vec<String> = Vec::new();
+    if webhook.is_empty() {
+        results.push("webhook 未填（仅发邮箱）".to_string());
+    } else {
+        let rt = tokio::runtime::Runtime::new();
+        let sent = match rt {
+            Ok(rt) => rt.block_on(crate::notify::notify_results_webhook_async(
+                Some(&webhook),
+                &title,
+                &msg,
+                None,
+            )),
+            Err(e) => Err(anyhow::anyhow!(e.to_string())),
+        };
+        results.push(match sent {
+            Ok(true) => "webhook ✓ 已送达".to_string(),
+            Ok(false) => "webhook ✗ 发送失败（HTTP 错误）".to_string(),
+            Err(e) => format!("webhook ✗ 内部错误: {}", e),
+        });
+    }
+    if email.is_empty() {
+        results.push("邮箱 未填（仅发 webhook）".to_string());
+    } else {
+        let ok = crate::notify::notify_results_email(Some(&email), &title, &msg, None);
+        results.push(if ok {
+            "邮箱 ✓ 已交付 msmtp".to_string()
+        } else {
+            "邮箱 ✗ msmtp 未安装或配置有误".to_string()
+        });
+    }
+    let any_failed = results
+        .iter()
+        .any(|s| s.starts_with("webhook ✗") || s.starts_with("邮箱 ✗"));
+    let prefix = if any_failed { "部分通道失败： " } else { "" };
+    format!("{prefix}{}", results.join("  "))
+}
 
 /// 空白或逗号分隔 → 去空 id 列表。
 fn split_ids(s: &str) -> Vec<String> {
