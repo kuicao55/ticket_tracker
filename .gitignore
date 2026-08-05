@@ -35,4 +35,10 @@ spiderman.sh
 # Rust 产物
 rs/target/
 rs/**/*.rs.bk
+# cargo build --release 默认把可执行文件落在 rs/ 下，文件名按 target triple 走
+# （tt-x86_64-apple-darwin / tt-aarch64-apple-darwin / tt-x86_64-pc-windows-msvc.exe 等）
+tt-*-apple-darwin
+tt-*-apple-darwin.exe
+tt-*-pc-windows-msvc.exe
+tt-*-unknown-linux-gnu
 # Cargo.lock 应该提交给 binary crate，不要加到这里
