@@ -396,7 +396,7 @@ fn draw_form_modal(f: &mut ratatui::Frame, area: Rect, form: &modal::FormModal) 
         vertical: 1,
     });
     let editing = matches!(form.mode, modal::FormMode::Editing { .. });
-    let mut lines = Vec::with_capacity(form.fields.len() + 3);
+    let mut lines = Vec::with_capacity(form.fields.len() + 4);
     for (idx, field) in form.fields.iter().enumerate() {
         let focused = idx == form.focus;
         let is_button = matches!(
@@ -446,10 +446,19 @@ fn draw_form_modal(f: &mut ratatui::Frame, area: Rect, form: &modal::FormModal) 
             Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
         )));
     }
+    let (keys_hint, example_hint) = form.hint();
     lines.push(Line::from(Span::styled(
-        form.hint(),
+        keys_hint,
         Style::default().fg(Color::DarkGray),
     )));
+    if let Some(ex) = example_hint {
+        lines.push(Line::from(Span::styled(
+            ex,
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        )));
+    }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 

@@ -848,11 +848,14 @@ impl Monitor {
                     // 小红书群聊: 群名为空则静默跳过
                     if let Some(ref g) = watch_xhs_group {
                         if !g.is_empty() {
-                            let xhs_body = format!(
-                                "{}｜{}｜{} 场｜{} 至 {}\n{}",
-                                info.name, m.cinema_name, m.show_count, m.earliest, m.latest, buy_url
+                            // 单条消息：标题 + 正文 + 来源拼成一行，一次性发完。
+                            // --body 传空字符串 → 脚本 `if args.body` 判定 False → 跳过 body，
+                            // 只剩 title 一段，避免被 xhs 风控判为多段刷屏。
+                            let xhs_title = format!(
+                                "预售开启 🎬｜{}｜{}｜{} 场｜{} 至 {} ｜来源：猫眼",
+                                info.name, m.cinema_name, m.show_count, m.earliest, m.latest
                             );
-                            notify::notify_xhs(g, "预售开启 🎬", &xhs_body, Some(&buy_url));
+                            notify::notify_xhs(g, &xhs_title, "", None);
                         }
                     }
                     if mode == config::Mode::Normal {
@@ -862,7 +865,7 @@ impl Monitor {
                                 .and_then(|v| v.as_u64())
                                 .unwrap_or(60)
                         };
-                        notify::notify_macos("预售开启 🎬", &alert, true, Some(&buy_url), dur);
+                        notify::notify_macos("预售开启 🎬", &alert, true, None, dur);
                     }
                     // 在 cfg 上记 fired
                     {
@@ -1104,15 +1107,15 @@ impl Monitor {
             // 小红书群聊: 群名为空则静默跳过
             if let Some(ref g) = watch_xhs_group {
                 if !g.is_empty() {
-                    let xhs_body = format!(
-                        "{}｜{}\n新增 {} 场:\n{}\n{}",
+                    // 单条消息：标题 + 正文 + 来源拼成一行，一次性发完。
+                    let xhs_title = format!(
+                        "新增场次 🎟｜{}｜{}｜新增 {} 场：{} ｜来源：猫眼",
                         info.name,
                         m.cinema_name,
                         fresh.len(),
-                        detail.join("\n"),
-                        buy_url
+                        detail.join("、")
                     );
-                    notify::notify_xhs(g, "新增场次 🎟", &xhs_body, Some(&buy_url));
+                    notify::notify_xhs(g, &xhs_title, "", None);
                 }
             }
             if mode == config::Mode::Normal {
@@ -1122,7 +1125,7 @@ impl Monitor {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(60)
                 };
-                notify::notify_macos("新增场次 🎟", &short, true, Some(&buy_url), dur);
+                notify::notify_macos("新增场次 🎟", &short, true, None, dur);
             }
             {
                 let mut g = self.shared.cfg.lock().unwrap();

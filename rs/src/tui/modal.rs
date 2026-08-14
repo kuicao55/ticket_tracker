@@ -131,14 +131,6 @@ pub struct CinemaPickerModal {
 // ------------------------- 构造器 -------------------------
 
 impl FormField {
-    fn new(label: &str, kind: FieldKind, required: bool) -> Self {
-        Self {
-            label: label.into(),
-            value: String::new(),
-            kind,
-            required,
-        }
-    }
     fn with_value(label: &str, kind: FieldKind, required: bool, value: String) -> Self {
         Self {
             label: label.into(),
@@ -160,16 +152,16 @@ impl FormField {
 impl FormModal {
     pub fn add_watch() -> Self {
         let fields = vec![
-            FormField::new("电影 ID", FieldKind::MovieId, true),
-            FormField::new("影院", FieldKind::CinemaList, true),
-            FormField::new("日期", FieldKind::DateList, false),
-            FormField::new("时段", FieldKind::TimeWindow, false),
+            FormField::with_value("电影 ID", FieldKind::MovieId, true, String::new()),
+            FormField::with_value("影院", FieldKind::CinemaList, true, String::new()),
+            FormField::with_value("日期", FieldKind::DateList, false, String::new()),
+            FormField::with_value("时段", FieldKind::TimeWindow, false, String::new()),
             FormField::with_value("模式", FieldKind::Mode, false, "开票提醒".into()),
-            FormField::new("电影名", FieldKind::Text, false),
-            FormField::new("独立间隔", FieldKind::OptionalInteger, false),
-            FormField::new("通知 webhook", FieldKind::Webhook, false),
-            FormField::new("通知邮箱", FieldKind::Text, false),
-            FormField::new("通知 xhs 群名", FieldKind::Text, false),
+            FormField::with_value("电影名", FieldKind::Text, false, String::new()),
+            FormField::with_value("独立间隔", FieldKind::OptionalInteger, false, String::new()),
+            FormField::with_value("通知 webhook", FieldKind::Webhook, false, String::new()),
+            FormField::with_value("通知邮箱", FieldKind::Text, false, String::new()),
+            FormField::with_value("通知 xhs 群名", FieldKind::Text, false, String::new()),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
         ];
@@ -310,21 +302,48 @@ impl FormModal {
         }
     }
 
-    /// 返回当前聚焦字段的输入提示（渲染底部用）。
-    pub fn hint(&self) -> &'static str {
-        match self.mode {
+    /// 返回当前聚焦字段的输入提示：`(键盘操作, 输入示例)`。示例供用户对照填写。
+    pub fn hint(&self) -> (&'static str, Option<&'static str>) {
+        let keys = match self.mode {
             FormMode::Editing { .. } => "输入中：Enter 确认  Esc 取消本项",
             FormMode::Navigation => match self.fields.get(self.focus).map(|f| f.kind) {
                 Some(FieldKind::MovieId) => {
                     "↑↓ 选择  Enter 搜索电影  i 手动输入  Esc 关闭"
                 }
                 Some(FieldKind::CinemaList) => "↑↓ 选择  Enter 影院收藏夹  Esc 关闭",
+                Some(FieldKind::TestNotify) => {
+                    "↑↓ 选择  Enter 给 webhook/邮箱/小红书各发一条测试  Esc 关闭"
+                }
                 Some(FieldKind::Submit) | Some(FieldKind::Cancel) => {
                     "↑↓ 选择  Enter 触发  Esc 关闭"
                 }
                 _ => "↑↓ 选择  Enter 编辑  Esc 关闭",
             },
-        }
+        };
+        let example = self.fields.get(self.focus).and_then(field_example);
+        (keys, example)
+    }
+}
+
+/// 当前聚焦字段的输入示例（显示在 hint 下方）。空/无示例 → None。
+fn field_example(field: &FormField) -> Option<&'static str> {
+    use FieldKind::*;
+    match field.kind {
+        MovieId => Some("例如 1545360"),
+        CinemaList => Some("例如 37534 12345（多个用空格或逗号分隔）"),
+        DateList => Some("例如 2026-08-13 2026-08-14（留空=不限）"),
+        TimeWindow => Some("例如 19:00-22:00（留空=不限）"),
+        Mode => Some("Enter / ←→ 在「开票提醒」「增场监控」间切换"),
+        OptionalInteger => Some("例如 60（秒，留空=用全局默认）"),
+        Integer => Some("数字"),
+        Webhook => Some("例如 https://discord.com/api/webhooks/..."),
+        TestNotify | Submit | Cancel => None,
+        Text => match field.label.as_str() {
+            "电影名" => Some("选填，留空自动从猫眼拉"),
+            "通知邮箱" => Some("例如 your@email.com（需本机 msmtp，留空=关）"),
+            "通知 xhs 群名" => Some("例如 test（留空=关闭该通道）"),
+            _ => None,
+        },
     }
 }
 
