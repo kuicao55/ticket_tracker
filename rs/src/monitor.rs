@@ -810,7 +810,6 @@ impl Monitor {
                     if already {
                         continue;
                     }
-                    let buy_url = maoyan::buy_pc_url_owned(cid);
                     let alert = format!(
                         "{}｜{}：{} 场｜{} 至 {}",
                         info.name, m.cinema_name, m.show_count, m.earliest, m.latest
@@ -828,7 +827,7 @@ impl Monitor {
                         webhook.as_deref(),
                         "预售开启 🎬",
                         &alert,
-                        Some(&buy_url),
+                        None,
                     )
                     .await;
                     // 结果通知：与 discord_webhook 不同，只在告警里发，不发心跳
@@ -836,14 +835,14 @@ impl Monitor {
                         results_wh.as_deref(),
                         "预售开启 �",
                         &alert,
-                        Some(&buy_url),
+                        None,
                     )
                     .await;
                     let _ = notify::notify_results_email(
                         results_email.as_deref(),
                         "预售开启 �",
                         &alert,
-                        Some(&buy_url),
+                        None,
                     );
                     // 小红书群聊: 群名为空则静默跳过
                     if let Some(ref g) = watch_xhs_group {
@@ -1061,7 +1060,6 @@ impl Monitor {
             .await;
             any_event = true;
 
-            let buy_url = maoyan::buy_pc_url_owned(cid);
             let alert = format!(
                 "{}｜{}\n新增 {} 场：\n{}",
                 info.name,
@@ -1088,21 +1086,21 @@ impl Monitor {
                 webhook.as_deref(),
                 "新增场次 🎟",
                 &alert,
-                Some(&buy_url),
+                None,
             )
             .await;
             let _ = notify::notify_results_webhook_async(
                 results_wh.as_deref(),
                 "新增场次 🎟",
                 &alert,
-                Some(&buy_url),
+                None,
             )
             .await;
             let _ = notify::notify_results_email(
                 results_email.as_deref(),
                 "新增场次 �",
                 &alert,
-                Some(&buy_url),
+                None,
             );
             // 小红书群聊: 群名为空则静默跳过
             if let Some(ref g) = watch_xhs_group {
