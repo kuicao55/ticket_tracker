@@ -42,3 +42,8 @@ tt-*-apple-darwin.exe
 tt-*-pc-windows-msvc.exe
 tt-*-unknown-linux-gnu
 # Cargo.lock 应该提交给 binary crate，不要加到这里
+
+# wechat-notify-fast.py：本机指向 ~/Kui-Knowledge-Base/scripts/ 的符号链接，
+# 上游是 single source of truth，这边不重复提交。新机器部署时手动建链：
+#   ln -s ~/Kui-Knowledge-Base/scripts/wechat-notify-fast.py rs/scripts/
+rs/scripts/wechat-notify-fast.py
