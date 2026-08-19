@@ -25,9 +25,12 @@
     4  权限/环境问题
 """
 import argparse
+import logging
+import os
 import subprocess
 import sys
 import time
+from logging.handlers import RotatingFileHandler
 
 
 class NotifyError(Exception):
@@ -46,6 +49,31 @@ def osa(script, *args, timeout=30):
     if r.returncode != 0:
         raise NotifyError(f"osascript 失败: {r.stderr.strip()}")
     return r.stdout.strip()
+
+
+_LOG_NAME = "wechat-notify-fast"
+_DEFAULT_LOG = "~/Library/Logs/wechat-notify-fast.log"
+
+
+def _setup_logging(log_file):
+    """配置 RotatingFileHandler（1MB×3）。多次调用会替换 handler。"""
+    path = os.path.expanduser(log_file)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    log = logging.getLogger(_LOG_NAME)
+    log.setLevel(logging.INFO)
+    for h in list(log.handlers):
+        log.removeHandler(h)
+    h = RotatingFileHandler(path, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    h.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S"))
+    log.addHandler(h)
+    return log
+
+
+def _msg_preview(text, limit=60):
+    text = text.replace("\n", "\\n")
+    return (text[:limit] + "...") if len(text) > limit else text
 
 
 _POST_KEYS_JS = r'''function run(argv) {
@@ -92,6 +120,8 @@ def _ensure_window_unminimized():
     分两步恢复：先 AX deminiaturize 恢复窗口显示（微信 4.x 单独 activate
     不恢复最小化窗口），再 activate 让它成为 key window 并重聚焦输入框
     （单独 deminiaturize 只恢复显示、不聚焦）。检测失败静默跳过。
+
+    Returns: True 表示检测到最小化并执行了恢复；False 表示未最小化或检测失败。
     """
     try:
         r = _run(["osascript", "-e",
@@ -99,9 +129,9 @@ def _ensure_window_unminimized():
                   'get value of attribute "AXMinimized" of window 1'],
                  timeout=10)
     except subprocess.TimeoutExpired:
-        return
+        return False
     if r.returncode != 0 or r.stdout.strip().lower() != "true":
-        return
+        return False
     _run(["osascript", "-e",
           'tell application "System Events" to tell process "WeChat" to '
           'set value of attribute "AXMinimized" of window 1 to false'],
@@ -109,6 +139,7 @@ def _ensure_window_unminimized():
     time.sleep(0.2)
     _run(["osascript", "-e", 'tell application "WeChat" to activate'], timeout=10)
     time.sleep(0.4)
+    return True
 
 
 def _fallback_send():
@@ -138,40 +169,69 @@ def type_and_send(text):
     注意：不要用坐标点输入框，底部 0.94 高度处是工具栏（含截屏按钮），
     会误触发截图。
     """
+    log = logging.getLogger(_LOG_NAME)
+    log.info(f"start msg={_msg_preview(text)!r}")
+
     r = _run(["pbcopy"], input=text, timeout=10)
     if r.returncode != 0:
+        log.error(f"pbcopy failed: {r.stderr.strip()}")
         raise NotifyError(f"写入剪贴板失败: {r.stderr.strip()}", code=2)
+    log.info("pbcopy ok")
+
     time.sleep(0.05)
-    pid = _wechat_pid()
-    _ensure_window_unminimized()
+    try:
+        pid = _wechat_pid()
+    except NotifyError as e:
+        log.error(f"wechat pid lookup failed: {e}")
+        raise
+    log.info(f"wechat pid={pid}")
+
+    if _ensure_window_unminimized():
+        log.warning("window was minimized; recovered via deminiaturize+activate")
+
     try:
         _post_keys_pid(pid)
-    except NotifyError:
-        _fallback_send()
+        log.info("post keys ok (CGEventPostToPid, main path)")
+    except NotifyError as e:
+        log.warning(f"main path failed: {e}; falling back to System Events")
+        try:
+            _fallback_send()
+            log.info("post keys ok (System Events, fallback)")
+        except NotifyError as fe:
+            log.error(f"fallback also failed: {fe}")
+            raise
 
 
 def main():
     p = argparse.ArgumentParser(description="极速版：直接把消息发给当前微信会话")
     p.add_argument("--message", required=True, help="要发送的正文（必填）")
     p.add_argument("--dry-run", action="store_true", help="只打印计划，不实际发送")
+    p.add_argument("--log-file", default=_DEFAULT_LOG,
+                   help=f"日志文件路径（默认 {_DEFAULT_LOG}，1MB×3 自动 rotate）")
     args = p.parse_args()
+
+    log = _setup_logging(args.log_file)
+    log.info(f"== invocation: msg={_msg_preview(args.message)!r} dry_run={args.dry_run}")
 
     print(f"[wechat-notify-fast] 文本:\n{args.message}\n")
 
     if args.dry_run:
+        log.info("dry-run, skipping send")
         print("[wechat-notify-fast] dry-run，跳过实际发送")
         return
 
     try:
         type_and_send(args.message)
+        log.info("== send success")
+        print("[wechat-notify-fast] 发送成功 ✓")
     except subprocess.TimeoutExpired as e:
+        log.error(f"== timeout: {e}")
         print(f"[wechat-notify-fast] 命令超时: {e}", file=sys.stderr)
         sys.exit(3)
     except NotifyError as e:
+        log.error(f"== failed code={e.code}: {e}")
         print(f"[wechat-notify-fast] {e}", file=sys.stderr)
         sys.exit(e.code)
-
-    print("[wechat-notify-fast] 发送成功 ✓")
 
 
 if __name__ == "__main__":
