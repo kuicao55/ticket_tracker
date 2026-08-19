@@ -1,6 +1,6 @@
 [package]
 name = "ticket-tracker"
-version = "1.4.0"
+version = "1.4.1"
 edition = "2021"
 description = "猫眼影城影片预售监测 CLI + TUI，Rust 重写版（CLI 1:1 对齐 py/，TUI 用 ratatui）"
 license = "MIT"

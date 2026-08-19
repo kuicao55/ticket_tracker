@@ -1076,13 +1076,15 @@ fn trigger_test_notify(f: &FormModal) -> String {
     if webhook.is_empty() {
         results.push("webhook 未填（仅发邮箱）".to_string());
     } else {
+        // 测试也带上购票链接：Discord 会渲染成 `👉 <url>`，其他 webhook 按 url 字段透传
+        let test_url = "https://www.maoyan.com/cinema/37534";
         let rt = tokio::runtime::Runtime::new();
         let sent = match rt {
             Ok(rt) => rt.block_on(crate::notify::notify_results_webhook_async(
                 Some(&webhook),
                 &title,
                 &msg,
-                None,
+                Some(test_url),
             )),
             Err(e) => Err(anyhow::anyhow!(e.to_string())),
         };

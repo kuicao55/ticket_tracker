@@ -818,6 +818,7 @@ impl Monitor {
                         "{}｜{}：{} 场｜{} 至 {}",
                         info.name, m.cinema_name, m.show_count, m.earliest, m.latest
                     );
+                    let buy_url = maoyan::buy_pc_url_owned(cid);
                     let webhook = {
                         let g = self.shared.cfg.lock().unwrap();
                         g.get("discord_webhook")
@@ -831,20 +832,20 @@ impl Monitor {
                         webhook.as_deref(),
                         "预售开启 🎬",
                         &alert,
-                        None,
+                        Some(&buy_url),
                     )
                     .await;
                     // 结果通知：与 discord_webhook 不同，只在告警里发，不发心跳
                     let _ = notify::notify_results_webhook_async(
                         results_wh.as_deref(),
-                        "预售开启 �",
+                        "预售开启 🎬",
                         &alert,
-                        None,
+                        Some(&buy_url),
                     )
                     .await;
                     let _ = notify::notify_results_email(
                         results_email.as_deref(),
-                        "预售开启 �",
+                        "预售开启 🎬",
                         &alert,
                         None,
                     );
@@ -1099,23 +1100,24 @@ impl Monitor {
             };
             let results_wh = watch_results_wh.clone();
             let results_email = watch_results_email.clone();
+            let buy_url = maoyan::buy_pc_url_owned(cid);
             let _ = notify::notify_discord_async(
                 webhook.as_deref(),
                 "新增场次 🎟",
                 &alert,
-                None,
+                Some(&buy_url),
             )
             .await;
             let _ = notify::notify_results_webhook_async(
                 results_wh.as_deref(),
                 "新增场次 🎟",
                 &alert,
-                None,
+                Some(&buy_url),
             )
             .await;
             let _ = notify::notify_results_email(
                 results_email.as_deref(),
-                "新增场次 �",
+                "新增场次 🎟",
                 &alert,
                 None,
             );
