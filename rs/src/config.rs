@@ -243,6 +243,10 @@ fn migrate_watch_schema(cfg: &mut Value) -> Result<()> {
                     w["movie_name"] = name.map(Value::String).unwrap_or(Value::Null);
                 }
             }
+            // wechat_notify：老 watch 默认为 false（不开启微信大群通知）
+            if w.get("wechat_notify").is_none() {
+                w["wechat_notify"] = json!(false);
+            }
         }
     }
     // 第二遍：注册 cinemas（不再持有 watches 的可变借用）
@@ -428,6 +432,7 @@ pub fn add_watch(
     notify_webhook: Option<&str>,
     notify_email_to: Option<&str>,
     xhs_group: Option<&str>,
+    wechat_notify: bool,
 ) -> Result<String> {
     let cinemas_v: Vec<String> = cinemas.iter().map(|s| s.to_string()).collect();
     for cid in &cinemas_v {
@@ -459,6 +464,7 @@ pub fn add_watch(
         "notify_webhook": notify_webhook.map(String::from).map(Value::String).unwrap_or(Value::Null),
         "notify_email_to": notify_email_to.map(String::from).map(Value::String).unwrap_or(Value::Null),
         "xhs_group": xhs_group.map(str::trim).filter(|s| !s.is_empty()).map(String::from).map(Value::String).unwrap_or(Value::Null),
+        "wechat_notify": wechat_notify,
         "enabled": true,
         "presale_fired": false,
         "created_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),

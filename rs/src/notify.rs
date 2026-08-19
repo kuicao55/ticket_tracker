@@ -216,6 +216,49 @@ pub fn notify_xhs(group: &str, title: &str, body: &str, url: Option<&str>) -> bo
     }
 }
 
+// ----------------- 微信大群通知（per-watch wechat_notify） -----------------
+
+/// 通过本地 wechat-notify-fast.py 脚本把消息推送到微信「当前打开的会话」。
+///
+/// 脚本机制：剪贴板写入 → Cmd+V 粘贴 → Enter 发送。Enter 在微信里是「发送」，
+/// 所以 message 里的换行会被原样粘贴成多行输入，**整段作为一条消息发出**
+/// （不像 xhs 脚本那样 \n 触发多次发送）。因此 wechat 模板里可以放心用 \n 排版。
+///
+/// 路径同样编译期定死在 `$CARGO_MANIFEST_DIR/scripts/wechat-notify-fast.py`，
+/// 部署到新位置需重新 `cargo build`。
+///
+/// 行为约定：
+/// - 脚本文件不存在 → stderr 留一行提示，静默 false
+/// - 微信未启动 / 没停在目标会话 / 缺权限 → 静默 false（脚本内部已 stderr 提示）
+pub fn notify_wechat(message: &str) -> bool {
+    let script = format!(
+        "{}/scripts/wechat-notify-fast.py",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    if !std::path::Path::new(&script).exists() {
+        eprintln!(
+            "⚠ wechat-notify-fast.py 未找到: {} (请确认 rs/scripts/ 目录已复制脚本)",
+            script
+        );
+        return false;
+    }
+    let result = Command::new("python3")
+        .arg(&script)
+        .arg("--message")
+        .arg(message)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    match result {
+        Ok(mut child) => match child.wait() {
+            Ok(s) if s.success() => true,
+            _ => false,
+        },
+        Err(_) => false,
+    }
+}
+
 // ----------------- macOS 电脑通知 -----------------
 
 /// 在 macOS 上发系统通知 + 周期性响铃 + 语音 + 自动打开购票页。

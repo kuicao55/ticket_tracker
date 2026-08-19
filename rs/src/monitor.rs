@@ -795,6 +795,10 @@ impl Monitor {
                     .get("xhs_group")
                     .and_then(|v| v.as_str())
                     .map(String::from);
+                let watch_wechat = watch_snapshot
+                    .get("wechat_notify")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 for m in &info.matches {
                     let cid = &m.cinema_id;
                     let already = {
@@ -856,6 +860,15 @@ impl Monitor {
                             );
                             notify::notify_xhs(g, &xhs_title, "", None);
                         }
+                    }
+                    // 微信大群: wechat_notify=true 时发到微信当前打开的会话
+                    if watch_wechat {
+                        let buy_url = maoyan::buy_pc_url_owned(cid);
+                        let wechat_msg = format!(
+                            "🎬 预售开启\n\n🎞 {}\n🏛 {}\n📅 {} 场｜{} 至 {}\n\n👉 {}",
+                            info.name, m.cinema_name, m.show_count, m.earliest, m.latest, buy_url
+                        );
+                        notify::notify_wechat(&wechat_msg);
                     }
                     if mode == config::Mode::Normal {
                         let dur = {
@@ -988,6 +1001,10 @@ impl Monitor {
             .get("xhs_group")
             .and_then(|v| v.as_str())
             .map(String::from);
+        let watch_wechat = watch_snapshot
+            .get("wechat_notify")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let no_shows: Vec<maoyan::ShowInfo> = Vec::new();
         let mut any_event = false;
@@ -1115,6 +1132,19 @@ impl Monitor {
                     );
                     notify::notify_xhs(g, &xhs_title, "", None);
                 }
+            }
+            // 微信大群: wechat_notify=true 时发到微信当前打开的会话
+            if watch_wechat {
+                let buy_url = maoyan::buy_pc_url_owned(cid);
+                let wechat_msg = format!(
+                    "🎟 新增场次\n\n🎞 {}\n🏛 {}\n🆕 新增 {} 场：{}\n\n👉 {}",
+                    info.name,
+                    m.cinema_name,
+                    fresh.len(),
+                    detail.join("、"),
+                    buy_url
+                );
+                notify::notify_wechat(&wechat_msg);
             }
             if mode == config::Mode::Normal {
                 let dur = {

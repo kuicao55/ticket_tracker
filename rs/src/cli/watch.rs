@@ -33,6 +33,9 @@ pub enum WatchAction {
         /// 仅告警时触发的小红书群聊通知（群名，留空 = 关闭）
         #[arg(long = "xhs-group")]
         xhs_group: Option<String>,
+        /// 仅告警时触发微信大群通知（发到当前打开的微信会话，开/关）
+        #[arg(long = "wechat-notify", default_missing_value = "true", num_args = 0..=1)]
+        wechat_notify: Option<bool>,
     },
     Show { id: String },
     Edit {
@@ -60,6 +63,9 @@ pub enum WatchAction {
         /// 留空字符串 `""` 表示清空；不传则不改
         #[arg(long = "xhs-group", allow_hyphen_values = true)]
         xhs_group: Option<String>,
+        /// 微信大群通知开关：`--wechat-notify` 启用 / `--wechat-notify false` 关闭 / 不传则不改
+        #[arg(long = "wechat-notify", default_missing_value = "true", num_args = 0..=1)]
+        wechat_notify: Option<bool>,
     },
     Remove { id: String },
     Enable { id: String },
@@ -80,6 +86,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_webhook,
             notify_email,
             xhs_group,
+            wechat_notify,
         } => add(
             movie_id,
             &cinema,
@@ -91,6 +98,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_webhook.as_deref(),
             notify_email.as_deref(),
             xhs_group.as_deref(),
+            wechat_notify.unwrap_or(false),
         ),
         WatchAction::Show { id } => show(&id),
         WatchAction::Edit {
@@ -104,6 +112,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_webhook,
             notify_email,
             xhs_group,
+            wechat_notify,
         } => edit(
             &id,
             &cinema,
@@ -115,6 +124,7 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_webhook.as_deref(),
             notify_email.as_deref(),
             xhs_group.as_deref(),
+            wechat_notify,
         ),
         WatchAction::Remove { id } => remove(&id),
         WatchAction::Enable { id } => set_enabled(&id, true),
@@ -151,6 +161,7 @@ fn add(
     notify_webhook: Option<&str>,
     notify_email: Option<&str>,
     xhs_group: Option<&str>,
+    wechat_notify: bool,
 ) -> Result<()> {
     if mode != config::MODE_PRESALE && mode != config::MODE_INCREMENTAL {
         return Err(anyhow!(
@@ -173,6 +184,7 @@ fn add(
         notify_webhook,
         notify_email,
         xhs_group,
+        wechat_notify,
     )?;
     println!("✓ 已添加 watch: {}", id);
     Ok(())
@@ -196,6 +208,7 @@ fn edit(
     notify_webhook: Option<&str>,
     notify_email: Option<&str>,
     xhs_group: Option<&str>,
+    wechat_notify: Option<bool>,
 ) -> Result<()> {
     if let Some(m) = mode {
         if m != config::MODE_PRESALE && m != config::MODE_INCREMENTAL {
@@ -268,6 +281,10 @@ fn edit(
         } else {
             updates.insert("xhs_group".into(), serde_json::json!(v));
         }
+    }
+    // wechat_notify: None=不改, Some(b)=设为 b
+    if let Some(v) = wechat_notify {
+        updates.insert("wechat_notify".into(), serde_json::json!(v));
     }
     // 影院/日期/时段/模式一变，旧的 seqNo 基线就对不上了 —— 清空让下一轮重新静默建线，
     // 否则新窗口里已有的场次会被当成"新增"一次性全报出来。

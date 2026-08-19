@@ -63,8 +63,9 @@ pub enum FieldKind {
     Webhook,
     MovieId,    // Enter → 打开 MovieSearch
     CinemaList, // Enter → 打开 CinemaPicker
-    Mode,       // Enter / ←→ 在「开票提醒」「增场监控」之间切换
-    TestNotify, // 仅 edit_watch：Enter → 给 webhook/邮箱各发一条测试消息
+    Mode,         // Enter / ←→ 在「开票提醒」「增场监控」之间切换
+    WechatNotify, // Enter 在「开」「关」之间切换
+    TestNotify,   // 仅 edit_watch：Enter → 给 webhook/邮箱各发一条测试消息
     Submit,
     Cancel,
 }
@@ -162,6 +163,12 @@ impl FormModal {
             FormField::with_value("通知 webhook", FieldKind::Webhook, false, String::new()),
             FormField::with_value("通知邮箱", FieldKind::Text, false, String::new()),
             FormField::with_value("通知 xhs 群名", FieldKind::Text, false, String::new()),
+            FormField::with_value(
+                "通知微信大群",
+                FieldKind::WechatNotify,
+                false,
+                "关".into(),
+            ),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
         ];
@@ -230,6 +237,19 @@ impl FormModal {
                 FieldKind::Text,
                 false,
                 opt_str("xhs_group"),
+            ),
+            FormField::with_value(
+                "通知微信大群",
+                FieldKind::WechatNotify,
+                false,
+                if w.get("wechat_notify")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    "开".to_string()
+                } else {
+                    "关".to_string()
+                },
             ),
             FormField::button("测试通知", FieldKind::TestNotify),
             FormField::button("确定", FieldKind::Submit),
@@ -312,7 +332,7 @@ impl FormModal {
                 }
                 Some(FieldKind::CinemaList) => "↑↓ 选择  Enter 影院收藏夹  Esc 关闭",
                 Some(FieldKind::TestNotify) => {
-                    "↑↓ 选择  Enter 给 webhook/邮箱/小红书各发一条测试  Esc 关闭"
+                    "↑↓ 选择  Enter 给 webhook/邮箱/小红书/微信各发一条测试  Esc 关闭"
                 }
                 Some(FieldKind::Submit) | Some(FieldKind::Cancel) => {
                     "↑↓ 选择  Enter 触发  Esc 关闭"
@@ -334,6 +354,7 @@ fn field_example(field: &FormField) -> Option<&'static str> {
         DateList => Some("例如 2026-08-13 2026-08-14（留空=不限）"),
         TimeWindow => Some("例如 19:00-22:00（留空=不限）"),
         Mode => Some("Enter / ←→ 在「开票提醒」「增场监控」间切换"),
+        WechatNotify => Some("Enter 在「开」「关」间切换（开启则发到当前微信会话）"),
         OptionalInteger => Some("例如 60（秒，留空=用全局默认）"),
         Integer => Some("数字"),
         Webhook => Some("例如 https://discord.com/api/webhooks/..."),
@@ -429,6 +450,16 @@ fn handle_form_key(app: &mut App, mut f: FormModal, key: KeyEvent) -> Option<Mod
                     "开票提醒".to_string()
                 } else {
                     "增场监控".to_string()
+                };
+                Some(Modal::Form(f))
+            }
+            FieldKind::WechatNotify => {
+                // Enter 在「开 / 关」间切换
+                let cur = &f.fields[f.focus].value;
+                f.fields[f.focus].value = if cur == "开" {
+                    "关".to_string()
+                } else {
+                    "开".to_string()
                 };
                 Some(Modal::Form(f))
             }
@@ -708,6 +739,7 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         let t = f.fields[9].value.trim();
         if t.is_empty() { None } else { Some(t.to_string()) }
     };
+    let wechat_notify = f.fields[10].value.trim() == "开";
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     let cref: Vec<&str> = cinemas.iter().map(String::as_str).collect();
     let id = config::add_watch(
@@ -722,6 +754,7 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         notify_webhook.as_deref(),
         notify_email_to.as_deref(),
         xhs_group.as_deref(),
+        wechat_notify,
     )
     .map_err(|e| e.to_string())?;
     Ok(format!("已添加 watch {}", id))
@@ -748,6 +781,7 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
         let t = f.fields[7].value.trim();
         if t.is_empty() { None } else { Some(t.to_string()) }
     };
+    let wechat_notify = f.fields[8].value.trim() == "开";
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     // 注册尚未收藏的影院
     for cid in &cinemas {
@@ -809,6 +843,7 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
             }
         }
     }
+    w["wechat_notify"] = serde_json::json!(wechat_notify);
     // 影院/日期/时段/模式变化 → 清 seen_shows（与 cli 行为对齐）
     let _ = w; // suppress unused warning if not used below
     let any_baseline_change = true; // 简化：保存路径上无 seen_shows diff，记住清一次
@@ -859,17 +894,19 @@ fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {
     Ok("全局设置已保存".into())
 }
 
-/// 编辑表单里的「测试通知」按钮：给当前表单里配的 webhook / 邮箱各发一条
+/// 编辑表单里的「测试通知」按钮：给当前表单里配的 webhook / 邮箱 / 小红书 / 微信各发一条
 /// 客户可读的测试消息。返回值交给底部 status bar 显示执行结果。
 ///
 /// 表单字段索引（按 `edit_watch` 现在的布局）：
 ///   0 cinemas | 1 dates | 2 time_window | 3 mode | 4 interval
-///   5 notify_webhook | 6 notify_email_to | 7 通知 xhs 群名 | 8 测试通知 | 9 确定 | 10 取消
+///   5 notify_webhook | 6 notify_email_to | 7 通知 xhs 群名 | 8 通知微信大群
+///   9 测试通知 | 10 确定 | 11 取消
 fn trigger_test_notify(f: &FormModal) -> String {
-    // 索引 5/6/7 才是真的 webhook / email / xhs 群名
+    // 索引 5/6/7/8 才是真的 webhook / email / xhs 群名 / 微信开关
     let webhook = f.fields.get(5).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let email = f.fields.get(6).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let xhs_group = f.fields.get(7).map(|x| x.value.trim().to_string()).unwrap_or_default();
+    let wechat_on = f.fields.get(8).map(|x| x.value.trim() == "开").unwrap_or(false);
     let cinemas_in_form = f.fields.get(0).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let dates_in_form = f.fields.get(1).map(|x| x.value.trim().to_string()).unwrap_or_default();
     let tw_in_form = f.fields.get(2).map(|x| x.value.trim().to_string()).unwrap_or_default();
@@ -1081,9 +1118,28 @@ fn trigger_test_notify(f: &FormModal) -> String {
             "XHS 群 ✗ 发送失败（看 stderr）".to_string()
         });
     }
-    let any_failed = results
-        .iter()
-        .any(|s| s.starts_with("webhook ✗") || s.starts_with("邮箱 ✗") || s.starts_with("XHS 群 ✗"));
+    if wechat_on {
+        // 微信测试通知：沿用真实告警模板，开头加 🧪 标识这是测试；末尾附购票链接
+        // （测试用 https://www.maoyan.com/cinema/37534 ，与正式告警链接同字段可点回猫眼）
+        let wechat_msg = format!(
+            "🧪 测试通知\n\n🎬 预售开启\n\n🎞 {}\n🏛 {}\n📅 测试场次｜N 场｜HH:MM 至 HH:MM\n\n👉 https://www.maoyan.com/cinema/37534",
+            movie_name, cinemas_display
+        );
+        let ok = crate::notify::notify_wechat(&wechat_msg);
+        results.push(if ok {
+            "微信大群 ✓ 已发送".to_string()
+        } else {
+            "微信大群 ✗ 发送失败（看 stderr）".to_string()
+        });
+    } else {
+        results.push("微信大群 关（不测试）".to_string());
+    }
+    let any_failed = results.iter().any(|s| {
+        s.starts_with("webhook ✗")
+            || s.starts_with("邮箱 ✗")
+            || s.starts_with("XHS 群 ✗")
+            || s.starts_with("微信大群 ✗")
+    });
     let prefix = if any_failed { "部分通道失败： " } else { "" };
     format!("{prefix}{}", results.join("  "))
 }
