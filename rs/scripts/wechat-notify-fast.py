@@ -52,7 +52,7 @@ def osa(script, *args, timeout=30):
 
 
 _LOG_NAME = "wechat-notify-fast"
-_DEFAULT_LOG = "~/Library/Logs/wechat-notify-fast.log"
+_DEFAULT_LOG = os.path.join(os.path.dirname(os.path.realpath(__file__)), "wechat-notify-fast.log")
 
 
 def _setup_logging(log_file):
