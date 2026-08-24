@@ -6,6 +6,7 @@
 //! - [`presets`] —— 内置影院
 //! - [`maoyan`] —— 猫眼 HTTP 客户端
 //! - [`notify`] —— Discord + macOS 通知
+//! - [`lock`]  —— 自动锁票（subprocess 调用 maoyan-booker）
 //! - [`monitor`] —— tokio 监测循环
 //! - [`cli`]   —— clap CLI 子命令
 //! - [`tui`]   —— ratatui TUI
@@ -17,6 +18,7 @@ pub mod presets;
 pub mod config;
 pub mod maoyan;
 pub mod notify;
+pub mod lock;
 pub mod monitor;
 pub mod cli;
 pub mod tui;

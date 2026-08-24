@@ -12,8 +12,16 @@
 
 ## 当前版本
 
-**v1.3.0** —— 配置表单化（弹窗替代命令面板输入）+ Detail 累计检查次数 +
-手动电影 ID + 影院收藏夹管理。
+**v1.5.1** —— 锁票联调体验修复（在 v1.5.0 自动锁票基础上）：
+- **选好座立即通知**：booker stdout 流式读取，`[seat] 选中:`/`[seat] 手动选中:` 一出现就发结果通知，
+  不再等浏览器关闭；dry-run 走通正确显示「🧪 锁票测试：脚本走通」而非「失败」。
+- **锁票测试即时响应**：TUI 点 `◈ 锁票测试` 立刻唤醒 monitor，不再等满一个检查间隔。
+- **通知带实际座位**：结果消息直接带选中的座位号；booker 被自动化驱动时不再滞留浏览器 30s。
+
+**v1.5.0** —— 在 v1.3.0（配置表单化 + 影院收藏夹）基础上新增：
+- **微信大群通知**：watch 级 `wechat_notify`，开售/增场时推送到当前打开的微信会话（本地 Python 脚本，不经服务器）。
+- **购票链接恢复**：Discord 告警重新带上猫眼购票直达链接。
+- **自动锁票**：与本机 [`maoyan-booker`](https://github.com/kuicao55/maoyan-booker) 联动，开售/增场命中时自动用 Playwright 锁座（详见下方[自动锁票](#自动锁票v15)一节）。
 
 ---
 
@@ -73,7 +81,7 @@ cargo build --release
 ## 验证安装
 
 ```bash
-tt --version      # → tt 1.3.0
+tt --version      # → tt 1.5.1
 tt doctor         # 自检：配置、网络、猫眼 API
 tt init           # 首次运行：创建 ~/.config/ticket-tracker/config.json
 ```
@@ -179,7 +187,7 @@ tt cinema add-preset 海淀       # 从内置影院预设加入收藏夹
 | `[a]` 添加 | 弹出表单：搜索电影 / 选影院 / 设日期 / 命名 / 间隔 |
 | `[r]` 立即检查 | 强制跑一轮所有启用 watch |
 | `[d]` 删除 | 删除当前 watch（二次确认） |
-| `[⚙]` 配置 | 弹全局设置表单：webhook / check_interval / quiet_window / phone_only_window / heartbeat |
+| `[⚙]` 配置 | 弹全局设置表单：webhook / check_interval / quiet_window / phone_only_window / heartbeat / 自动锁票(全局) / 真锁 / 无头 |
 | `[?]` 帮助 | 弹键位说明 |
 | `[q]` 退出 | 干净关闭 TUI |
 
@@ -228,6 +236,68 @@ tt cinema add-preset 海淀       # 从内置影院预设加入收藏夹
 - **TUI 状态实时同步**：添加 / 删除 / 编辑 / 切换启停都直接改 Monitor 内存配置，UI 立即刷新，无需重启。
 
 完整变更历史见 [CHANGELOG](https://github.com/kuicao55/ticket_tracker/commits/main)。
+
+---
+
+## 自动锁票
+
+> ⚠️ 依赖本机 [`maoyan-booker`](https://github.com/kuicao55/maoyan-booker)（Playwright PoC），
+> 通过 `uv run python booker.py ...` 调用。booker 目录默认 `~/Applications/maoyan-booker`，
+> 可用环境变量 `MAOYAN_BOOKER_DIR` 覆盖（booker 自带登录态 session，可复用）。
+
+**自动锁票只看 watch 级开关**：该 watch 的 `--auto-lock`（CLI 或 TUI 表单里的「自动锁票」）
+为 true 才会触发；没有全局总闸，每个 watch 独立决定，不开启的 watch 完全不碰锁票。
+
+### 触发时机
+
+- **开票提醒（presale）**：某影院首报开售时；
+- **增场监控（incremental）**：每轮发现新增场次时。
+- 命中场次会同时注入 booker 的 `--show-date`（最早场次日期）与
+  `--show-time-range`（优先 watch 的 `--lock-time-range`，其次 `--time-window`）。
+
+通知与锁票**互不干扰**：通知走 watch 既有的通道（Discord / 邮箱 / 小红书 / 微信 / macOS），
+锁票独立触发；同一影院锁成功后本 watch 不会再重复锁。
+
+### CLI
+
+```bash
+# watch 级：给某个 watch 开自动锁票 → 命中就真锁（15 分钟内去 App 付款），不开就不锁
+tt watch add 1234 -c 37534 --auto-lock \
+    --imax-only \
+    --lock-num-seats 2 \
+    --lock-max-retries 3 \
+    --lock-seat "5排6座" --lock-seat "6排7座" \   # 可多次；不传=智能选座
+    --lock-time-range "19:00-22:00"            # 缺省回退用 --time-window
+tt watch edit <wid> --auto-lock true --lock-num-seats 2
+```
+
+全局配置别名：`lock-headless`（默认 true 无头，false 带浏览器调试）；watch 级字段：`auto-lock`。
+> 从 v1.5.1 起没有「dry-run vs 真锁」开关——watch 开了 `auto-lock` 就**真锁**；
+> dry-run 只存在于 TUI 的「◈ 锁票测试」按钮（强制不真锁）。
+
+### 关键细节
+
+- **开了就真锁**：watch 级 `auto_lock` 打开后，命中场次会传 `--confirm` 真锁
+  （booker 点到确认、票锁到账号，15 分钟内去 App 付款）；不想要锁票的 watch 直接不开启。
+  状态（`lock_ok_cinemas[]` / `lock_tries{}`）只在真锁成功或重试耗尽时落盘。
+- **重试**：单影院默认最多 `--lock-max-retries 3` 次；`场次没了/流程异常/超时/未知` 各消耗一次。
+  同轮并发锁票串行执行（booker 全局一把 inflight 锁），忙时不占重试额度。
+- **停用**：锁票 watch 在「全部影院锁成 或 重试耗尽」后才自动停用；否则保持 enabled 继续盯。
+- **锁成功通知**：沿该 watch 既有通道（Discord/邮箱/小红书/微信/macOS）发「🔒 自动锁票成功」，
+  带「⚠️ 15 分钟内到猫眼 App 完成支付」提示；booker 的锁票截图存
+  `~/Applications/maoyan-booker/screenshots/05_locked.png`。
+
+### 手动锁票测试（TUI）
+
+不想等开售，也可以随时在 TUI 里过一遍锁票链路：Detail 栏按钮行按 `→` 选中
+**「◈ 锁票测试」** 再按 Enter。
+
+- 走一次完整检查拿到当前匹配场次，挑**最早开场的一个影院**跑 booker；
+- **强制有头浏览器**（`headless=false`）+ **dry-run**（`confirm=false`），只演示不真锁，
+  你可以亲眼看到 Playwright 打开浏览器选座、停在确认前；
+- 结果会沿该 watch 既有的全部通道**发一条测试通知**（标题带🧪），顺便验证通知链路；
+- **不改任何锁状态**：不记锁成功、不耗重试额度，随时可以放心点。
+- 若 watch 当前没有匹配场次（没开售/已过期/IMAX 筛选后无场次）会提示「跳过我」。
 
 ---
 

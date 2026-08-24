@@ -122,7 +122,24 @@ pub struct ShowInfo {
     pub tp: String,
 }
 
+/// 是否 IMAX 场次：影厅（th）或制式（tp）字段里带「IMAX」（大小写不敏感）。
+/// 与 booker `--imax-only` 语义对齐：booker 读 `<span class="hall">` 判定，这里也基于影厅文本。
+pub fn is_imax_show(s: &ShowInfo) -> bool {
+    let hay = format!("{} {}", s.th, s.tp);
+    hay.to_ascii_uppercase().contains("IMAX")
+}
+
+/// 过滤出 IMAX 场次（保序）。
+pub fn imax_shows(shows: &[ShowInfo]) -> Vec<ShowInfo> {
+    shows.iter().filter(|s| is_imax_show(s)).cloned().collect()
+}
+
 impl ShowInfo {
+    /// 是否 IMAX 场次（见 [`is_imax_show`]）。
+    pub fn is_imax(&self) -> bool {
+        is_imax_show(self)
+    }
+
     /// 通知里用的一行描述：`08-09 19:30 IMAX 激光厅 IMAX2D`
     pub fn label(&self) -> String {
         let date = self.dt.get(5..).unwrap_or(self.dt.as_str());
@@ -335,6 +352,34 @@ mod tests {
     #[test]
     fn movie_shows_on_movie_without_shows_is_empty() {
         assert!(movie_shows(&json!({ "nm": "x" })).is_empty());
+    }
+
+    #[test]
+    fn imax_detection_matches_hall_or_format_case_insensitive() {
+        let imax_hall = ShowInfo { seq_no: "1".into(), dt: "2026-08-09".into(), tm: "15:40".into(), th: "IMAX 激光厅".into(), tp: "IMAX2D".into() };
+        assert!(imax_hall.is_imax());
+        // 只有制式带 imax（小写）也算
+        let fmt_only = ShowInfo { seq_no: "2".into(), dt: "2026-08-09".into(), tm: "19:00".into(), th: "1号激光厅".into(), tp: "imax2d".into() };
+        assert!(fmt_only.is_imax());
+        // 普通厅不算
+        let normal = ShowInfo { seq_no: "3".into(), dt: "2026-08-09".into(), tm: "20:00".into(), th: "5号厅".into(), tp: "2D".into() };
+        assert!(!normal.is_imax());
+        // 空字段不算（别把空字符串误判）
+        let empty = ShowInfo { seq_no: "4".into(), dt: "2026-08-09".into(), tm: "20:00".into(), th: "".into(), tp: "".into() };
+        assert!(!empty.is_imax());
+    }
+
+    #[test]
+    fn imax_shows_filters_and_preserves_order() {
+        let shows = movie_shows(&sample_movie());
+        assert_eq!(shows.len(), 2);
+        let filtered = imax_shows(&shows);
+        assert_eq!(filtered.len(), 2);
+        // 加一个普通厅再过滤
+        let mut mixed = shows;
+        mixed.push(ShowInfo { seq_no: "x".into(), dt: "2026-08-10".into(), tm: "10:00".into(), th: "4号厅".into(), tp: "2D".into() });
+        let filtered = imax_shows(&mixed);
+        assert_eq!(filtered.len(), 2);
     }
 }
 

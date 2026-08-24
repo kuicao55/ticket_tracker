@@ -371,6 +371,58 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         Span::styled("检查    ", Style::default().fg(Color::DarkGray)),
         Span::raw(format!(" {} 次", check_count)),
     ]));
+    // ---- 锁票状态 ----
+    let auto_lock = crate::config::watch_auto_lock(&w);
+    if auto_lock {
+        let imax_only = crate::config::watch_imax_only(&w);
+        let num = crate::config::watch_lock_num_seats(&w);
+        let max = crate::config::watch_lock_max_retries(&w);
+        let seats = crate::config::watch_lock_seats(&w);
+        let range = crate::config::watch_lock_time_range(&w);
+        let cids: Vec<String> = w
+            .get("cinemas")
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let mut per = String::new();
+        for cid in &cids {
+            if crate::config::cinema_lock_ok(&w, cid) {
+                per.push_str(&format!("{}✓ ", cid));
+            } else if crate::config::cinema_lock_exhausted(&w, cid) {
+                per.push_str(&format!("{}×{} ", cid, crate::config::cinema_lock_tries(&w, cid)));
+            } else {
+                per.push_str(&format!("{}·{}次 ", cid, crate::config::cinema_lock_tries(&w, cid)));
+            }
+        }
+        info_lines.push(Line::from(vec![
+            Span::styled("锁票    ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("开 · IMAX{} · {}座×{}次", if imax_only { "开" } else { "关" }, num, max),
+                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        if !seats.is_empty() {
+            info_lines.push(Line::from(vec![
+                Span::styled("座位    ", Style::default().fg(Color::DarkGray)),
+                Span::raw(seats.join("、")),
+            ]));
+        }
+        if let Some(r) = &range {
+            info_lines.push(Line::from(vec![
+                Span::styled("锁时    ", Style::default().fg(Color::DarkGray)),
+                Span::raw(r.clone()),
+            ]));
+        }
+        info_lines.push(Line::from(vec![
+            Span::styled("锁定    ", Style::default().fg(Color::DarkGray)),
+            Span::raw(if per.is_empty() { "（尚未触发）".into() } else { per }),
+        ]));
+    } else {
+        info_lines.push(Line::from(vec![
+            Span::styled("锁票    ", Style::default().fg(Color::DarkGray)),
+            Span::styled("关", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
     let info = Paragraph::new(info_lines)
         .block(Block::default().borders(Borders::NONE))
         .wrap(Wrap { trim: false });

@@ -36,6 +36,24 @@ pub enum WatchAction {
         /// 仅告警时触发微信大群通知（发到当前打开的微信会话，开/关）
         #[arg(long = "wechat-notify", default_missing_value = "true", num_args = 0..=1)]
         wechat_notify: Option<bool>,
+        /// 本 watch 启用自动锁票（无全局总闸，只由本 watch 开关控制）
+        #[arg(long = "auto-lock")]
+        auto_lock: bool,
+        /// 只锁 IMAX 厅
+        #[arg(long = "imax-only")]
+        imax_only: bool,
+        /// 锁票票数（booker --num-seats；1-6）
+        #[arg(long = "lock-num-seats", default_value_t = config::DEFAULT_LOCK_NUM_SEATS)]
+        lock_num_seats: u64,
+        /// 同一影院锁票重试上限
+        #[arg(long = "lock-max-retries", default_value_t = config::DEFAULT_LOCK_MAX_RETRIES)]
+        lock_max_retries: u64,
+        /// 手动指定座位（booker --seat，可多次，如 "5排6座"）；设置后覆盖智能选座
+        #[arg(long = "lock-seat")]
+        lock_seats: Vec<String>,
+        /// 锁票时间范围（HH:MM-HH:MM）；缺省用 --time-window
+        #[arg(long = "lock-time-range")]
+        lock_time_range: Option<String>,
     },
     Show { id: String },
     Edit {
@@ -66,6 +84,24 @@ pub enum WatchAction {
         /// 微信大群通知开关：`--wechat-notify` 启用 / `--wechat-notify false` 关闭 / 不传则不改
         #[arg(long = "wechat-notify", default_missing_value = "true", num_args = 0..=1)]
         wechat_notify: Option<bool>,
+        /// 自动锁票开关：`--auto-lock` 启用 / `--auto-lock false` 关闭 / 不传则不改
+        #[arg(long = "auto-lock", default_missing_value = "true", num_args = 0..=1)]
+        auto_lock: Option<bool>,
+        /// 只锁 IMAX 厅（同上布尔语义）
+        #[arg(long = "imax-only", default_missing_value = "true", num_args = 0..=1)]
+        imax_only: Option<bool>,
+        /// 锁票票数
+        #[arg(long = "lock-num-seats")]
+        lock_num_seats: Option<u64>,
+        /// 同一影院锁票重试上限
+        #[arg(long = "lock-max-retries")]
+        lock_max_retries: Option<u64>,
+        /// 手动指定座位（可多次，覆盖智能选座）；传 `--lock-seat ""` 清空
+        #[arg(long = "lock-seat", allow_hyphen_values = true)]
+        lock_seats: Vec<String>,
+        /// 锁票时间范围；传空字符串 `""` 回退用 time-window；不传则不改
+        #[arg(long = "lock-time-range", allow_hyphen_values = true)]
+        lock_time_range: Option<String>,
     },
     Remove { id: String },
     Enable { id: String },
@@ -87,6 +123,12 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_email,
             xhs_group,
             wechat_notify,
+            auto_lock,
+            imax_only,
+            lock_num_seats,
+            lock_max_retries,
+            lock_seats,
+            lock_time_range,
         } => add(
             movie_id,
             &cinema,
@@ -99,6 +141,12 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_email.as_deref(),
             xhs_group.as_deref(),
             wechat_notify.unwrap_or(false),
+            auto_lock,
+            imax_only,
+            lock_num_seats,
+            lock_max_retries,
+            &lock_seats,
+            lock_time_range.as_deref(),
         ),
         WatchAction::Show { id } => show(&id),
         WatchAction::Edit {
@@ -113,6 +161,12 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_email,
             xhs_group,
             wechat_notify,
+            auto_lock,
+            imax_only,
+            lock_num_seats,
+            lock_max_retries,
+            lock_seats,
+            lock_time_range,
         } => edit(
             &id,
             &cinema,
@@ -125,6 +179,12 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             notify_email.as_deref(),
             xhs_group.as_deref(),
             wechat_notify,
+            auto_lock,
+            imax_only,
+            lock_num_seats,
+            lock_max_retries,
+            &lock_seats,
+            lock_time_range.as_deref(),
         ),
         WatchAction::Remove { id } => remove(&id),
         WatchAction::Enable { id } => set_enabled(&id, true),
@@ -162,6 +222,12 @@ fn add(
     notify_email: Option<&str>,
     xhs_group: Option<&str>,
     wechat_notify: bool,
+    auto_lock: bool,
+    imax_only: bool,
+    lock_num_seats: u64,
+    lock_max_retries: u64,
+    lock_seats: &[String],
+    lock_time_range: Option<&str>,
 ) -> Result<()> {
     if mode != config::MODE_PRESALE && mode != config::MODE_INCREMENTAL {
         return Err(anyhow!(
@@ -185,7 +251,19 @@ fn add(
         notify_email,
         xhs_group,
         wechat_notify,
+        auto_lock,
+        imax_only,
+        lock_num_seats,
+        lock_max_retries,
+        lock_seats,
     )?;
+    // lock_time_range 不经 add_watch 默认参传递，单独写入（区分 null 与不传）
+    if let Some(r) = lock_time_range {
+        if let Some(w) = config::find_watch_mut(&mut cfg, &id) {
+            w["lock_time_range"] = serde_json::json!(r);
+        }
+        config::save(&cfg)?;
+    }
     println!("✓ 已添加 watch: {}", id);
     Ok(())
 }
@@ -209,6 +287,12 @@ fn edit(
     notify_email: Option<&str>,
     xhs_group: Option<&str>,
     wechat_notify: Option<bool>,
+    auto_lock: Option<bool>,
+    imax_only: Option<bool>,
+    lock_num_seats: Option<u64>,
+    lock_max_retries: Option<u64>,
+    lock_seats: &[String],
+    lock_time_range: Option<&str>,
 ) -> Result<()> {
     if let Some(m) = mode {
         if m != config::MODE_PRESALE && m != config::MODE_INCREMENTAL {
@@ -285,6 +369,39 @@ fn edit(
     // wechat_notify: None=不改, Some(b)=设为 b
     if let Some(v) = wechat_notify {
         updates.insert("wechat_notify".into(), serde_json::json!(v));
+    }
+    // 锁票字段：None=不改，Some=覆盖
+    if let Some(v) = auto_lock {
+        updates.insert("auto_lock".into(), serde_json::json!(v));
+    }
+    if let Some(v) = imax_only {
+        updates.insert("imax_only".into(), serde_json::json!(v));
+    }
+    if let Some(v) = lock_num_seats {
+        updates.insert("lock_num_seats".into(), serde_json::json!(v));
+    }
+    if let Some(v) = lock_max_retries {
+        updates.insert("lock_max_retries".into(), serde_json::json!(v));
+    }
+    if !lock_seats.is_empty() {
+        // 显式传空串 = 清空手动座位（回退智能选座）
+        let cleared = lock_seats.iter().all(|s| s.is_empty());
+        let v: Vec<String> = if cleared {
+            Vec::new()
+        } else {
+            lock_seats.to_vec()
+        };
+        updates.insert("lock_seats".into(), serde_json::json!(v));
+    }
+    // lock_time_range: 区分「没传」/「传空」/「传具体值」
+    if let Some(v) = lock_time_range {
+        if v.is_empty() {
+            updates.insert("lock_time_range".into(), serde_json::Value::Null);
+        } else {
+            config::parse_window(v)
+                .map_err(|e| anyhow!("--lock-time-range 格式错误: {}", e))?;
+            updates.insert("lock_time_range".into(), serde_json::json!(v));
+        }
     }
     // 影院/日期/时段/模式一变，旧的 seqNo 基线就对不上了 —— 清空让下一轮重新静默建线，
     // 否则新窗口里已有的场次会被当成"新增"一次性全报出来。

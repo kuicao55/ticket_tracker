@@ -48,9 +48,18 @@ pub fn default_config() -> Value {
         "heartbeat_interval_sec": 3600,
         "cinemas": [],
         "watches": [],
+        // 自动锁票行为全局默认（无全局 confirm：watch 开了 auto_lock 就真锁，dry-run 只在测试按钮）
+        "lock_headless": true,
         "_runtime": {},
     })
 }
+
+// ----------------- 锁票默认值常量 -----------------
+
+/// 每个 watch 的默认锁票票数（booker `--num-seats`）。
+pub const DEFAULT_LOCK_NUM_SEATS: u64 = 2;
+/// 每个 watch 的默认锁票重试次数（同一影院尽力次数，达到即放弃该影院）。
+pub const DEFAULT_LOCK_MAX_RETRIES: u64 = 3;
 
 // ----------------- 时段解析（HH:MM-HH:MM） -----------------
 
@@ -247,6 +256,8 @@ fn migrate_watch_schema(cfg: &mut Value) -> Result<()> {
             if w.get("wechat_notify").is_none() {
                 w["wechat_notify"] = json!(false);
             }
+            // 锁票相关老 watch 默认：不开锁票，其余走全局默认值（向后兼容）。
+            settle_lock_defaults(w);
         }
     }
     // 第二遍：注册 cinemas（不再持有 watches 的可变借用）
@@ -303,6 +314,27 @@ fn migrate_per_watch_notify(cfg: &mut Value) -> Result<()> {
         save(cfg)?;
     }
     Ok(())
+}
+
+/// 给单个 watch 补齐全部锁票字段默认值（幂等，已存在的字段不动）。
+/// 供两条路径共用：老配置迁移 + 新 watch 直建。
+fn settle_lock_defaults(w: &mut Value) {
+    let _ = w.get("auto_lock").is_none().then(|| w["auto_lock"] = json!(false));
+    let _ = w.get("imax_only").is_none().then(|| w["imax_only"] = json!(false));
+    let _ = w
+        .get("lock_num_seats")
+        .is_none()
+        .then(|| w["lock_num_seats"] = json!(DEFAULT_LOCK_NUM_SEATS));
+    let _ = w
+        .get("lock_max_retries")
+        .is_none()
+        .then(|| w["lock_max_retries"] = json!(DEFAULT_LOCK_MAX_RETRIES));
+    let _ = w.get("lock_seats").is_none().then(|| w["lock_seats"] = json!([]));
+    // 锁票时间范围：null 时回退用 watch 的时段窗口（time_window）做 --show-time-range
+    let _ = w.get("lock_time_range").is_none().then(|| w["lock_time_range"] = Value::Null);
+    // 锁票运行状态（不进入 add_watch 的初始 JSON，由 mark/incr 写入）
+    let _ = w.get("lock_ok_cinemas").is_none().then(|| w["lock_ok_cinemas"] = json!([]));
+    let _ = w.get("lock_tries").is_none().then(|| w["lock_tries"] = json!({}));
 }
 
 // ----------------- 影院操作 -----------------
@@ -433,6 +465,12 @@ pub fn add_watch(
     notify_email_to: Option<&str>,
     xhs_group: Option<&str>,
     wechat_notify: bool,
+    // 锁票相关（默认值见 DEFAULT_LOCK_* 常量）
+    auto_lock: bool,
+    imax_only: bool,
+    lock_num_seats: u64,
+    lock_max_retries: u64,
+    lock_seats: &[String],
 ) -> Result<String> {
     let cinemas_v: Vec<String> = cinemas.iter().map(|s| s.to_string()).collect();
     for cid in &cinemas_v {
@@ -465,10 +503,20 @@ pub fn add_watch(
         "notify_email_to": notify_email_to.map(String::from).map(Value::String).unwrap_or(Value::Null),
         "xhs_group": xhs_group.map(str::trim).filter(|s| !s.is_empty()).map(String::from).map(Value::String).unwrap_or(Value::Null),
         "wechat_notify": wechat_notify,
+        // 锁票
+        "auto_lock": auto_lock,
+        "imax_only": imax_only,
+        "lock_num_seats": lock_num_seats,
+        "lock_max_retries": lock_max_retries,
+        "lock_seats": lock_seats.to_vec(),
+        "lock_time_range": Value::Null,
         "enabled": true,
         "presale_fired": false,
         "created_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
     });
+    // 幂等兜底：即便漏字段也补齐（含 lock_ok_cinemas/lock_tries 运行状态）
+    let mut watch = watch;
+    settle_lock_defaults(&mut watch);
     cfg.get_mut("watches")
         .and_then(|v| v.as_array_mut())
         .ok_or_else(|| anyhow!("config 缺少 watches[]"))?
@@ -567,6 +615,147 @@ pub fn touch_last_alert(cfg: &mut Value, watch_id: &str) {
     if let Some(w) = find_watch_mut(cfg, watch_id) {
         w["last_alert_at"] = json!(chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string());
     }
+}
+
+// ----------------- 自动锁票：读档 -----------------
+
+/// 全局：锁票时浏览器是否无头。默认 true（无人值守时无头稳定）。
+pub fn global_lock_headless(cfg: &Value) -> bool {
+    cfg.get("lock_headless").and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
+/// 每个 watch 是否启用自动锁票（自动锁票只看 watch 级开关，无全局总闸）。
+pub fn watch_auto_lock(watch: &Value) -> bool {
+    watch.get("auto_lock").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// 只锁 IMAX 厅。
+pub fn watch_imax_only(watch: &Value) -> bool {
+    watch.get("imax_only").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+
+/// 锁票票数（booker `--num-seats`）。
+pub fn watch_lock_num_seats(watch: &Value) -> u64 {
+    watch
+        .get("lock_num_seats")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_LOCK_NUM_SEATS)
+}
+
+/// 同一影院的锁票重试上限。
+pub fn watch_lock_max_retries(watch: &Value) -> u64 {
+    watch
+        .get("lock_max_retries")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(DEFAULT_LOCK_MAX_RETRIES)
+}
+
+/// 手动指定的座位列表（booker `--seat "X排Y座"`，可多条）。空 = 用 num_seats 让 booker 智能选座。
+pub fn watch_lock_seats(watch: &Value) -> Vec<String> {
+    watch
+        .get("lock_seats")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// 给 booker 的 `--show-time-range` 时间范围。优先 `lock_time_range`，缺省回退 `time_window`
+/// （时段窗口即范围对应的隐含语义）。
+pub fn watch_lock_time_range(watch: &Value) -> Option<String> {
+    let pick = |k: &str| {
+        watch
+            .get(k)
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    pick("lock_time_range").or_else(|| pick("time_window"))
+}
+
+// ----------------- 自动锁票：状态（运行期写入） -----------------
+
+/// 已锁成功的影院列表（按 `LockResult::Ok` 记录）。
+pub fn lock_ok_cinemas(watch: &Value) -> Vec<String> {
+    watch
+        .get("lock_ok_cinemas")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| s.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub fn cinema_lock_ok(watch: &Value, cinema_id: &str) -> bool {
+    lock_ok_cinemas(watch).iter().any(|c| c == cinema_id)
+}
+
+/// 某影院已尝试锁票的次数。
+pub fn cinema_lock_tries(watch: &Value, cinema_id: &str) -> u64 {
+    watch
+        .get("lock_tries")
+        .and_then(|v| v.get(cinema_id))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+}
+
+/// 某影院的锁票尝试是否已耗尽重试上限。
+pub fn cinema_lock_exhausted(watch: &Value, cinema_id: &str) -> bool {
+    cinema_lock_tries(watch, cinema_id) >= watch_lock_max_retries(watch)
+}
+
+/// 锁票成功后记录：加入 lock_ok_cinemas（去重），并清掉该影院的失败计数。落盘。
+pub fn mark_lock_ok(cfg: &mut Value, watch_id: &str, cinema_id: &str) -> Result<()> {
+    mark_lock_ok_inner(cfg, watch_id, cinema_id);
+    save(cfg)?;
+    Ok(())
+}
+
+fn mark_lock_ok_inner(cfg: &mut Value, watch_id: &str, cinema_id: &str) {
+    if let Some(w) = find_watch_mut(cfg, watch_id) {
+        if !cinema_lock_ok(w, cinema_id) {
+            let arr = w
+                .get_mut("lock_ok_cinemas")
+                .and_then(|v| v.as_array_mut())
+                .expect("lock_ok_cinemas 数组");
+            arr.push(Value::String(cinema_id.to_string()));
+        }
+        if let Some(tries) = w.get_mut("lock_tries").and_then(|v| v.as_object_mut()) {
+            tries.remove(cinema_id);
+        }
+    }
+}
+
+/// 一次锁票失败后记录（不论失败原因），达上限后该影院不再尝试。落盘。
+pub fn incr_lock_tries(cfg: &mut Value, watch_id: &str, cinema_id: &str) -> Result<()> {
+    incr_lock_tries_inner(cfg, watch_id, cinema_id);
+    save(cfg)?;
+    Ok(())
+}
+
+fn incr_lock_tries_inner(cfg: &mut Value, watch_id: &str, cinema_id: &str) {
+    if let Some(w) = find_watch_mut(cfg, watch_id) {
+        let cur = cinema_lock_tries(w, cinema_id);
+        if !w.get("lock_tries").map(|v| v.is_object()).unwrap_or(false) {
+            w["lock_tries"] = json!({});
+        }
+        w["lock_tries"][cinema_id] = json!(cur + 1);
+    }
+}
+
+/// 一个 watch 是否所有影院都已「锁成功」或「重试耗尽」。空影院列表返回 false，
+/// 避免误停用只有空列表的 watch。
+pub fn all_cinemas_lock_settled(watch: &Value, cinemas: &[String]) -> bool {
+    !cinemas.is_empty()
+        && cinemas
+            .iter()
+            .all(|c| cinema_lock_ok(watch, c) || cinema_lock_exhausted(watch, c))
 }
 
 // ----------------- 运行期 -----------------
@@ -709,5 +898,102 @@ mod tests {
         assert!(!in_time_window(&w, "22:00")); // 终点不含（与 Python range 一致）
         assert!(!in_time_window(&w, "18:59"));
         assert!(!in_time_window(&w, "23:00"));
+    }
+
+    // ---------- 自动锁票 ----------
+
+    #[test]
+    fn global_lock_defaults_headless() {
+        assert!(global_lock_headless(&json!({})));
+        assert!(global_lock_headless(&json!({ "lock_headless": false })) == false);
+        assert!(global_lock_headless(&json!({ "lock_headless": true })));
+    }
+
+    #[test]
+    fn watch_lock_defaults_for_legacy_or_out_of_range() {
+        assert!(!watch_auto_lock(&json!({})));
+        assert!(!watch_imax_only(&json!({})));
+        assert_eq!(watch_lock_num_seats(&json!({})), DEFAULT_LOCK_NUM_SEATS);
+        assert_eq!(watch_lock_num_seats(&json!({ "lock_num_seats": 0 })), 0);
+        assert_eq!(watch_lock_max_retries(&json!({})), DEFAULT_LOCK_MAX_RETRIES);
+        assert_eq!(watch_lock_seats(&json!({})), Vec::<String>::new());
+        assert_eq!(watch_lock_seats(&json!({ "lock_seats": ["5排6座", "5排7座"] })), vec!["5排6座", "5排7座"]);
+    }
+
+    #[test]
+    fn lock_time_range_falls_back_to_time_window() {
+        assert_eq!(watch_lock_time_range(&watch_with_tw("19:00-22:00")), Some("19:00-22:00".into()));
+        // 显式 lock_time_range 优先
+        let w = json!({ "time_window": "19:00-22:00", "lock_time_range": "20:00-21:00" });
+        assert_eq!(watch_lock_time_range(&w), Some("20:00-21:00".into()));
+        assert_eq!(watch_lock_time_range(&json!({})), None);
+        assert_eq!(watch_lock_time_range(&json!({ "time_window": "" })), None);
+    }
+
+    #[test]
+    fn lock_state_tracks_ok_and_tries() {
+        let mut cfg = cfg_with_watch(json!({
+            "id": "w_1",
+            "lock_max_retries": 3,
+            "lock_ok_cinemas": [],
+            "lock_tries": {},
+        }));
+        assert!(!cinema_lock_ok(find_watch(&cfg, "w_1").unwrap(), "37534"));
+        assert_eq!(cinema_lock_tries(find_watch(&cfg, "w_1").unwrap(), "37534"), 0);
+
+        incr_lock_tries_inner(&mut cfg, "w_1", "37534");
+        incr_lock_tries_inner(&mut cfg, "w_1", "37534");
+        let w = find_watch(&cfg, "w_1").unwrap();
+        assert_eq!(cinema_lock_tries(w, "37534"), 2);
+        assert!(!cinema_lock_exhausted(w, "37534"));
+
+        incr_lock_tries_inner(&mut cfg, "w_1", "37534");
+        let w = find_watch(&cfg, "w_1").unwrap();
+        assert!(cinema_lock_exhausted(w, "37534"));
+
+        // 成功后：标记 ok + 清掉计数
+        mark_lock_ok_inner(&mut cfg, "w_1", "37534");
+        let w = find_watch(&cfg, "w_1").unwrap();
+        assert!(cinema_lock_ok(w, "37534"));
+        assert!(cinema_lock_exhausted(w, "37534") == false); // 清掉计数后不再 exhausted
+        assert_eq!(cinema_lock_tries(w, "37534"), 0);
+    }
+
+    #[test]
+    fn all_cinemas_lock_settled_requires_all_done() {
+        let mut cfg = cfg_with_watch(json!({
+            "id": "w_1",
+            "lock_max_retries": 2,
+            "lock_ok_cinemas": [],
+            "lock_tries": {},
+        }));
+        let cinemas = vec!["37534".to_string(), "42020".to_string()];
+        // 全未处理
+        assert!(!all_cinemas_lock_settled(find_watch(&cfg, "w_1").unwrap(), &cinemas));
+        // 空列表永不 settled（防误停用）
+        assert!(!all_cinemas_lock_settled(find_watch(&cfg, "w_1").unwrap(), &[]));
+        // 一家 ok、一家耗尽 → settled
+        mark_lock_ok_inner(&mut cfg, "w_1", "37534");
+        incr_lock_tries_inner(&mut cfg, "w_1", "42020");
+        incr_lock_tries_inner(&mut cfg, "w_1", "42020");
+        assert!(all_cinemas_lock_settled(find_watch(&cfg, "w_1").unwrap(), &cinemas));
+    }
+
+    #[test]
+    fn settle_lock_defaults_fills_missing_fields_idempotently() {
+        let mut w = json!({ "id": "w_1" });
+        settle_lock_defaults(&mut w);
+        assert_eq!(w["auto_lock"], json!(false));
+        assert_eq!(w["imax_only"], json!(false));
+        assert_eq!(w["lock_num_seats"], json!(DEFAULT_LOCK_NUM_SEATS));
+        assert_eq!(w["lock_max_retries"], json!(DEFAULT_LOCK_MAX_RETRIES));
+        assert_eq!(w["lock_seats"], json!([]));
+        assert_eq!(w["lock_ok_cinemas"], json!([]));
+        assert_eq!(w["lock_tries"], json!({}));
+        // 已存在的值不被覆盖
+        let mut w2 = json!({ "id": "w_2", "lock_num_seats": 5, "auto_lock": true });
+        settle_lock_defaults(&mut w2);
+        assert_eq!(w2["lock_num_seats"], json!(5));
+        assert_eq!(w2["auto_lock"], json!(true));
     }
 }

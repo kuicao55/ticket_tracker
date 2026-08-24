@@ -65,6 +65,7 @@ pub enum FieldKind {
     CinemaList, // Enter → 打开 CinemaPicker
     Mode,         // Enter / ←→ 在「开票提醒」「增场监控」之间切换
     WechatNotify, // Enter 在「开」「关」之间切换
+    Toggle,       // 自动锁票 / 只锁 IMAX：Enter 在「开」「关」之间切换
     TestNotify,   // 仅 edit_watch：Enter → 给 webhook/邮箱各发一条测试消息
     Submit,
     Cancel,
@@ -169,6 +170,22 @@ impl FormModal {
                 false,
                 "关".into(),
             ),
+            FormField::with_value("自动锁票", FieldKind::Toggle, false, "关".into()),
+            FormField::with_value("只锁 IMAX 厅", FieldKind::Toggle, false, "关".into()),
+            FormField::with_value(
+                "锁票票数",
+                FieldKind::OptionalInteger,
+                false,
+                config::DEFAULT_LOCK_NUM_SEATS.to_string(),
+            ),
+            FormField::with_value(
+                "同影院重试上限",
+                FieldKind::OptionalInteger,
+                false,
+                config::DEFAULT_LOCK_MAX_RETRIES.to_string(),
+            ),
+            FormField::with_value("锁票座位", FieldKind::Text, false, String::new()),
+            FormField::with_value("锁票时段", FieldKind::TimeWindow, false, String::new()),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
         ];
@@ -201,6 +218,17 @@ impl FormModal {
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string()
+        };
+        let bool_on = |v: Option<&Value>| -> String {
+            match v {
+                Some(Value::Bool(true)) => "开".to_string(),
+                _ => "关".to_string(),
+            }
+        };
+        let opt_u64 = |v: Option<&Value>, default: u64| -> String {
+            v.and_then(|x| x.as_u64())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| default.to_string())
         };
         let cinemas = join_arr("cinemas");
         let dates = join_arr("dates");
@@ -251,6 +279,37 @@ impl FormModal {
                     "关".to_string()
                 },
             ),
+            FormField::with_value(
+                "自动锁票",
+                FieldKind::Toggle,
+                false,
+                bool_on(w.get("auto_lock")),
+            ),
+            FormField::with_value(
+                "只锁 IMAX 厅",
+                FieldKind::Toggle,
+                false,
+                bool_on(w.get("imax_only")),
+            ),
+            FormField::with_value(
+                "锁票票数",
+                FieldKind::OptionalInteger,
+                false,
+                opt_u64(w.get("lock_num_seats"), config::DEFAULT_LOCK_NUM_SEATS),
+            ),
+            FormField::with_value(
+                "同影院重试上限",
+                FieldKind::OptionalInteger,
+                false,
+                opt_u64(w.get("lock_max_retries"), config::DEFAULT_LOCK_MAX_RETRIES),
+            ),
+            FormField::with_value("锁票座位", FieldKind::Text, false, join_arr("lock_seats")),
+            FormField::with_value(
+                "锁票时段",
+                FieldKind::TimeWindow,
+                false,
+                opt_str("lock_time_range"),
+            ),
             FormField::button("测试通知", FieldKind::TestNotify),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
@@ -282,6 +341,13 @@ impl FormModal {
                 .map(|n| n.to_string())
                 .unwrap_or_default()
         };
+        let bool_str = |key: &str| -> String {
+            if cfg.get(key).and_then(|v| v.as_bool()).unwrap_or(false) {
+                "开".to_string()
+            } else {
+                "关".to_string()
+            }
+        };
         let fields = vec![
             FormField::with_value(
                 "Discord webhook",
@@ -307,6 +373,12 @@ impl FormModal {
                 FieldKind::Integer,
                 true,
                 u("heartbeat_interval_sec"),
+            ),
+            FormField::with_value(
+                "无头模式",
+                FieldKind::Toggle,
+                false,
+                bool_str("lock_headless"),
             ),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
@@ -337,6 +409,9 @@ impl FormModal {
                 Some(FieldKind::Submit) | Some(FieldKind::Cancel) => {
                     "↑↓ 选择  Enter 触发  Esc 关闭"
                 }
+                Some(FieldKind::Toggle) | Some(FieldKind::WechatNotify) => {
+                    "↑↓ 选择  Enter 在「开」「关」间切换  Esc 关闭"
+                }
                 _ => "↑↓ 选择  Enter 编辑  Esc 关闭",
             },
         };
@@ -355,16 +430,18 @@ fn field_example(field: &FormField) -> Option<&'static str> {
         TimeWindow => Some("例如 19:00-22:00（留空=不限）"),
         Mode => Some("Enter / ←→ 在「开票提醒」「增场监控」间切换"),
         WechatNotify => Some("Enter 在「开」「关」间切换（开启则发到当前微信会话）"),
-        OptionalInteger => Some("例如 60（秒，留空=用全局默认）"),
-        Integer => Some("数字"),
-        Webhook => Some("例如 https://discord.com/api/webhooks/..."),
-        TestNotify | Submit | Cancel => None,
+        Toggle => Some("Enter 在「开」「关」间切换（须先满足其前置开关才会生效）"),
         Text => match field.label.as_str() {
             "电影名" => Some("选填，留空自动从猫眼拉"),
             "通知邮箱" => Some("例如 your@email.com（需本机 msmtp，留空=关）"),
             "通知 xhs 群名" => Some("例如 test（留空=关闭该通道）"),
+            "锁票座位" => Some("例如 5排6座 6排7座（空格分隔，留空=智能选座）"),
             _ => None,
         },
+        OptionalInteger => Some("例如 60（秒，留空=用全局默认）"),
+        Integer => Some("数字"),
+        Webhook => Some("例如 https://discord.com/api/webhooks/..."),
+        TestNotify | Submit | Cancel => None,
     }
 }
 
@@ -453,7 +530,7 @@ fn handle_form_key(app: &mut App, mut f: FormModal, key: KeyEvent) -> Option<Mod
                 };
                 Some(Modal::Form(f))
             }
-            FieldKind::WechatNotify => {
+            FieldKind::WechatNotify | FieldKind::Toggle => {
                 // Enter 在「开 / 关」间切换
                 let cur = &f.fields[f.focus].value;
                 f.fields[f.focus].value = if cur == "开" {
@@ -740,6 +817,17 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         if t.is_empty() { None } else { Some(t.to_string()) }
     };
     let wechat_notify = f.fields[10].value.trim() == "开";
+    let auto_lock = f.fields[11].value.trim() == "开";
+    let imax_only = f.fields[12].value.trim() == "开";
+    let lock_num_seats = parse_opt_u64(&f.fields[13].value, "锁票票数")?
+        .unwrap_or(config::DEFAULT_LOCK_NUM_SEATS);
+    let lock_max_retries = parse_opt_u64(&f.fields[14].value, "重试上限")?
+        .unwrap_or(config::DEFAULT_LOCK_MAX_RETRIES);
+    let lock_seats: Vec<String> = f.fields[15].value.split_whitespace().map(String::from).collect();
+    let lock_time_range = {
+        let t = f.fields[16].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     let cref: Vec<&str> = cinemas.iter().map(String::as_str).collect();
     let id = config::add_watch(
@@ -755,8 +843,20 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         notify_email_to.as_deref(),
         xhs_group.as_deref(),
         wechat_notify,
+        auto_lock,
+        imax_only,
+        lock_num_seats,
+        lock_max_retries,
+        &lock_seats,
     )
     .map_err(|e| e.to_string())?;
+    // lock_time_range 不经 add_watch 传参，单独写入（区分 null 与不传）
+    if let Some(r) = lock_time_range {
+        if let Some(w) = config::find_watch_mut(&mut cfg, &id) {
+            w["lock_time_range"] = serde_json::json!(r);
+        }
+        config::save(&cfg).map_err(|e| e.to_string())?;
+    }
     Ok(format!("已添加 watch {}", id))
 }
 
@@ -782,6 +882,17 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
         if t.is_empty() { None } else { Some(t.to_string()) }
     };
     let wechat_notify = f.fields[8].value.trim() == "开";
+    let auto_lock = f.fields[9].value.trim() == "开";
+    let imax_only = f.fields[10].value.trim() == "开";
+    let lock_num_seats = parse_opt_u64(&f.fields[11].value, "锁票票数")?
+        .unwrap_or(config::DEFAULT_LOCK_NUM_SEATS);
+    let lock_max_retries = parse_opt_u64(&f.fields[12].value, "重试上限")?
+        .unwrap_or(config::DEFAULT_LOCK_MAX_RETRIES);
+    let lock_seats: Vec<String> = f.fields[13].value.split_whitespace().map(String::from).collect();
+    let lock_time_range = {
+        let t = f.fields[14].value.trim();
+        if t.is_empty() { None } else { Some(t.to_string()) }
+    };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     // 注册尚未收藏的影院
     for cid in &cinemas {
@@ -844,6 +955,23 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
         }
     }
     w["wechat_notify"] = serde_json::json!(wechat_notify);
+    // 锁票字段
+    w["auto_lock"] = serde_json::json!(auto_lock);
+    w["imax_only"] = serde_json::json!(imax_only);
+    w["lock_num_seats"] = serde_json::json!(lock_num_seats);
+    w["lock_max_retries"] = serde_json::json!(lock_max_retries);
+    w["lock_seats"] = serde_json::json!(lock_seats);
+    match &lock_time_range {
+        Some(s) => {
+            config::parse_window(s).map_err(|e| format!("锁票时段格式错误: {}", e))?;
+            w["lock_time_range"] = serde_json::Value::String(s.clone());
+        }
+        None => {
+            if let Some(o) = w.as_object_mut() {
+                o.remove("lock_time_range");
+            }
+        }
+    }
     // 影院/日期/时段/模式变化 → 清 seen_shows（与 cli 行为对齐）
     let _ = w; // suppress unused warning if not used below
     let any_baseline_change = true; // 简化：保存路径上无 seen_shows diff，记住清一次
@@ -870,6 +998,7 @@ fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {
         .trim()
         .parse()
         .map_err(|_| "报告间隔必须是数字".to_string())?;
+    let lock_headless = f.fields[5].value.trim() == "开";
     if !quiet.is_empty() {
         config::parse_window(&quiet).map_err(|e| e.to_string())?;
     }
@@ -890,6 +1019,7 @@ fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {
         cfg["phone_only_window"] = serde_json::json!(phone);
     }
     cfg["heartbeat_interval_sec"] = serde_json::json!(hb);
+    cfg["lock_headless"] = serde_json::json!(lock_headless);
     config::save(&cfg).map_err(|e| e.to_string())?;
     Ok("全局设置已保存".into())
 }
@@ -900,7 +1030,9 @@ fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {
 /// 表单字段索引（按 `edit_watch` 现在的布局）：
 ///   0 cinemas | 1 dates | 2 time_window | 3 mode | 4 interval
 ///   5 notify_webhook | 6 notify_email_to | 7 通知 xhs 群名 | 8 通知微信大群
-///   9 测试通知 | 10 确定 | 11 取消
+///   9 自动锁票 | 10 只锁IMAX | 11 锁票票数 | 12 重试上限
+///   13 锁票座位 | 14 锁票时段
+///   15 测试通知 | 16 确定 | 17 取消
 fn trigger_test_notify(f: &FormModal) -> String {
     // 索引 5/6/7/8 才是真的 webhook / email / xhs 群名 / 微信开关
     let webhook = f.fields.get(5).map(|x| x.value.trim().to_string()).unwrap_or_default();

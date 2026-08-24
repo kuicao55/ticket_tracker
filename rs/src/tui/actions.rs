@@ -20,7 +20,7 @@ pub const BUTTONS: &[(&str, &str)] = &[
     ("q", "退出"),
 ];
 
-/// Detail 列内的 per-watch 按钮（仅 Detail In 模式生效）。长度 = 6。
+/// Detail 列内的 per-watch 按钮（仅 Detail In 模式生效）。长度 = 7。
 pub const DETAIL_BUTTONS: &[(&str, &str)] = &[
     ("◉", "启停"),
     ("~", "影院"),
@@ -28,6 +28,7 @@ pub const DETAIL_BUTTONS: &[(&str, &str)] = &[
     ("~", "间隔"),
     ("r", "立即检查"),
     ("-", "删除"),
+    ("◈", "锁票测试"),
 ];
 
 /// 当前 `app.action_idx` 对应的按钮 Enter 触发的动作。
@@ -155,7 +156,8 @@ pub fn cmd_delete_wid(app: &mut App, wid: &str) {
 }
 
 /// Detail In 模式下按 Enter 触发当前按钮。
-/// 顺序与 `DETAIL_BUTTONS` 一致：0=启停, 1=影院, 2=日期, 3=间隔, 4=立即检查, 5=删除。
+/// 顺序与 `DETAIL_BUTTONS` 一致：0=启停, 1=影院, 2=日期, 3=间隔, 4=立即检查, 5=删除,
+/// 6=锁票测试。
 pub fn dispatch_detail_action(app: &mut App, btn_idx: usize) {
     let wid = match cmd::current_wid(app) {
         Some(w) => w,
@@ -193,6 +195,12 @@ pub fn dispatch_detail_action(app: &mut App, btn_idx: usize) {
                 text: format!("删 watch {} ? (y/n)", wid),
                 created_at: std::time::Instant::now(),
             });
+        }
+        6 => {
+            // 手动锁票测试：有头浏览器 + dry-run，不真锁，结果走既有通知通道。
+            app.monitor.test_lock_wid(wid.clone());
+            cmd::push_event(app, format!("· 请求 {} 锁票测试（有头 dry-run）…", wid));
+            cmd::push_status(app, format!("{} 锁票测试已排队", wid), 3);
         }
         _ => {}
     }

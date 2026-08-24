@@ -34,6 +34,8 @@ fn resolve_key(k: &str) -> &str {
         "quiet" => "quiet_window",
         "phone-only" => "phone_only_window",
         "interval" => "check_interval",
+        // 自动锁票无全局总闸/confirm（watch 开了 auto_lock 就真锁，dry-run 只在测试按钮）
+        "lock-headless" => "lock_headless",
         other => other,
     }
 }

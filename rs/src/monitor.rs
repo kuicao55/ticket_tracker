@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::Notify;
 
 use crate::config;
+use crate::lock;
 use crate::maoyan;
 use crate::notify;
 
@@ -182,6 +183,19 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
             .and_then(|v| v.as_i64())
             .unwrap_or(total_shows);
 
+        // imax_only：只监控 IMAX 厅。show_count 重算与场次明细两处都要把 IMAX 判定
+        // 并进过滤条件，否则「非 IMAX 场次也会报开售」但锁票却锁不上，两套语义不一致。
+        let imax_only = config::watch_imax_only(watch);
+        // 原始 plist 条目（还没摊平成 ShowInfo）的 IMAX 判定，与 maoyan::is_imax_show 对齐。
+        let is_imax_raw = |p: &Value| -> bool {
+            if !imax_only {
+                return true;
+            }
+            let th = p.get("th").and_then(|v| v.as_str()).unwrap_or("");
+            let tp = p.get("tp").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{th} {tp}").to_ascii_uppercase().contains("IMAX")
+        };
+
         // 日期过滤
         let mut dates = all_dates.clone();
         let allowed: Option<BTreeSet<String>> =
@@ -215,7 +229,7 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
                                                 .and_then(|v| v.as_str())
                                                 .map(|t| config::in_time_window(watch, t))
                                                 .unwrap_or(true);
-                                            d_ok && t_ok
+                                            d_ok && t_ok && is_imax_raw(p)
                                         })
                                         .count() as i64
                                 })
@@ -242,8 +256,28 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
                                                 .and_then(|v| v.as_str())
                                                 .map(|t| config::in_time_window(watch, t))
                                                 .unwrap_or(true)
+                                                && is_imax_raw(p)
                                         })
                                         .count() as i64
+                                })
+                                .unwrap_or(0)
+                        })
+                        .sum()
+                })
+                .unwrap_or(0);
+        } else if imax_only {
+            // 没限日期也没限时段，只锁 IMAX —— show_count 同样要被 IMAX 过滤重算，
+            // 否则状态会报「N 场」但锁票候选里全是非 IMAX，语义分裂。
+            show_count = movie
+                .get("shows")
+                .and_then(|v| v.as_array())
+                .map(|arr: &Vec<Value>| {
+                    arr.iter()
+                        .map(|s: &Value| {
+                            s.get("plist")
+                                .and_then(|v| v.as_array())
+                                .map(|plist: &Vec<Value>| {
+                                    plist.iter().filter(|p| is_imax_raw(p)).count() as i64
                                 })
                                 .unwrap_or(0)
                         })
@@ -261,6 +295,10 @@ pub async fn check_watch(watch: &Value, cinema_cache: &mut HashMap<String, Value
             }
             // 时段窗口过滤：在允许日期内再按 HH:MM 截一刀。
             cshows.retain(|s| config::in_time_window(watch, &s.tm));
+            // imax_only：同时只留 IMAX 厅，让锁票候选与「开售」的语义一致。
+            if imax_only {
+                cshows.retain(maoyan::is_imax_show);
+            }
             shows_map.insert(cid.clone(), cshows);
         }
         if dates.is_empty() || show_count <= 0 {
@@ -338,8 +376,39 @@ pub struct Monitor {
     force_flag: Arc<AtomicBool>,
     /// wid 集合：要求「只强制检查这一条」的 watch（per-watch force check）
     force_targets: Arc<StdMutex<std::collections::HashSet<String>>>,
+    /// 自动锁票在途标志：booker 单实例（共享 `~/.maoyan-booker-profile/` cookie 目录），
+    /// 同一时刻只允许一个锁票子进程。忙时本轮的锁票请求整体跳过，不消耗重试额度。
+    lock_inflight: Arc<AtomicBool>,
+    /// 手动锁票测试队列：TUI 点「锁票测试」时入队，monitor 循环消费，
+    /// 用有头浏览器 + dry-run 跑一遍 booker 并沿既有通道发结果通知。
+    lock_testing: Arc<StdMutex<std::collections::HashSet<String>>>,
+    /// 锁票测试请求唤醒：入队时 `notify_one()`，打断 loop 的 interval 睡眠，
+    /// 立刻消费队列——否则要等满 check_interval 才启动测试（用户会觉得很慢）。
+    lock_test_requested: Notify,
     #[allow(dead_code)]
     watch_filter: Vec<String>,
+}
+
+/// 给异步锁票子任务持有的 RAII 保护：任务结束（含 panic 展开）时自动回落 in-flight 标志，
+/// 避免标志被卡死在 true 导致后续永远不再锁票。
+struct InflightGuard(Arc<AtomicBool>);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// 从任意线程/任务往事件队列写一行（无需 `&Monitor`，供锁票子任务回调用）。
+fn push_event_shared(shared: &SharedState, line: &str) {
+    let ts = chrono::Local::now().format("%H:%M:%S");
+    let entry = format!("[{}] {}", ts, line);
+    let mut q = shared.events.lock().unwrap();
+    // 仅保留最近 12 条，避免高频推送导致队列爆炸
+    if q.len() >= 12 {
+        q.pop_back();
+    }
+    q.push_front(entry);
 }
 
 #[derive(Debug, Default, Clone)]
@@ -383,6 +452,9 @@ impl Monitor {
             stop: Arc::new(Notify::new()),
             force_flag: Arc::new(AtomicBool::new(false)),
             force_targets: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            lock_inflight: Arc::new(AtomicBool::new(false)),
+            lock_testing: Arc::new(StdMutex::new(std::collections::HashSet::new())),
+            lock_test_requested: Notify::new(),
             watch_filter: watch_filter.unwrap_or_default(),
         })
     }
@@ -403,14 +475,7 @@ impl Monitor {
     }
 
     pub async fn push_event(&self, line: String) {
-        let ts = chrono::Local::now().format("%H:%M:%S");
-        let entry = format!("[{}] {}", ts, line);
-        let mut q = self.shared.events.lock().unwrap();
-        // 仅保留最近 12 条，避免高频推送导致队列爆炸
-        if q.len() >= 12 {
-            q.pop_back();
-        }
-        q.push_front(entry);
+        push_event_shared(&self.shared, &line);
     }
 
     pub fn stop(&self) {
@@ -449,6 +514,24 @@ impl Monitor {
         for w in enabled_wids {
             ft.insert(w);
         }
+    }
+
+    /// 手动锁票测试：把 wid 加入测试队列，monitor 循环会用有头浏览器 + dry-run
+/// 跑一遍 booker（不真锁）并沿该 watch 既有通知通道发结果。
+pub fn test_lock_wid(&self, wid: String) {
+        if !wid.is_empty() {
+            self.lock_testing.lock().unwrap().insert(wid);
+            // 立刻打断 loop 的 interval 睡眠，尽快启动测试（不等满 check_interval）
+            self.lock_test_requested.notify_one();
+        }
+    }
+
+    /// 读出当前锁票测试队列并清空它（一轮循环消费一次）。
+    fn drain_lock_test_targets(&self) -> std::collections::HashSet<String> {
+        let mut lt = self.lock_testing.lock().unwrap();
+        let snap = lt.clone();
+        lt.clear();
+        snap
     }
 
     /// 读出当前 force_targets 的 snapshot 并清空它（一轮 tick 内消费一次）。
@@ -544,6 +627,12 @@ impl Monitor {
                     .await;
             }
 
+            // 手动锁票测试队列（独立于检查节奏）
+            let lock_test_set = self.drain_lock_test_targets();
+            for wid in lock_test_set {
+                self.run_lock_test(&wid).await;
+            }
+
             let did = self.tick(mode, force, &force_set).await;
             if did {
                 let mut s = self.shared.stats.lock().unwrap();
@@ -611,6 +700,8 @@ impl Monitor {
         tokio::select! {
             _ = tokio::time::sleep(d) => false,
             _ = self.stop.notified() => true,
+            // 锁票测试请求：立刻醒来回 loop 顶部消费队列，不等满 interval
+            _ = self.lock_test_requested.notified() => false,
         }
     }
 
@@ -886,6 +977,8 @@ impl Monitor {
                         let _ = config::mark_presale_fired(&mut g, &wid, cid);
                     }
                 }
+                // 自动锁票（预设开售即触发；与通知通道互不干扰）
+                self.maybe_trigger_autolock(i, &wid, &label, info).await;
                 // 自动停用
                 let all_cinemas: std::collections::HashSet<String> = {
                     let g = self.shared.cfg.lock().unwrap();
@@ -915,7 +1008,32 @@ impl Monitor {
                         })
                         .unwrap_or_default()
                 };
-                if !all_cinemas.is_empty() && all_cinemas.is_subset(&fired_set) {
+                // 自动锁票在开时，不能「所有影院都通知过」就停用 —— 要等每个影院都
+                // 锁成功或重试耗尽（settled）才停，否则 ticket-tracker 一停用锁票就断线。
+                let lock_settled = {
+                    let g = self.shared.cfg.lock().unwrap();
+                    let w = g
+                        .get("watches")
+                        .and_then(|v| v.as_array())
+                        .and_then(|a| a.get(i));
+                    match w {
+                        Some(w) if config::watch_auto_lock(w) => {
+                            let cinemas: Vec<String> = w
+                                .get("cinemas")
+                                .and_then(|v| v.as_array())
+                                .map(|a| {
+                                    a.iter()
+                                        .filter_map(|v| v.as_str().map(String::from))
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+                            config::all_cinemas_lock_settled(w, &cinemas)
+                        }
+                        // 没开自动锁票：维持旧行为，全部通知完即停
+                        _ => true,
+                    }
+                };
+                if !all_cinemas.is_empty() && all_cinemas.is_subset(&fired_set) && lock_settled {
                     {
                         let mut g = self.shared.cfg.lock().unwrap();
                         if let Some(arr) = g.get_mut("watches").and_then(|v| v.as_array_mut()) {
@@ -1173,6 +1291,484 @@ impl Monitor {
             ))
             .await;
         }
+        // 增场监控 + 自动锁票：只要影院有场次就想尽办法锁（与"新增才通知"解耦）
+        self.maybe_trigger_autolock(idx, wid, label, info).await;
+    }
+
+    // ----------------- 自动锁票：触发与结果落账 -----------------
+
+    /// 自动锁票触发点：给该 watch 尚未处理的影院逐一组装 booker 参数，交由一个异步
+    /// 子任务按「最早场次日期」顺序串行执行（booker 单实例，同一时刻只有一个锁票进程）。
+    ///
+    /// 开关：只看 per-watch `auto_lock`（无全局总闸，每个 watch 独立决定）。
+    /// 已经 `lock_ok` 或重试耗尽的影院直接跳过；子进程忙（in-flight）时本轮整体跳过，
+    /// 且**不**消耗重试额度。
+    async fn maybe_trigger_autolock(
+        &self,
+        idx: usize,
+        wid: &str,
+        label: &str,
+        info: &WatchInfo,
+    ) {
+        let watch = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("watches")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.get(idx))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        if watch.is_null() {
+            return;
+        }
+        // 只按 watch 级 auto_lock 触发；无全局 confirm 开关，开了就是真锁。
+        // dry-run 只存在于「锁票测试」（强制 confirm=false）。headless 取自全局 cfg。
+        let (lock_on, headless) = {
+            let g = self.shared.cfg.lock().unwrap();
+            (config::watch_auto_lock(&watch), config::global_lock_headless(&g))
+        };
+        if !lock_on {
+            return;
+        }
+        // 串行化：已有锁票子进程在跑 → 本轮整体跳过（不抢、不消耗重试额度）
+        if self
+            .lock_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.push_event(format!("· {} 锁票子进程忙，本轮跳过", label))
+                .await;
+            return;
+        }
+        let guard = InflightGuard(Arc::clone(&self.lock_inflight));
+
+        let movie_id = watch.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
+        let num_seats = config::watch_lock_num_seats(&watch);
+        let imax_only = config::watch_imax_only(&watch);
+        let seats = config::watch_lock_seats(&watch);
+        // 锁票时间范围：显式 lock_time_range → 时段窗口 → 全天兜底
+        let lock_range = config::watch_lock_time_range(&watch)
+            .unwrap_or_else(|| "00:00-23:59".to_string());
+
+        // 待锁影院：本轮有场次、未锁成功、未耗尽重试
+        let mut pending: Vec<(lock::LockArgs, String)> = Vec::new();
+        for (cid, shows) in &info.shows {
+            if shows.is_empty() {
+                continue;
+            }
+            if config::cinema_lock_ok(&watch, cid) || config::cinema_lock_exhausted(&watch, cid) {
+                continue;
+            }
+            // 场次已经过 dates + 时段 + imax 过滤，min dt 一定存在在窗口内的场次。
+            let Some(show_date) = shows.iter().map(|s| s.dt.clone()).min() else {
+                continue;
+            };
+            let cinema_name = info
+                .cinema_names
+                .get(cid)
+                .cloned()
+                .unwrap_or_else(|| cid.clone());
+            pending.push((
+                lock::LockArgs {
+                    cinema_id: cid.clone(),
+                    movie_id,
+                    show_date,
+                    time_range: Some(lock_range.clone()),
+                    num_seats,
+                    imax_only,
+                    seats: seats.clone(),
+                    confirm: true, // 真实锁票：直接真锁（dry-run 只走测试路径）
+                    headless,
+                },
+                cinema_name,
+            ));
+        }
+        if pending.is_empty() {
+            drop(guard);
+            return;
+        }
+        // 按最早场次日期排序，多影院按开售先后顺序尝试
+        pending.sort_by(|a, b| a.0.show_date.cmp(&b.0.show_date));
+
+        self.push_event(format!(
+            "🎯 {} 自动锁票触发：{} 个影院待锁（{}）",
+            label,
+            pending.len(),
+            "真锁"
+        ))
+        .await;
+
+        let shared = Arc::clone(&self.shared);
+        let stop = Arc::clone(&self.stop);
+        let wid_owned = wid.to_string();
+        let label_owned = label.to_string();
+        tokio::spawn(async move {
+            for (args, cinema_name) in pending {
+                // 停止信号一旦到达立即中止排程；已启动的子进程交给超时兜底。
+                let run = tokio::select! {
+                    _ = stop.notified() => break,
+                    r = lock::run_lock(&args) => match r {
+                        Ok(run) => run,
+                        Err(e) => {
+                            push_event_shared(
+                                &shared,
+                                &format!("✗ {} {} 无法启动 booker: {}", label_owned, args.cinema_id, e),
+                            );
+                            let mut g = shared.cfg.lock().unwrap();
+                            let _ = config::incr_lock_tries(&mut g, &wid_owned, &args.cinema_id);
+                            continue;
+                        }
+                    },
+                };
+                // 终态一到（锁成/get到 dry-run 走通）先通知，不等浏览器收起
+                let decided = run.decided();
+                if let Some(res) = decided {
+                    let early = lock::LockOutcome {
+                        result: res,
+                        stdout: run.stdout(),
+                        stderr: String::new(),
+                        elapsed: run.elapsed(),
+                    };
+                    Self::record_lock_outcome(
+                        &shared,
+                        &wid_owned,
+                        &args.cinema_id,
+                        &cinema_name,
+                        &label_owned,
+                        &args,
+                        &early,
+                        false,
+                    )
+                    .await;
+                }
+                // 等本场 booker 彻底退出再排下一场（串行、不抢同一 profile）
+                let final_outcome = run.complete().await;
+                if decided.is_none() {
+                    Self::record_lock_outcome(
+                        &shared,
+                        &wid_owned,
+                        &args.cinema_id,
+                        &cinema_name,
+                        &label_owned,
+                        &args,
+                        &final_outcome,
+                        false,
+                    )
+                    .await;
+                }
+            }
+            // guard 随任务结束回落 in-flight 标志
+            drop(guard);
+        });
+    }
+
+    /// 手动锁票测试：TUI「锁票测试」按钮触发。走一次完整的 check 流拿到当前匹配场次，
+    /// 挑最早开场的一个影院，以「有头浏览器 + dry-run（不传 --confirm）」跑一遍 booker，
+    /// 结果沿 watch 既有通知通道发一条测试消息（验证通道 + 锁票链路通不通）。
+    ///
+    /// 与自动锁票的区别：不要求全局/本 watch 开关打开；强制 confirm=false（绝不真锁）、
+    /// headless=false（打开浏览器给用户过目）；**不改任何锁状态**（不记 ok、不耗重试额度）。
+    async fn run_lock_test(&self, wid: &str) {
+        let watch = {
+            let g = self.shared.cfg.lock().unwrap();
+            g.get("watches")
+                .and_then(|v| v.as_array())
+                .and_then(|a| {
+                    a.iter()
+                        .find(|w| w.get("id").and_then(|v| v.as_str()) == Some(wid))
+                })
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        if watch.is_null() {
+            return;
+        }
+        let label = watch
+            .get("movie_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or(wid)
+            .to_string();
+
+        // 完整 check 流（dates + 时段 + imax 过滤）拿当前匹配场次
+        let mut cinema_cache: HashMap<String, Value> = HashMap::new();
+        let status = check_watch(&watch, &mut cinema_cache).await;
+        let info = status.info();
+        // 挑「最早开场」的影院做测试（booker 单实例 + 有头慢，一次只跑一场）
+        let mut candidates: Vec<(String, &Vec<maoyan::ShowInfo>)> = info
+            .shows
+            .iter()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(cid, s)| (cid.clone(), s))
+            .collect();
+        candidates.sort_by(|a, b| {
+            let da = a.1.iter().map(|s| s.dt.as_str()).min();
+            let db = b.1.iter().map(|s| s.dt.as_str()).min();
+            da.cmp(&db)
+        });
+        let Some((cid, shows)) = candidates.first() else {
+            self.push_event(format!("🧪 {} 锁票测试：当前没有匹配场次，跳过", label))
+                .await;
+            return;
+        };
+        let Some(show_date) = shows.iter().map(|s| s.dt.clone()).min() else {
+            return;
+        };
+
+        // 测试强制有头 + dry-run（永不真锁），不看全局 lock_headless
+        let confirm = false;
+        let headless = false;
+        // 全局单实例：已有锁票在跑则跳过测试
+        if self
+            .lock_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            self.push_event(format!("· {} 锁票子进程忙，测试跳过", label))
+                .await;
+            return;
+        }
+        let guard = InflightGuard(Arc::clone(&self.lock_inflight));
+
+        let args = lock::LockArgs {
+            cinema_id: cid.clone(),
+            movie_id: watch.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0),
+            show_date,
+            // 锁票时间范围：显式 lock_time_range → 时段窗口 → 全天兜底
+            time_range: Some(
+                config::watch_lock_time_range(&watch).unwrap_or_else(|| "00:00-23:59".to_string()),
+            ),
+            num_seats: config::watch_lock_num_seats(&watch),
+            imax_only: config::watch_imax_only(&watch),
+            seats: config::watch_lock_seats(&watch),
+            confirm,
+            headless,
+        };
+        let cinema_name = info
+            .cinema_names
+            .get(cid)
+            .cloned()
+            .unwrap_or_else(|| cid.clone());
+        self.push_event(format!(
+            "🧪 {} {} 锁票测试启动（有头浏览器 dry-run，未真锁）",
+            label, cinema_name
+        ))
+        .await;
+
+        let shared = Arc::clone(&self.shared);
+        let stop = Arc::clone(&self.stop);
+        let wid_owned = wid.to_string();
+        let label_owned = label.clone();
+        tokio::spawn(async move {
+            let run = tokio::select! {
+                _ = stop.notified() => {
+                    push_event_shared(&shared, &format!("· {} 锁票测试被停止信号中断", label_owned));
+                    return;
+                }
+                r = lock::run_lock(&args) => match r {
+                    Ok(run) => run,
+                    Err(e) => {
+                        push_event_shared(
+                            &shared,
+                            &format!("✗ {} {} 锁票测试无法启动 booker: {}", label_owned, args.cinema_id, e),
+                        );
+                        drop(guard);
+                        return;
+                    }
+                },
+            };
+            // 终态一出现就通知（dry-run 走通/真锁成功/超时），不等浏览器 30s 收起
+            let decided = run.decided();
+            if let Some(res) = decided {
+                let early = lock::LockOutcome {
+                    result: res,
+                    stdout: run.stdout(),
+                    stderr: String::new(),
+                    elapsed: run.elapsed(),
+                };
+                Self::record_lock_outcome(
+                    &shared,
+                    &wid_owned,
+                    &args.cinema_id,
+                    &cinema_name,
+                    &label_owned,
+                    &args,
+                    &early,
+                    true,
+                )
+                .await;
+            }
+            // 等进程真正退出（浏览器保持收尾）→ 回收进程、回落 in-flight 标志
+            let final_outcome = run.complete().await;
+            if decided.is_none() {
+                // 未提前定案（多为失败）：用退出码/完整输出分类后再通知
+                Self::record_lock_outcome(
+                    &shared,
+                    &wid_owned,
+                    &args.cinema_id,
+                    &cinema_name,
+                    &label_owned,
+                    &args,
+                    &final_outcome,
+                    true,
+                )
+                .await;
+            }
+            // guard 随任务结束回落 in-flight 标志
+            drop(guard);
+        });
+    }
+
+    /// 锁票结果落账：更新 cfg 状态（ok/重试计数）并沿该 watch 既有通知通道发结果。
+    /// 在独立 tokio 任务里调用，只依赖 `SharedState`，不碰 `&Monitor`。
+    /// `test_mode=true`（手动测试）：不改任何锁状态，并**总是**发通知
+    /// （dry-run 命中也会推送，方便验证通知通道）。
+    #[allow(clippy::too_many_arguments)]
+    async fn record_lock_outcome(
+        shared: &Arc<SharedState>,
+        wid: &str,
+        cid: &str,
+        cinema_name: &str,
+        label: &str,
+        args: &lock::LockArgs,
+        outcome: &lock::LockOutcome,
+        test_mode: bool,
+    ) {
+        // 状态落账（测试模式不改任何锁状态：不记 ok、不耗重试额度）
+        if !test_mode {
+            match outcome.result {
+                lock::LockResult::Ok => {
+                    let mut g = shared.cfg.lock().unwrap();
+                    let _ = config::mark_lock_ok(&mut g, wid, cid);
+                }
+                lock::LockResult::DryRun => {
+                    // dry-run 只演示不真锁：不改任何锁状态，保证后续切 confirm=true 重试额度不减。
+                    push_event_shared(
+                        shared,
+                        &format!(
+                            "🔍 {} {} 锁票 dry-run（未真锁）：{}",
+                            label,
+                            cinema_name,
+                            outcome.summary()
+                        ),
+                    );
+                    return;
+                }
+                other => {
+                    if other.retryable() {
+                        let mut g = shared.cfg.lock().unwrap();
+                        let _ = config::incr_lock_tries(&mut g, wid, cid);
+                    }
+                }
+            }
+        } else {
+            push_event_shared(
+                shared,
+                &format!(
+                    "🧪 {} {} 锁票测试：{}",
+                    label,
+                    cinema_name,
+                    outcome.summary()
+                ),
+            );
+        }
+
+        // 读 watch 快照拿通知通道（结果通知只走既有 per-watch 通道 + 全局 discord）
+        let watch_snapshot = {
+            let g = shared.cfg.lock().unwrap();
+            g.get("watches")
+                .and_then(|v| v.as_array())
+                .and_then(|a| a.iter().find(|w| w.get("id").and_then(|v| v.as_str()) == Some(wid)))
+                .cloned()
+                .unwrap_or(Value::Null)
+        };
+        let (movie_name, wh, email, xhs, wechat, discord_wh) = {
+            let g = shared.cfg.lock().unwrap();
+            let discord_wh = g.get("discord_webhook").and_then(|v| v.as_str()).map(String::from);
+            match &watch_snapshot {
+                Value::Object(w) => (
+                    w.get("movie_name").and_then(|v| v.as_str()).unwrap_or(label).to_string(),
+                    w.get("notify_webhook").and_then(|v| v.as_str()).map(String::from),
+                    w.get("notify_email_to").and_then(|v| v.as_str()).map(String::from),
+                    w.get("xhs_group").and_then(|v| v.as_str()).map(String::from),
+                    w.get("wechat_notify").and_then(|v| v.as_bool()).unwrap_or(false),
+                    discord_wh,
+                ),
+                _ => (label.to_string(), None, None, None, false, discord_wh),
+            }
+        };
+
+        // 攒通知文本
+        let summary = outcome.summary();
+        let title: String;
+        let body: String;
+        match outcome.result {
+            // dry-run 也算「走通」：联调停在确认前、未真锁，不该标失败
+            lock::LockResult::Ok | lock::LockResult::DryRun => {
+                title = if test_mode {
+                    "🧪 锁票测试：脚本走通（dry-run 未真锁）".to_string()
+                } else {
+                    "🔒 自动锁票成功".to_string()
+                };
+                body = if test_mode {
+                    format!(
+                        "🎞 {}\n🏛 {}\n📅 {} 起｜🕒 用时 {:.1}s\n📋 {}\n\n仅联调，未真锁；不影响正式锁票",
+                        movie_name,
+                        cinema_name,
+                        args.show_date,
+                        outcome.elapsed.as_secs_f64(),
+                        summary
+                    )
+                } else {
+                    format!(
+                        "🎞 {}\n🏛 {}\n📅 {} 起｜🕒 用时 {:.1}s\n📋 {}\n\n⚠️ {} 分钟内到猫眼 App 完成支付",
+                        movie_name,
+                        cinema_name,
+                        args.show_date,
+                        outcome.elapsed.as_secs_f64(),
+                        summary,
+                        lock::PAY_WINDOW_MINUTES
+                    )
+                };
+            }
+            other => {
+                title = if test_mode {
+                    format!("🧪 锁票测试：失败（{}）", other.label())
+                } else {
+                    "⚠️ 自动锁票失败".to_string()
+                };
+                let ex = if test_mode {
+                    "手动测试，不影响正式锁票状态".to_string()
+                } else if config::cinema_lock_exhausted(&watch_snapshot, cid) {
+                    "已耗尽重试额度，不再自动尝试".to_string()
+                } else {
+                    "稍后自动重试".to_string()
+                };
+                body = format!(
+                    "🎞 {}\n🏛 {}\n📋 {}\n\n原因：{}\n🔁 {}",
+                    movie_name,
+                    cinema_name,
+                    summary,
+                    other.label(),
+                    ex
+                );
+            }
+        }
+
+        let buy_url = maoyan::buy_pc_url_owned(cid);
+        let _ = notify::notify_discord_async(discord_wh.as_deref(), &title, &body, Some(&buy_url))
+            .await;
+        let _ = notify::notify_results_webhook_async(wh.as_deref(), &title, &body, Some(&buy_url))
+            .await;
+        let _ = notify::notify_results_email(email.as_deref(), &title, &body, None);
+        if !xhs.as_deref().map(str::trim).unwrap_or("").is_empty() {
+            notify::notify_xhs(&xhs.unwrap(), &title, &body, Some(&buy_url));
+        }
+        if wechat {
+            notify::notify_wechat(&format!("{}\n\n{}", title, body));
+        }
+        notify::notify_macos(&title, &body, true, None, 60);
+
+        push_event_shared(shared, &format!("📌 {} {}: {}", label, cinema_name, title));
     }
 
     async fn send_heartbeat(&self) {
@@ -1556,6 +2152,44 @@ mod tests {
     fn parse_window_rejects_garbage() {
         assert!(parse_window("25:00-10:00").is_err());
         assert!(parse_window("abc").is_err());
+    }
+
+    /// imax_only 时：非 IMAX 场次从 shows 与 show_count 里剔干净，状态码同步
+    #[tokio::test]
+    async fn check_watch_imax_only_filters_out_non_imax() {
+        let payload = json!({
+            "cinema_id": "37534",
+            "cinema_name": "测试影院",
+            "movies": [{
+                "id": 1545360,
+                "nm": "Test Movie",
+                "showCount": 3,
+                "shows": [{ "showDate": "2026-08-08", "plist": [
+                    { "seqNo": "i1", "dt": "2026-08-08", "tm": "15:40", "th": "IMAX 激光厅", "tp": "IMAX2D" },
+                    { "seqNo": "n1", "dt": "2026-08-08", "tm": "16:00", "th": "5号厅", "tp": "2D" },
+                    { "seqNo": "i2", "dt": "2026-08-08", "tm": "18:30", "th": "IMAX 激光厅", "tp": "IMAX2D" },
+                ]}]
+            }]
+        });
+        let mut cache: HashMap<String, Value> =
+            HashMap::from([("37534".to_string(), payload)]);
+
+        // 全开：3 场都在
+        let w_all = watch_with("37534", 1545360, None);
+        let st = check_watch(&w_all, &mut cache).await;
+        assert_eq!(st.info().shows["37534"].len(), 3);
+
+        // imax_only：只剩 2 场 IMAX，show_count 同步为 2，S_OPEN 仍触发
+        let mut w = w_all.clone();
+        w["imax_only"] = json!(true);
+        let st = check_watch(&w, &mut cache).await;
+        assert_eq!(st.code(), S_OPEN);
+        let got: BTreeSet<String> = st.info().shows["37534"]
+            .iter()
+            .map(|s| s.seq_no.clone())
+            .collect();
+        assert_eq!(got, ["i1", "i2"].iter().map(|s| s.to_string()).collect());
+        assert_eq!(st.info().matches[0].show_count, 2, "imax_only 时 show_count 重算");
     }
 
     /// 不设 time_window 时，三场全在
