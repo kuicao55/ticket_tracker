@@ -39,7 +39,7 @@ pub enum WatchAction {
         /// 本 watch 启用自动锁票（无全局总闸，只由本 watch 开关控制）
         #[arg(long = "auto-lock")]
         auto_lock: bool,
-        /// 只锁 IMAX 厅
+        /// 只监控 IMAX 厅（监测与锁票共用一个开关：过滤监控场次，锁票候选随之）
         #[arg(long = "imax-only")]
         imax_only: bool,
         /// 锁票票数（booker --num-seats；1-6）
@@ -51,9 +51,6 @@ pub enum WatchAction {
         /// 手动指定座位（booker --seat，可多次，如 "5排6座"）；设置后覆盖智能选座
         #[arg(long = "lock-seat")]
         lock_seats: Vec<String>,
-        /// 锁票时间范围（HH:MM-HH:MM）；缺省用 --time-window
-        #[arg(long = "lock-time-range")]
-        lock_time_range: Option<String>,
     },
     Show { id: String },
     Edit {
@@ -87,7 +84,7 @@ pub enum WatchAction {
         /// 自动锁票开关：`--auto-lock` 启用 / `--auto-lock false` 关闭 / 不传则不改
         #[arg(long = "auto-lock", default_missing_value = "true", num_args = 0..=1)]
         auto_lock: Option<bool>,
-        /// 只锁 IMAX 厅（同上布尔语义）
+        /// 只监控 IMAX 厅（监测与锁票共用一个开关）
         #[arg(long = "imax-only", default_missing_value = "true", num_args = 0..=1)]
         imax_only: Option<bool>,
         /// 锁票票数
@@ -99,9 +96,6 @@ pub enum WatchAction {
         /// 手动指定座位（可多次，覆盖智能选座）；传 `--lock-seat ""` 清空
         #[arg(long = "lock-seat", allow_hyphen_values = true)]
         lock_seats: Vec<String>,
-        /// 锁票时间范围；传空字符串 `""` 回退用 time-window；不传则不改
-        #[arg(long = "lock-time-range", allow_hyphen_values = true)]
-        lock_time_range: Option<String>,
     },
     Remove { id: String },
     Enable { id: String },
@@ -128,7 +122,6 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             lock_num_seats,
             lock_max_retries,
             lock_seats,
-            lock_time_range,
         } => add(
             movie_id,
             &cinema,
@@ -146,7 +139,6 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             lock_num_seats,
             lock_max_retries,
             &lock_seats,
-            lock_time_range.as_deref(),
         ),
         WatchAction::Show { id } => show(&id),
         WatchAction::Edit {
@@ -166,7 +158,6 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             lock_num_seats,
             lock_max_retries,
             lock_seats,
-            lock_time_range,
         } => edit(
             &id,
             &cinema,
@@ -184,7 +175,6 @@ pub fn dispatch(a: WatchAction) -> Result<()> {
             lock_num_seats,
             lock_max_retries,
             &lock_seats,
-            lock_time_range.as_deref(),
         ),
         WatchAction::Remove { id } => remove(&id),
         WatchAction::Enable { id } => set_enabled(&id, true),
@@ -227,7 +217,6 @@ fn add(
     lock_num_seats: u64,
     lock_max_retries: u64,
     lock_seats: &[String],
-    lock_time_range: Option<&str>,
 ) -> Result<()> {
     if mode != config::MODE_PRESALE && mode != config::MODE_INCREMENTAL {
         return Err(anyhow!(
@@ -257,13 +246,6 @@ fn add(
         lock_max_retries,
         lock_seats,
     )?;
-    // lock_time_range 不经 add_watch 默认参传递，单独写入（区分 null 与不传）
-    if let Some(r) = lock_time_range {
-        if let Some(w) = config::find_watch_mut(&mut cfg, &id) {
-            w["lock_time_range"] = serde_json::json!(r);
-        }
-        config::save(&cfg)?;
-    }
     println!("✓ 已添加 watch: {}", id);
     Ok(())
 }
@@ -292,7 +274,6 @@ fn edit(
     lock_num_seats: Option<u64>,
     lock_max_retries: Option<u64>,
     lock_seats: &[String],
-    lock_time_range: Option<&str>,
 ) -> Result<()> {
     if let Some(m) = mode {
         if m != config::MODE_PRESALE && m != config::MODE_INCREMENTAL {
@@ -392,16 +373,6 @@ fn edit(
             lock_seats.to_vec()
         };
         updates.insert("lock_seats".into(), serde_json::json!(v));
-    }
-    // lock_time_range: 区分「没传」/「传空」/「传具体值」
-    if let Some(v) = lock_time_range {
-        if v.is_empty() {
-            updates.insert("lock_time_range".into(), serde_json::Value::Null);
-        } else {
-            config::parse_window(v)
-                .map_err(|e| anyhow!("--lock-time-range 格式错误: {}", e))?;
-            updates.insert("lock_time_range".into(), serde_json::json!(v));
-        }
     }
     // 影院/日期/时段/模式一变，旧的 seqNo 基线就对不上了 —— 清空让下一轮重新静默建线，
     // 否则新窗口里已有的场次会被当成"新增"一次性全报出来。

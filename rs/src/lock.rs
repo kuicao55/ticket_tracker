@@ -100,7 +100,7 @@ pub struct LockArgs {
     pub time_range: Option<String>,
     /// 智能选座票数 `--num-seats`（`seats` 为空时生效）。
     pub num_seats: u64,
-    /// 只锁 IMAX 厅 `--imax-only`。
+    /// 只锁 IMAX 厅 `--imax-only`（来自 watch 的「只看IMAX」，与监测过滤一致）。
     pub imax_only: bool,
     /// 手动指定座位 `--seat "X排Y座"`（可多条）；非空时覆盖智能选座。
     pub seats: Vec<String>,

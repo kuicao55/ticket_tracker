@@ -378,7 +378,9 @@ pub fn draw_detail(app: &mut App, f: &mut Frame, area: Rect) {
         let num = crate::config::watch_lock_num_seats(&w);
         let max = crate::config::watch_lock_max_retries(&w);
         let seats = crate::config::watch_lock_seats(&w);
-        let range = crate::config::watch_lock_time_range(&w);
+        // 锁票范围跟随监控时段窗口（time_window），无需单独 lock_time_range
+        let range = crate::config::watch_time_window(&w)
+            .map(|(h1, m1, h2, m2)| format!("{:02}:{:02}-{:02}:{:02}", h1, m1, h2, m2));
         let cids: Vec<String> = w
             .get("cinemas")
             .and_then(|v| v.as_array())

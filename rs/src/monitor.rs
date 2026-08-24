@@ -977,8 +977,9 @@ pub fn test_lock_wid(&self, wid: String) {
                         let _ = config::mark_presale_fired(&mut g, &wid, cid);
                     }
                 }
-                // 自动锁票（预设开售即触发；与通知通道互不干扰）
-                self.maybe_trigger_autolock(i, &wid, &label, info).await;
+                // 自动锁票（预设开售即触发；与通知通道互不干扰）。预设模式无基线概念，
+                // 首次见到场次=开售，就是要锁，因此不跳过任何影院。
+                self.maybe_trigger_autolock(i, &wid, &label, info, &Default::default()).await;
                 // 自动停用
                 let all_cinemas: std::collections::HashSet<String> = {
                     let g = self.shared.cfg.lock().unwrap();
@@ -1128,6 +1129,10 @@ pub fn test_lock_wid(&self, wid: String) {
         let no_shows: Vec<maoyan::ShowInfo> = Vec::new();
         let mut any_event = false;
         let mut total_seqs: usize = 0;
+        // 本轮「从未建过基线」的影院。这些影院本轮的场次只是用来建立基线，
+        // 绝不能触发自动锁票（否则基线清零/重启/编辑删除 seen_shows 后，
+        // 第一轮就会把所有已知场次当新场次跑去真锁下单）。
+        let mut first_sight: std::collections::HashSet<String> = Default::default();
         // all_cinemas 只包含本轮成功抓到的影院；抓取失败的在 info.errors 里，跳过它们
         // 才不会把"没抓到"误当成"场次消失"而污染基线。
         for m in &info.all_cinemas {
@@ -1160,6 +1165,7 @@ pub fn test_lock_wid(&self, wid: String) {
                 ))
                 .await;
                 any_event = true;
+                first_sight.insert(cid.clone());
                 continue;
             };
 
@@ -1291,8 +1297,9 @@ pub fn test_lock_wid(&self, wid: String) {
             ))
             .await;
         }
-        // 增场监控 + 自动锁票：只要影院有场次就想尽办法锁（与"新增才通知"解耦）
-        self.maybe_trigger_autolock(idx, wid, label, info).await;
+        // 增场监控 + 自动锁票：只要影院有场次就想尽办法锁（与"新增才通知"解耦）。
+        // 首轮建基线的影院本轮不锁（防误锁下单）。
+        self.maybe_trigger_autolock(idx, wid, label, info, &first_sight).await;
     }
 
     // ----------------- 自动锁票：触发与结果落账 -----------------
@@ -1301,14 +1308,16 @@ pub fn test_lock_wid(&self, wid: String) {
     /// 子任务按「最早场次日期」顺序串行执行（booker 单实例，同一时刻只有一个锁票进程）。
     ///
     /// 开关：只看 per-watch `auto_lock`（无全局总闸，每个 watch 独立决定）。
-    /// 已经 `lock_ok` 或重试耗尽的影院直接跳过；子进程忙（in-flight）时本轮整体跳过，
-    /// 且**不**消耗重试额度。
+    /// 已经 `lock_ok` 或重试耗尽的影院直接跳过；本轮刚建基线的影院（`first_sight`）
+    /// 跳过 —— 增场模式首轮只建基线绝不锁票，防止基线清零/重启后第一轮误锁下单；
+    /// 子进程忙（in-flight）时本轮整体跳过，且**不**消耗重试额度。
     async fn maybe_trigger_autolock(
         &self,
         idx: usize,
         wid: &str,
         label: &str,
         info: &WatchInfo,
+        first_sight: &std::collections::HashSet<String>,
     ) {
         let watch = {
             let g = self.shared.cfg.lock().unwrap();
@@ -1346,17 +1355,24 @@ pub fn test_lock_wid(&self, wid: String) {
         let num_seats = config::watch_lock_num_seats(&watch);
         let imax_only = config::watch_imax_only(&watch);
         let seats = config::watch_lock_seats(&watch);
-        // 锁票时间范围：显式 lock_time_range → 时段窗口 → 全天兜底
-        let lock_range = config::watch_lock_time_range(&watch)
-            .unwrap_or_else(|| "00:00-23:59".to_string());
+        // 锁票时间范围：直接用监控时段窗口（time_window）—— 监测到什么时段，
+        // 那个时段里所有满足条件的场次就是我想锁的场次，无需单独设定。
+        let lock_range = config::watch_time_window(&watch)
+            .map(|(h1, m1, h2, m2)| format!("{:02}:{:02}-{:02}:{:02}", h1, m1, h2, m2));
 
         // 待锁影院：本轮有场次、未锁成功、未耗尽重试
         let mut pending: Vec<(lock::LockArgs, String)> = Vec::new();
+        let mut first_sight_skipped = 0;
         for (cid, shows) in &info.shows {
             if shows.is_empty() {
                 continue;
             }
             if config::cinema_lock_ok(&watch, cid) || config::cinema_lock_exhausted(&watch, cid) {
+                continue;
+            }
+            // 本轮刚建基线的影院不锁（见 handle_incremental 的 first_sight 收集）
+            if first_sight.contains(cid) {
+                first_sight_skipped += 1;
                 continue;
             }
             // 场次已经过 dates + 时段 + imax 过滤，min dt 一定存在在窗口内的场次。
@@ -1373,7 +1389,7 @@ pub fn test_lock_wid(&self, wid: String) {
                     cinema_id: cid.clone(),
                     movie_id,
                     show_date,
-                    time_range: Some(lock_range.clone()),
+                    time_range: lock_range.clone(),
                     num_seats,
                     imax_only,
                     seats: seats.clone(),
@@ -1382,6 +1398,13 @@ pub fn test_lock_wid(&self, wid: String) {
                 },
                 cinema_name,
             ));
+        }
+        if first_sight_skipped > 0 {
+            self.push_event(format!(
+                "· {} {} 个影院首轮建基线，本轮跳过锁票（防误锁）",
+                label, first_sight_skipped
+            ))
+            .await;
         }
         if pending.is_empty() {
             drop(guard);
@@ -1533,10 +1556,9 @@ pub fn test_lock_wid(&self, wid: String) {
             cinema_id: cid.clone(),
             movie_id: watch.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0),
             show_date,
-            // 锁票时间范围：显式 lock_time_range → 时段窗口 → 全天兜底
-            time_range: Some(
-                config::watch_lock_time_range(&watch).unwrap_or_else(|| "00:00-23:59".to_string()),
-            ),
+            // 锁票时间范围：直接用监控时段窗口（time_window）
+            time_range: config::watch_time_window(&watch)
+                .map(|(h1, m1, h2, m2)| format!("{:02}:{:02}-{:02}:{:02}", h1, m1, h2, m2)),
             num_seats: config::watch_lock_num_seats(&watch),
             imax_only: config::watch_imax_only(&watch),
             seats: config::watch_lock_seats(&watch),

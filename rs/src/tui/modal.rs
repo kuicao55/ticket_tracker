@@ -65,7 +65,7 @@ pub enum FieldKind {
     CinemaList, // Enter → 打开 CinemaPicker
     Mode,         // Enter / ←→ 在「开票提醒」「增场监控」之间切换
     WechatNotify, // Enter 在「开」「关」之间切换
-    Toggle,       // 自动锁票 / 只锁 IMAX：Enter 在「开」「关」之间切换
+    Toggle,       // 自动锁票 / 只看IMAX：Enter 在「开」「关」之间切换
     TestNotify,   // 仅 edit_watch：Enter → 给 webhook/邮箱各发一条测试消息
     Submit,
     Cancel,
@@ -171,7 +171,7 @@ impl FormModal {
                 "关".into(),
             ),
             FormField::with_value("自动锁票", FieldKind::Toggle, false, "关".into()),
-            FormField::with_value("只锁 IMAX 厅", FieldKind::Toggle, false, "关".into()),
+            FormField::with_value("只看IMAX", FieldKind::Toggle, false, "关".into()),
             FormField::with_value(
                 "锁票票数",
                 FieldKind::OptionalInteger,
@@ -185,7 +185,6 @@ impl FormModal {
                 config::DEFAULT_LOCK_MAX_RETRIES.to_string(),
             ),
             FormField::with_value("锁票座位", FieldKind::Text, false, String::new()),
-            FormField::with_value("锁票时段", FieldKind::TimeWindow, false, String::new()),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
         ];
@@ -286,7 +285,7 @@ impl FormModal {
                 bool_on(w.get("auto_lock")),
             ),
             FormField::with_value(
-                "只锁 IMAX 厅",
+                "只看IMAX",
                 FieldKind::Toggle,
                 false,
                 bool_on(w.get("imax_only")),
@@ -304,12 +303,6 @@ impl FormModal {
                 opt_u64(w.get("lock_max_retries"), config::DEFAULT_LOCK_MAX_RETRIES),
             ),
             FormField::with_value("锁票座位", FieldKind::Text, false, join_arr("lock_seats")),
-            FormField::with_value(
-                "锁票时段",
-                FieldKind::TimeWindow,
-                false,
-                opt_str("lock_time_range"),
-            ),
             FormField::button("测试通知", FieldKind::TestNotify),
             FormField::button("确定", FieldKind::Submit),
             FormField::button("取消", FieldKind::Cancel),
@@ -430,7 +423,11 @@ fn field_example(field: &FormField) -> Option<&'static str> {
         TimeWindow => Some("例如 19:00-22:00（留空=不限）"),
         Mode => Some("Enter / ←→ 在「开票提醒」「增场监控」间切换"),
         WechatNotify => Some("Enter 在「开」「关」间切换（开启则发到当前微信会话）"),
-        Toggle => Some("Enter 在「开」「关」间切换（须先满足其前置开关才会生效）"),
+        Toggle => match field.label.as_str() {
+            // IMAX 是纯监测过滤开关：不需要先开自动锁票，且会同时约束锁票候选
+            "只看IMAX" => Some("开启后只监测（并锁票）IMAX 厅，无需先开自动锁票"),
+            _ => Some("Enter 在「开」「关」间切换"),
+        },
         Text => match field.label.as_str() {
             "电影名" => Some("选填，留空自动从猫眼拉"),
             "通知邮箱" => Some("例如 your@email.com（需本机 msmtp，留空=关）"),
@@ -824,10 +821,6 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
     let lock_max_retries = parse_opt_u64(&f.fields[14].value, "重试上限")?
         .unwrap_or(config::DEFAULT_LOCK_MAX_RETRIES);
     let lock_seats: Vec<String> = f.fields[15].value.split_whitespace().map(String::from).collect();
-    let lock_time_range = {
-        let t = f.fields[16].value.trim();
-        if t.is_empty() { None } else { Some(t.to_string()) }
-    };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     let cref: Vec<&str> = cinemas.iter().map(String::as_str).collect();
     let id = config::add_watch(
@@ -850,13 +843,6 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
         &lock_seats,
     )
     .map_err(|e| e.to_string())?;
-    // lock_time_range 不经 add_watch 传参，单独写入（区分 null 与不传）
-    if let Some(r) = lock_time_range {
-        if let Some(w) = config::find_watch_mut(&mut cfg, &id) {
-            w["lock_time_range"] = serde_json::json!(r);
-        }
-        config::save(&cfg).map_err(|e| e.to_string())?;
-    }
     Ok(format!("已添加 watch {}", id))
 }
 
@@ -889,10 +875,6 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
     let lock_max_retries = parse_opt_u64(&f.fields[12].value, "重试上限")?
         .unwrap_or(config::DEFAULT_LOCK_MAX_RETRIES);
     let lock_seats: Vec<String> = f.fields[13].value.split_whitespace().map(String::from).collect();
-    let lock_time_range = {
-        let t = f.fields[14].value.trim();
-        if t.is_empty() { None } else { Some(t.to_string()) }
-    };
     let mut cfg = app.monitor.shared.cfg.lock().unwrap();
     // 注册尚未收藏的影院
     for cid in &cinemas {
@@ -900,6 +882,44 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
             config::add_cinema(&mut cfg, cid, None).map_err(|e| e.to_string())?;
         }
     }
+    // 缓存改动前的基线相关字段，据此决定是否重建 seqNo 基线
+    let old_watch = config::find_watch(&cfg, wid).cloned();
+    let old_cinemas: Vec<String> = old_watch
+        .as_ref()
+        .and_then(|w| w.get("cinemas"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let old_dates: Vec<String> = old_watch
+        .as_ref()
+        .and_then(|w| w.get("dates"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    let old_dates_unset = old_watch
+        .as_ref()
+        .map_or(true, |w| w.get("dates").map_or(true, |v| v.is_null()));
+    let old_tw = old_watch
+        .as_ref()
+        .and_then(|w| w.get("time_window"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let old_mode = old_watch
+        .as_ref()
+        .and_then(|w| w.get("mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or(config::MODE_PRESALE)
+        .to_string();
+    // 只有 cinemas/dates/time_window/mode 变化才重建基线；只改锁票/通知/启停则保留基线。
+    // 否则 TUI 每保存一次基线就清零，下一轮把已知场次当"新增"直接触发自动锁票真锁下单。
+    let fresh_dates: Vec<String> = dates.clone().unwrap_or_default();
+    let baseline_keys_changed = old_cinemas != cinemas
+        || fresh_dates != old_dates
+        || dates.is_some() != !old_dates_unset
+        || old_tw != time_window.as_deref().unwrap_or("").trim()
+        || old_mode != mode;
+
     let w =
         config::find_watch_mut(&mut cfg, wid).ok_or_else(|| format!("watch 不存在: {}", wid))?;
     w["cinemas"] = serde_json::json!(cinemas);
@@ -961,21 +981,7 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
     w["lock_num_seats"] = serde_json::json!(lock_num_seats);
     w["lock_max_retries"] = serde_json::json!(lock_max_retries);
     w["lock_seats"] = serde_json::json!(lock_seats);
-    match &lock_time_range {
-        Some(s) => {
-            config::parse_window(s).map_err(|e| format!("锁票时段格式错误: {}", e))?;
-            w["lock_time_range"] = serde_json::Value::String(s.clone());
-        }
-        None => {
-            if let Some(o) = w.as_object_mut() {
-                o.remove("lock_time_range");
-            }
-        }
-    }
-    // 影院/日期/时段/模式变化 → 清 seen_shows（与 cli 行为对齐）
-    let _ = w; // suppress unused warning if not used below
-    let any_baseline_change = true; // 简化：保存路径上无 seen_shows diff，记住清一次
-    if any_baseline_change {
+    if baseline_keys_changed {
         if let Some(o) = w.as_object_mut() {
             o.remove("seen_shows");
         }
@@ -1030,9 +1036,9 @@ fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {
 /// 表单字段索引（按 `edit_watch` 现在的布局）：
 ///   0 cinemas | 1 dates | 2 time_window | 3 mode | 4 interval
 ///   5 notify_webhook | 6 notify_email_to | 7 通知 xhs 群名 | 8 通知微信大群
-///   9 自动锁票 | 10 只锁IMAX | 11 锁票票数 | 12 重试上限
-///   13 锁票座位 | 14 锁票时段
-///   15 测试通知 | 16 确定 | 17 取消
+///   9 自动锁票 | 10 只看IMAX | 11 锁票票数 | 12 重试上限
+///   13 锁票座位
+///   14 测试通知 | 15 确定 | 16 取消
 fn trigger_test_notify(f: &FormModal) -> String {
     // 索引 5/6/7/8 才是真的 webhook / email / xhs 群名 / 微信开关
     let webhook = f.fields.get(5).map(|x| x.value.trim().to_string()).unwrap_or_default();

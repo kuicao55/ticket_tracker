@@ -12,6 +12,11 @@
 
 ## 当前版本
 
+**v1.5.2** —— 自动锁票语义简化 + 防误锁（在 v1.5.1 基础上）：
+- **锁定时段跟随监控时段**：删掉独立的锁票时段输入，`--time-window` 内所有满足条件的场次就是要锁的场次。
+- **IMAX 单一开关**：`--imax-only` 同时作用于监测过滤与锁票候选（TUI 表单改标「只看IMAX」，可单独开，不需要同时开自动锁票）。
+- **增场首轮不锁票**：影院本轮刚建立/重建基线时跳过锁票（事件栏有提示），修复重启/编辑保存清基线后第一轮误锁下单的雷；TUI 编辑 watch 不再无条件清基线，只有影院/日期/时段/模式真正变化才重建。
+
 **v1.5.1** —— 锁票联调体验修复（在 v1.5.0 自动锁票基础上）：
 - **选好座立即通知**：booker stdout 流式读取，`[seat] 选中:`/`[seat] 手动选中:` 一出现就发结果通知，
   不再等浏览器关闭；dry-run 走通正确显示「🧪 锁票测试：脚本走通」而非「失败」。
@@ -81,7 +86,7 @@ cargo build --release
 ## 验证安装
 
 ```bash
-tt --version      # → tt 1.5.1
+tt --version      # → tt 1.5.2
 tt doctor         # 自检：配置、网络、猫眼 API
 tt init           # 首次运行：创建 ~/.config/ticket-tracker/config.json
 ```
@@ -253,7 +258,7 @@ tt cinema add-preset 海淀       # 从内置影院预设加入收藏夹
 - **开票提醒（presale）**：某影院首报开售时；
 - **增场监控（incremental）**：每轮发现新增场次时。
 - 命中场次会同时注入 booker 的 `--show-date`（最早场次日期）与
-  `--show-time-range`（优先 watch 的 `--lock-time-range`，其次 `--time-window`）。
+  `--show-time-range`（即监测的时段窗口 `--time-window`）。
 
 通知与锁票**互不干扰**：通知走 watch 既有的通道（Discord / 邮箱 / 小红书 / 微信 / macOS），
 锁票独立触发；同一影院锁成功后本 watch 不会再重复锁。
@@ -263,11 +268,11 @@ tt cinema add-preset 海淀       # 从内置影院预设加入收藏夹
 ```bash
 # watch 级：给某个 watch 开自动锁票 → 命中就真锁（15 分钟内去 App 付款），不开就不锁
 tt watch add 1234 -c 37534 --auto-lock \
-    --imax-only \
+    --time-window "19:00-22:00" \              # 监控时段即锁票时段，无需单独设定
+    --imax-only \                              # 监测与锁票共用一个 IMAX 开关
     --lock-num-seats 2 \
     --lock-max-retries 3 \
-    --lock-seat "5排6座" --lock-seat "6排7座" \   # 可多次；不传=智能选座
-    --lock-time-range "19:00-22:00"            # 缺省回退用 --time-window
+    --lock-seat "5排6座" --lock-seat "6排7座"   # 可多次；不传=智能选座
 tt watch edit <wid> --auto-lock true --lock-num-seats 2
 ```
 
@@ -280,6 +285,13 @@ tt watch edit <wid> --auto-lock true --lock-num-seats 2
 - **开了就真锁**：watch 级 `auto_lock` 打开后，命中场次会传 `--confirm` 真锁
   （booker 点到确认、票锁到账号，15 分钟内去 App 付款）；不想要锁票的 watch 直接不开启。
   状态（`lock_ok_cinemas[]` / `lock_tries{}`）只在真锁成功或重试耗尽时落盘。
+- **锁票范围跟随监控时段**：不再有单独的锁票时段输入。监测时段（`--time-window`）内
+  所有满足条件的场次就是你要锁的场次，锁票自动取同一窗口传给 booker。
+- **IMAX 单一开关**：`--imax-only` 同时作用于**监测过滤与锁票候选** —— 开了 IMAX，
+  非 IMAX 场次既不会报也不会锁；关了则 IMAX 与非 IMAX 一起监控、一起锁。
+- **增场首轮不锁票**：增场监控的影院本轮刚建立/重建基线时，该轮**只建基线不锁票**
+  （事件栏提示「首轮建基线，本轮跳过锁票」）。防止基线清零/重启/编辑保存后，
+  下一轮把所有已知场次当"新增"直接跑去真锁下单。
 - **重试**：单影院默认最多 `--lock-max-retries 3` 次；`场次没了/流程异常/超时/未知` 各消耗一次。
   同轮并发锁票串行执行（booker 全局一把 inflight 锁），忙时不占重试额度。
 - **停用**：锁票 watch 在「全部影院锁成 或 重试耗尽」后才自动停用；否则保持 enabled 继续盯。

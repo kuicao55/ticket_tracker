@@ -330,8 +330,6 @@ fn settle_lock_defaults(w: &mut Value) {
         .is_none()
         .then(|| w["lock_max_retries"] = json!(DEFAULT_LOCK_MAX_RETRIES));
     let _ = w.get("lock_seats").is_none().then(|| w["lock_seats"] = json!([]));
-    // 锁票时间范围：null 时回退用 watch 的时段窗口（time_window）做 --show-time-range
-    let _ = w.get("lock_time_range").is_none().then(|| w["lock_time_range"] = Value::Null);
     // 锁票运行状态（不进入 add_watch 的初始 JSON，由 mark/incr 写入）
     let _ = w.get("lock_ok_cinemas").is_none().then(|| w["lock_ok_cinemas"] = json!([]));
     let _ = w.get("lock_tries").is_none().then(|| w["lock_tries"] = json!({}));
@@ -509,7 +507,6 @@ pub fn add_watch(
         "lock_num_seats": lock_num_seats,
         "lock_max_retries": lock_max_retries,
         "lock_seats": lock_seats.to_vec(),
-        "lock_time_range": Value::Null,
         "enabled": true,
         "presale_fired": false,
         "created_at": chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
@@ -629,7 +626,7 @@ pub fn watch_auto_lock(watch: &Value) -> bool {
     watch.get("auto_lock").and_then(|v| v.as_bool()).unwrap_or(false)
 }
 
-/// 只锁 IMAX 厅。
+/// 只看 IMAX 厅（纯监测过滤；同时约束锁票候选，无需先开 auto_lock）。
 pub fn watch_imax_only(watch: &Value) -> bool {
     watch.get("imax_only").and_then(|v| v.as_bool()).unwrap_or(false)
 }
@@ -661,20 +658,6 @@ pub fn watch_lock_seats(watch: &Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// 给 booker 的 `--show-time-range` 时间范围。优先 `lock_time_range`，缺省回退 `time_window`
-/// （时段窗口即范围对应的隐含语义）。
-pub fn watch_lock_time_range(watch: &Value) -> Option<String> {
-    let pick = |k: &str| {
-        watch
-            .get(k)
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(String::from)
-    };
-    pick("lock_time_range").or_else(|| pick("time_window"))
 }
 
 // ----------------- 自动锁票：状态（运行期写入） -----------------
@@ -918,16 +901,6 @@ mod tests {
         assert_eq!(watch_lock_max_retries(&json!({})), DEFAULT_LOCK_MAX_RETRIES);
         assert_eq!(watch_lock_seats(&json!({})), Vec::<String>::new());
         assert_eq!(watch_lock_seats(&json!({ "lock_seats": ["5排6座", "5排7座"] })), vec!["5排6座", "5排7座"]);
-    }
-
-    #[test]
-    fn lock_time_range_falls_back_to_time_window() {
-        assert_eq!(watch_lock_time_range(&watch_with_tw("19:00-22:00")), Some("19:00-22:00".into()));
-        // 显式 lock_time_range 优先
-        let w = json!({ "time_window": "19:00-22:00", "lock_time_range": "20:00-21:00" });
-        assert_eq!(watch_lock_time_range(&w), Some("20:00-21:00".into()));
-        assert_eq!(watch_lock_time_range(&json!({})), None);
-        assert_eq!(watch_lock_time_range(&json!({ "time_window": "" })), None);
     }
 
     #[test]
