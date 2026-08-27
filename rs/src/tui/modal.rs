@@ -846,7 +846,7 @@ fn submit_add_watch(app: &App, f: &FormModal) -> Result<String, String> {
     Ok(format!("已添加 watch {}", id))
 }
 
-fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, String> {
+fn submit_edit_watch(app: &mut App, wid: &str, f: &FormModal) -> Result<String, String> {
     let cinemas = split_ids(&f.fields[0].value);
     let dates = parse_dates(&f.fields[1].value)?;
     let time_window = {
@@ -875,119 +875,149 @@ fn submit_edit_watch(app: &App, wid: &str, f: &FormModal) -> Result<String, Stri
     let lock_max_retries = parse_opt_u64(&f.fields[12].value, "重试上限")?
         .unwrap_or(config::DEFAULT_LOCK_MAX_RETRIES);
     let lock_seats: Vec<String> = f.fields[13].value.split_whitespace().map(String::from).collect();
-    let mut cfg = app.monitor.shared.cfg.lock().unwrap();
-    // 注册尚未收藏的影院
-    for cid in &cinemas {
-        if config::find_cinema(&cfg, cid).is_none() {
-            config::add_cinema(&mut cfg, cid, None).map_err(|e| e.to_string())?;
+    // 所有 cfg 修改都封装在此块中：块结束 cfg 锁 guard 自动 drop，下面才能调用
+    // config::save（共享借用 cfg）和 cmd::push_event（独占借用 app）。
+    let (cfg_snapshot, released) = {
+        let mut cfg = app.monitor.shared.cfg.lock().unwrap();
+        // 注册尚未收藏的影院
+        for cid in &cinemas {
+            if config::find_cinema(&cfg, cid).is_none() {
+                config::add_cinema(&mut cfg, cid, None).map_err(|e| e.to_string())?;
+            }
         }
-    }
-    // 缓存改动前的基线相关字段，据此决定是否重建 seqNo 基线
-    let old_watch = config::find_watch(&cfg, wid).cloned();
-    let old_cinemas: Vec<String> = old_watch
-        .as_ref()
-        .and_then(|w| w.get("cinemas"))
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    let old_dates: Vec<String> = old_watch
-        .as_ref()
-        .and_then(|w| w.get("dates"))
-        .and_then(|v| v.as_array())
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    let old_dates_unset = old_watch
-        .as_ref()
-        .map_or(true, |w| w.get("dates").map_or(true, |v| v.is_null()));
-    let old_tw = old_watch
-        .as_ref()
-        .and_then(|w| w.get("time_window"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let old_mode = old_watch
-        .as_ref()
-        .and_then(|w| w.get("mode"))
-        .and_then(|v| v.as_str())
-        .unwrap_or(config::MODE_PRESALE)
-        .to_string();
-    // 只有 cinemas/dates/time_window/mode 变化才重建基线；只改锁票/通知/启停则保留基线。
-    // 否则 TUI 每保存一次基线就清零，下一轮把已知场次当"新增"直接触发自动锁票真锁下单。
-    let fresh_dates: Vec<String> = dates.clone().unwrap_or_default();
-    let baseline_keys_changed = old_cinemas != cinemas
-        || fresh_dates != old_dates
-        || dates.is_some() != !old_dates_unset
-        || old_tw != time_window.as_deref().unwrap_or("").trim()
-        || old_mode != mode;
+        // 缓存改动前的基线相关字段，据此决定是否重建 seqNo 基线
+        let old_watch = config::find_watch(&cfg, wid).cloned();
+        let old_cinemas: Vec<String> = old_watch
+            .as_ref()
+            .and_then(|w| w.get("cinemas"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let old_dates: Vec<String> = old_watch
+            .as_ref()
+            .and_then(|w| w.get("dates"))
+            .and_then(|v| v.as_array())
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let old_dates_unset = old_watch
+            .as_ref()
+            .map_or(true, |w| w.get("dates").map_or(true, |v| v.is_null()));
+        let old_tw = old_watch
+            .as_ref()
+            .and_then(|w| w.get("time_window"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let old_mode = old_watch
+            .as_ref()
+            .and_then(|w| w.get("mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or(config::MODE_PRESALE)
+            .to_string();
+        // 只有 cinemas/dates/time_window/mode 变化才重建基线；只改锁票/通知/启停则保留基线。
+        // 否则 TUI 每保存一次基线就清零，下一轮把已知场次当"新增"直接触发自动锁票真锁下单。
+        let fresh_dates: Vec<String> = dates.clone().unwrap_or_default();
+        let baseline_keys_changed = old_cinemas != cinemas
+            || fresh_dates != old_dates
+            || dates.is_some() != !old_dates_unset
+            || old_tw != time_window.as_deref().unwrap_or("").trim()
+            || old_mode != mode;
 
-    let w =
-        config::find_watch_mut(&mut cfg, wid).ok_or_else(|| format!("watch 不存在: {}", wid))?;
-    w["cinemas"] = serde_json::json!(cinemas);
-    w["dates"] = match dates {
-        Some(d) => serde_json::json!(d),
-        None => Value::Null,
+        let w = config::find_watch_mut(&mut cfg, wid)
+            .ok_or_else(|| format!("watch 不存在: {}", wid))?;
+        w["cinemas"] = serde_json::json!(cinemas);
+        w["dates"] = match dates {
+            Some(d) => serde_json::json!(d),
+            None => Value::Null,
+        };
+        // 时段窗口：空 = 移除配置；非空 = 落盘
+        let tw = &time_window;
+        match tw {
+            Some(s) if !s.trim().is_empty() => {
+                config::parse_window(s).map_err(|e| format!("时段格式错误: {}", e))?;
+                w["time_window"] = serde_json::Value::String(s.clone());
+            }
+            _ => {
+                if let Some(o) = w.as_object_mut() {
+                    o.remove("time_window");
+                }
+            }
+        }
+        w["mode"] = serde_json::json!(mode);
+        match interval {
+            Some(secs) => w["interval"] = serde_json::json!(secs),
+            None => {
+                if let Some(o) = w.as_object_mut() {
+                    o.remove("interval");
+                }
+            }
+        }
+        // 通知通道
+        match &notify_webhook {
+            Some(s) => w["notify_webhook"] = serde_json::Value::String(s.clone()),
+            None => {
+                if let Some(o) = w.as_object_mut() {
+                    o.remove("notify_webhook");
+                }
+            }
+        }
+        match &notify_email_to {
+            Some(s) => w["notify_email_to"] = serde_json::Value::String(s.clone()),
+            None => {
+                if let Some(o) = w.as_object_mut() {
+                    o.remove("notify_email_to");
+                }
+            }
+        }
+        match &xhs_group {
+            Some(s) => w["xhs_group"] = serde_json::Value::String(s.clone()),
+            None => {
+                if let Some(o) = w.as_object_mut() {
+                    o.remove("xhs_group");
+                }
+            }
+        }
+        w["wechat_notify"] = serde_json::json!(wechat_notify);
+        // 锁票字段
+        w["auto_lock"] = serde_json::json!(auto_lock);
+        w["imax_only"] = serde_json::json!(imax_only);
+        w["lock_num_seats"] = serde_json::json!(lock_num_seats);
+        w["lock_max_retries"] = serde_json::json!(lock_max_retries);
+        w["lock_seats"] = serde_json::json!(lock_seats);
+        if baseline_keys_changed {
+            if let Some(o) = w.as_object_mut() {
+                o.remove("seen_shows");
+            }
+        }
+        // 锁键变化（cinemas/dates/time_window/imax_only/movie_id 任一）→
+        // 清空 lock_ok_cinemas + lock_tries：旧锁可能落在新范围外，下次 tick 会被
+        // cinema_lock_ok 误判跳过，需要从头评估。auto_lock 开关本身、锁参数、通知字段
+        // 不触发此清空（设计原则：开关即真锁、锁是历史事实）。
+        // 直接 clone w 作为 new_snapshot，省一次 cfg 借用（w 是 cfg 子树的 mut 借用）。
+        let released = match (old_watch.as_ref(), Some(w)) {
+            (Some(old), Some(new)) if config::lock_keys_changed(old, new) => {
+                config::clear_lock_state(new)
+            }
+            _ => 0,
+        };
+        (cfg.clone(), released)
     };
-    // 时段窗口：空 = 移除配置；非空 = 落盘
-    let tw = &time_window;
-    match tw {
-        Some(s) if !s.trim().is_empty() => {
-            config::parse_window(s).map_err(|e| format!("时段格式错误: {}", e))?;
-            w["time_window"] = serde_json::Value::String(s.clone());
-        }
-        _ => {
-            if let Some(o) = w.as_object_mut() {
-                o.remove("time_window");
-            }
-        }
+    config::save(&cfg_snapshot).map_err(|e| e.to_string())?;
+    if released > 0 {
+        cmd::push_event(
+            app,
+            format!(
+                "🔓 {} 匹配范围变化，释放 {} 个影院锁票状态",
+                wid, released
+            ),
+        );
     }
-    w["mode"] = serde_json::json!(mode);
-    match interval {
-        Some(secs) => w["interval"] = serde_json::json!(secs),
-        None => {
-            if let Some(o) = w.as_object_mut() {
-                o.remove("interval");
-            }
-        }
-    }
-    // 通知通道
-    match &notify_webhook {
-        Some(s) => w["notify_webhook"] = serde_json::Value::String(s.clone()),
-        None => {
-            if let Some(o) = w.as_object_mut() {
-                o.remove("notify_webhook");
-            }
-        }
-    }
-    match &notify_email_to {
-        Some(s) => w["notify_email_to"] = serde_json::Value::String(s.clone()),
-        None => {
-            if let Some(o) = w.as_object_mut() {
-                o.remove("notify_email_to");
-            }
-        }
-    }
-    match &xhs_group {
-        Some(s) => w["xhs_group"] = serde_json::Value::String(s.clone()),
-        None => {
-            if let Some(o) = w.as_object_mut() {
-                o.remove("xhs_group");
-            }
-        }
-    }
-    w["wechat_notify"] = serde_json::json!(wechat_notify);
-    // 锁票字段
-    w["auto_lock"] = serde_json::json!(auto_lock);
-    w["imax_only"] = serde_json::json!(imax_only);
-    w["lock_num_seats"] = serde_json::json!(lock_num_seats);
-    w["lock_max_retries"] = serde_json::json!(lock_max_retries);
-    w["lock_seats"] = serde_json::json!(lock_seats);
-    if baseline_keys_changed {
-        if let Some(o) = w.as_object_mut() {
-            o.remove("seen_shows");
-        }
-    }
-    config::save(&cfg).map_err(|e| e.to_string())?;
-    Ok(format!("已更新 {}", wid))
+    let suffix = if released > 0 {
+        format!("（释放 {} 个影院锁票状态）", released)
+    } else {
+        String::new()
+    };
+    Ok(format!("已更新 {} {}", wid, suffix).trim().to_string())
 }
 
 fn submit_global(app: &App, f: &FormModal) -> Result<String, String> {

@@ -12,6 +12,10 @@
 
 ## 当前版本
 
+**v1.5.3** —— 编辑 watch 自动释放锁状态：
+- **匹配范围变化 → 清 `lock_ok_cinemas` + `lock_tries`**：编辑表单保存时，若 cinemas / dates / time_window / imax_only / movie_id 任一改变，自动清空该 watch 的锁票运行状态（旧锁可能落在新范围外），下一轮 tick 重新评估。事件栏推 `🔓 {watch} 匹配范围变化，释放 N 个影院锁票状态`。
+- **不影响**：auto_lock 开关本身、锁参数（票数/座位/重试上限）、mode（开售提醒 vs 增场监控）、通知字段、`interval` —— 这些改了只影响下一场，不重置历史。详细副作用表见下方[编辑 watch 的副作用](#编辑-watch-的副作用)。
+
 **v1.5.2** —— 自动锁票语义简化 + 防误锁（在 v1.5.1 基础上）：
 - **锁定时段跟随监控时段**：删掉独立的锁票时段输入，`--time-window` 内所有满足条件的场次就是要锁的场次。
 - **IMAX 单一开关**：`--imax-only` 同时作用于监测过滤与锁票候选（TUI 表单改标「只看IMAX」，可单独开，不需要同时开自动锁票）。
@@ -86,7 +90,7 @@ cargo build --release
 ## 验证安装
 
 ```bash
-tt --version      # → tt 1.5.2
+tt --version      # → tt 1.5.3
 tt doctor         # 自检：配置、网络、猫眼 API
 tt init           # 首次运行：创建 ~/.config/ticket-tracker/config.json
 ```
@@ -298,6 +302,25 @@ tt watch edit <wid> --auto-lock true --lock-num-seats 2
 - **锁成功通知**：沿该 watch 既有通道（Discord/邮箱/小红书/微信/macOS）发「🔒 自动锁票成功」，
   带「⚠️ 15 分钟内到猫眼 App 完成支付」提示；booker 的锁票截图存
   `~/Applications/maoyan-booker/screenshots/05_locked.png`。
+
+### 编辑 watch 的副作用
+
+> TUI 编辑表单 / `tt watch edit` 保存时，会按下方表格清理运行期状态。改之前
+> 想清楚：清掉 `seen_shows` → 下一轮所有已知场次当"新增"；清掉 `lock_ok_cinemas`
+> → 该影院可以重新触发锁票（**会真锁**，别手滑）。
+
+| 改动字段 | `seen_shows` 基线 | `lock_ok_cinemas` + `lock_tries` |
+|---|---|---|
+| `cinemas` / `dates` / `time_window` | ✅ 清空 | ✅ 清空 |
+| `imax_only` / `movie_id` | ✅ 清空 | ✅ 清空 |
+| `mode`（开售提醒 ↔ 增场监控） | ✅ 清空 | ❌ 保留（mode 只影响通知，不影响锁范围） |
+| `auto_lock` 开关本身（true↔false） | ❌ 保留 | ❌ 保留（设计原则：开关即真锁） |
+| `lock_num_seats` / `lock_seats` / `lock_max_retries` | ❌ 保留 | ❌ 保留（锁是历史事实，下场用新参数锁） |
+| 通知字段 / `interval` | ❌ 保留 | ❌ 保留 |
+
+锁状态清空时，事件栏会推一条 `🔓 {watch} 匹配范围变化，释放 N 个影院锁票状态`
+让你知道。如果不想要被释放，编辑时只改通知/参数就行，别碰 cinemas/dates/
+time_window/imax_only/movie_id。
 
 ### 手动锁票测试（TUI）
 

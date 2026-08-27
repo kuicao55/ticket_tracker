@@ -732,6 +732,78 @@ fn incr_lock_tries_inner(cfg: &mut Value, watch_id: &str, cinema_id: &str) {
     }
 }
 
+/// 判定编辑 watch 时，"匹配范围"相关字段是否发生变化。
+///
+/// 一旦匹配范围变了，旧的 `lock_ok_cinemas` / `lock_tries` 就不再可信——
+/// 上次锁的那场可能根本不在新范围里（比如日期改了），或新范围里出现了
+/// 之前没考虑的影院。调用方应据此清空锁票状态让 monitor 重新评估。
+///
+/// 触发字段（任一变化即返回 true）：
+///   - `cinemas`     影院列表
+///   - `dates`       限定日期（null/[] 都视为无过滤，归一化后比较）
+///   - `time_window` 监控时段窗口
+///   - `imax_only`   是否只看 IMAX
+///   - `movie_id`    监控的电影本身变了，旧锁完全无关
+///
+/// 不触发的字段（保留状态）：
+///   - `mode`                仅影响通知逻辑（开售提醒 vs 增场监控），不影响锁范围
+///   - `auto_lock` 开关本身   toggle 不重锁（设计原则：开关即真锁）
+///   - 锁参数 (`lock_num_seats` / `lock_seats` / `lock_max_retries`)
+///                          锁是历史事实，参数改了只影响下一场
+///   - 通知字段 / `interval`
+pub fn lock_keys_changed(old: &Value, new: &Value) -> bool {
+    fn str_list(v: Option<&Value>) -> Vec<String> {
+        v.and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    if str_list(old.get("cinemas")) != str_list(new.get("cinemas")) {
+        return true;
+    }
+    if str_list(old.get("dates")) != str_list(new.get("dates")) {
+        return true;
+    }
+    let tw_old = old
+        .get("time_window")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let tw_new = new
+        .get("time_window")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if tw_old != tw_new {
+        return true;
+    }
+    let imax_old = old.get("imax_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    let imax_new = new.get("imax_only").and_then(|v| v.as_bool()).unwrap_or(false);
+    if imax_old != imax_new {
+        return true;
+    }
+    let movie_old = old.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let movie_new = new.get("movie_id").and_then(|v| v.as_i64()).unwrap_or(0);
+    if movie_old != movie_new {
+        return true;
+    }
+    false
+}
+
+/// 清空 watch 的锁票运行状态（`lock_ok_cinemas` + `lock_tries`）。
+/// 返回清掉前 `lock_ok_cinemas` 的长度，供 UI 在事件栏 push「释放 N 个影院」文案。
+///
+/// 注意：本函数不 save，由调用方（编辑表单提交）统一落盘。
+pub fn clear_lock_state(watch: &mut Value) -> usize {
+    let cleared = lock_ok_cinemas(watch).len();
+    if let Some(o) = watch.as_object_mut() {
+        o.insert("lock_ok_cinemas".into(), json!([]));
+        o.insert("lock_tries".into(), json!({}));
+    }
+    cleared
+}
+
 /// 一个 watch 是否所有影院都已「锁成功」或「重试耗尽」。空影院列表返回 false，
 /// 避免误停用只有空列表的 watch。
 pub fn all_cinemas_lock_settled(watch: &Value, cinemas: &[String]) -> bool {
@@ -968,5 +1040,138 @@ mod tests {
         settle_lock_defaults(&mut w2);
         assert_eq!(w2["lock_num_seats"], json!(5));
         assert_eq!(w2["auto_lock"], json!(true));
+    }
+
+    /// 编辑 watch 时，"匹配范围"变化应当触发锁状态清空。
+    /// 一次覆盖五个触发字段：cinemas / dates / time_window / imax_only / movie_id。
+    fn w(cinemas: &[&str], dates: Option<&[&str]>, tw: Option<&str>, imax: bool, movie: i64) -> Value {
+        let mut v = json!({
+            "id": "w_1",
+            "cinemas": cinemas,
+            "imax_only": imax,
+            "movie_id": movie,
+        });
+        if let Some(d) = dates {
+            v["dates"] = json!(d);
+        }
+        if let Some(t) = tw {
+            v["time_window"] = json!(t);
+        }
+        v
+    }
+
+    #[test]
+    fn lock_keys_changed_triggers_on_each_range_field() {
+        let base = w(&["37534"], Some(&["2026-08-31"]), Some("19:00-22:00"), true, 1545360);
+
+        // cinemas 增/减/换 都触发
+        assert!(lock_keys_changed(&base, &w(&["42020"], Some(&["2026-08-31"]), Some("19:00-22:00"), true, 1545360)));
+        assert!(lock_keys_changed(&base, &w(&["37534", "42020"], Some(&["2026-08-31"]), Some("19:00-22:00"), true, 1545360)));
+
+        // dates 改：换日期、清空（[]）、从 null 改成有限定
+        assert!(lock_keys_changed(&base, &w(&["37534"], Some(&["2026-09-01"]), Some("19:00-22:00"), true, 1545360)));
+        assert!(lock_keys_changed(&base, &w(&["37534"], Some(&[]), Some("19:00-22:00"), true, 1545360)));
+        assert!(lock_keys_changed(&base, &w(&["37534"], None, Some("19:00-22:00"), true, 1545360)));
+
+        // time_window 改
+        assert!(lock_keys_changed(&base, &w(&["37534"], Some(&["2026-08-31"]), Some("20:00-22:00"), true, 1545360)));
+        assert!(lock_keys_changed(&base, &w(&["37534"], Some(&["2026-08-31"]), None, true, 1545360)));
+
+        // imax_only toggle
+        assert!(lock_keys_changed(&base, &w(&["37534"], Some(&["2026-08-31"]), Some("19:00-22:00"), false, 1545360)));
+
+        // movie_id 改
+        assert!(lock_keys_changed(&base, &w(&["37534"], Some(&["2026-08-31"]), Some("19:00-22:00"), true, 9999999)));
+    }
+
+    #[test]
+    fn lock_keys_changed_ignores_unrelated_fields() {
+        let base = w(&["37534"], Some(&["2026-08-31"]), Some("19:00-22:00"), true, 1545360);
+        let mut same = base.clone();
+
+        // 通知字段：全不算
+        same["wechat_notify"] = json!(true);
+        same["xhs_group"] = json!("another");
+        same["notify_webhook"] = json!("https://example/hook");
+        same["notify_email_to"] = json!("a@b.com");
+        // 锁参数：toggle 不算
+        same["auto_lock"] = json!(false);
+        same["lock_num_seats"] = json!(4);
+        same["lock_max_retries"] = json!(5);
+        same["lock_seats"] = json!(["5排6座", "7排8座"]);
+        // 节奏字段
+        same["mode"] = json!("presale");
+        same["interval"] = json!(30);
+        assert!(!lock_keys_changed(&base, &same), "无关字段全部改了也应返回 false");
+
+        // dates null vs [] 视为相同（都表示"不限"）
+        let null_dates = json!({
+            "id": "w_1", "cinemas": ["37534"], "dates": null, "time_window": "19:00-22:00",
+            "imax_only": true, "movie_id": 1545360,
+        });
+        let empty_dates = json!({
+            "id": "w_1", "cinemas": ["37534"], "dates": [], "time_window": "19:00-22:00",
+            "imax_only": true, "movie_id": 1545360,
+        });
+        assert!(!lock_keys_changed(&null_dates, &empty_dates));
+    }
+
+    #[test]
+    fn clear_lock_state_empties_arrays_and_reports_count() {
+        let mut w = json!({
+            "id": "w_1",
+            "lock_ok_cinemas": ["37534", "42020"],
+            "lock_tries": { "37534": 2, "42020": 3 },
+        });
+        let n = clear_lock_state(&mut w);
+        assert_eq!(n, 2);
+        assert_eq!(w["lock_ok_cinemas"], json!([]));
+        assert_eq!(w["lock_tries"], json!({}));
+    }
+
+    #[test]
+    fn clear_lock_state_handles_missing_fields_gracefully() {
+        let mut w = json!({ "id": "w_1" });
+        let n = clear_lock_state(&mut w);
+        assert_eq!(n, 0);
+        assert_eq!(w["lock_ok_cinemas"], json!([]));
+        assert_eq!(w["lock_tries"], json!({}));
+    }
+
+    /// 端到端集成：旧 watch 已锁成功 → 编辑匹配范围 → 锁状态被清，
+    /// 下一次 tick 不会因 cinema_lock_ok 跳过。
+    #[test]
+    fn edit_clears_lock_state_when_range_changes() {
+        let mut cfg = cfg_with_watch(json!({
+            "id": "w_1",
+            "cinemas": ["37534"],
+            "dates": ["2026-08-31"],
+            "time_window": "19:00-22:00",
+            "imax_only": true,
+            "movie_id": 1545360,
+            "lock_ok_cinemas": ["37534"],
+            "lock_tries": {},
+            "seen_shows": { "37534": ["202608310023070"] },
+        }));
+
+        // 模拟"编辑把 dates 从 8/31 改成 9/1"——匹配范围变化
+        let new_dates = json!(["2026-09-01"]);
+        let w_ref = find_watch(&cfg, "w_1").unwrap();
+        let new_snapshot = {
+            let mut snap = w_ref.clone();
+            snap["dates"] = new_dates;
+            snap
+        };
+        assert!(lock_keys_changed(w_ref, &new_snapshot));
+
+        // 真实写回 cfg（按 submit_edit_watch 的做法）
+        let w = find_watch_mut(&mut cfg, "w_1").unwrap();
+        w["dates"] = json!(["2026-09-01"]);
+        let cleared = clear_lock_state(w);
+        assert_eq!(cleared, 1);
+
+        let w = find_watch(&cfg, "w_1").unwrap();
+        assert!(!cinema_lock_ok(w, "37534"), "锁状态必须被清空");
+        assert_eq!(w["lock_ok_cinemas"], json!([]));
     }
 }
