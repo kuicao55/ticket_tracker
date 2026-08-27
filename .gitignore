@@ -47,3 +47,7 @@ tt-*-unknown-linux-gnu
 # 上游是 single source of truth，这边不重复提交。新机器部署时手动建链：
 #   ln -s ~/Kui-Knowledge-Base/scripts/wechat-notify-fast.py rs/scripts/
 rs/scripts/wechat-notify-fast.py
+# xhs-notify.py：同上，本机指向 ~/Kui-Knowledge-Base/scripts/ 的符号链接。
+# 新机器部署时手动建链：
+#   ln -s ~/Kui-Knowledge-Base/scripts/xhs-notify.py rs/scripts/
+rs/scripts/xhs-notify.py
