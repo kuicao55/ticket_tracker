@@ -1,0 +1,317 @@
+{% extends "base.html" %}
+{% block title %}Overview · ticket-tracker{% endblock %}
+{% block content %}
+<div id="auto-refresh"
+     hx-get="/" hx-trigger="every 5s"
+     hx-select="#auto-refresh" hx-target="#auto-refresh" hx-swap="outerHTML">
+
+  <section class="hero">
+    <div>
+      <p class="eyebrow">Live monitoring</p>
+      <h1>Quiet eyes on<br>every seat.</h1>
+      <p class="lede">猫眼场次的小时桶基线、轮询健康与订阅关系，都在这一页。通知/锁票只投递给外部 Gofer，不探活。</p>
+    </div>
+    <div class="hero-meta">
+      <form method="post" action="/actions/monitor/toggle">
+        <button class="switch {% if health.paused %}paused{% else %}on{% endif %}" type="submit"
+                title="{% if health.paused %}恢复监控{% else %}暂停监控{% endif %}">
+          <span class="switch-knob"></span>
+          <span>{% if health.paused %}已暂停{% else %}运行中{% endif %}</span>
+        </button>
+      </form>
+      <span class="badge {% if health.ok %}on{% else %}bad{% endif %}">
+        <span class="status-dot {% if health.ok %}ok{% else %}bad{% endif %}"></span>
+        {{ health.status_text }}
+      </span>
+      <span class="mono">up {{ uptime }}</span>
+      <span class="mono muted">{{ health.check_count }} rounds</span>
+    </div>
+  </section>
+
+  <section class="kpi-grid">
+    <div class="card kpi">
+      <div class="label">Polls</div>
+      <div class="value">{{ counts.polls }}</div>
+      <div class="foot">{{ health.fetch_ok }}/{{ health.fetch_total }} 抓取正常</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Watches</div>
+      <div class="value">{{ counts.watches }}</div>
+      <div class="foot">{{ counts.active_watches }} 个启用</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Users</div>
+      <div class="value">{{ counts.users }}</div>
+      <div class="foot">小程序订阅用户</div>
+    </div>
+    <div class="card kpi">
+      <div class="label">Subscriptions</div>
+      <div class="value">{{ counts.subscriptions }}</div>
+      <div class="foot">user × watch</div>
+    </div>
+    {% if health.paused %}
+    <div class="card kpi kpi-featured">
+      <div class="label">Monitoring</div>
+      <div class="value" style="font-size:22px">Paused</div>
+      <div class="foot">面板仍在运行；恢复后立即重新计算轮询</div>
+    </div>
+    {% else %}
+    <div class="card kpi kpi-featured">
+      <div class="label">Check interval</div>
+      <div class="kpi-ring">
+        <button class="ring-button" type="button"
+                data-ring
+                data-last-poll="{{ last_poll_ts }}"
+                data-next-poll="{{ next_poll_ts }}"
+                data-interval="{{ interval }}"
+                onclick="document.getElementById('interval-dialog').showModal()">
+          <svg viewBox="0 0 66 66" aria-hidden="true">
+            <circle class="ring-track" cx="33" cy="33" r="28"></circle>
+            <circle class="ring-progress" cx="33" cy="33" r="28"></circle>
+          </svg>
+          <span class="ring-value">…</span>
+        </button>
+        <div>
+          <div class="mono" style="font-size:20px">{{ interval }}s</div>
+          <div class="ring-caption">点击修改<br>下一轮倒计时</div>
+        </div>
+      </div>
+    </div>
+    {% endif %}
+    <div class="card kpi">
+      <div class="label">Uptime</div>
+      <div class="value" style="font-size:20px">{{ uptime }}</div>
+      <div class="foot">since last restart</div>
+    </div>
+  </section>
+
+  <section class="grid-main">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Subscriptions</p>
+          <h2>Watch leaderboard</h2>
+          <p>按订阅人数排序，点击进入详情配置通知渠道。</p>
+        </div>
+        <div style="display:flex;gap:8px"><a class="btn ghost small" href="/watches">全部 watch</a><a class="btn clay small" href="/watches/new">新建</a></div>
+      </div>
+      {% if top_watches.is_empty() %}
+      <div class="empty">还没有 watch。先用 API 或旧版 CLI 创建一条。</div>
+      {% else %}
+      <div class="watch-list">
+        {% for w in top_watches %}
+        <a class="watch-row" href="{{ w.href }}">
+          <span class="rank">{{ loop.index }}</span>
+          <span class="watch-main">
+            <div class="watch-name">{{ w.name }}</div>
+            <div class="watch-sub">{{ w.movie_id }} · {{ w.cinemas }} 影院 · 基线 {{ w.baseline_total }} 场 · {{ w.last_trigger }}</div>
+            <div class="bar"><span style="width: {{ w.bar_pct }}%"></span></div>
+          </span>
+          <span class="sparkline" title="最近 24 小时基线变化">{{ w.sparkline|safe }}</span>
+          <span class="watch-meta">
+            <span class="mono">{{ w.subs }}</span>
+            <span class="badge {{ w.status_class }}">{{ w.status_text }}</span>
+          </span>
+        </a>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Health</p>
+            <h2>运行状态</h2>
+          </div>
+          <span class="badge {% if health.ok %}on{% else %}bad{% endif %}">
+            <span class="status-dot {% if health.ok %}ok{% else %}bad{% endif %}"></span>
+            {{ health.status_text }}
+          </span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">监控开关</span>
+          <span class="badge {% if health.paused %}warn{% else %}on{% endif %}">{% if health.paused %}已暂停{% else %}运行中{% endif %}</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">最近轮询</span>
+          <span class="health-val">{{ health.last_poll }}</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">抓取</span>
+          <span class="health-val">{{ health.fetch_ok }} ok / {{ health.fetch_err }} err</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">静默窗口</span>
+          <span class="health-val">{% if health.silent %}静默中{% else %}正常轮询{% endif %}</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">连续失败</span>
+          <span class="health-val">{{ health.consecutive_failures }}</span>
+        </div>
+        {% if health.has_error %}
+        <div class="alert-strip">{{ health.last_error }}</div>
+        {% endif %}
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Poll plan</p>
+            <h2>当前轮询影院</h2>
+          </div>
+          <span class="pill">{{ counts.polls }} polls</span>
+        </div>
+        {% if polls.is_empty() %}
+        <div class="empty">等待首轮。添加 watch 后会自动建立 poll 列表。</div>
+        {% else %}
+        {% for p in polls %}
+        <div class="poll-row">
+          <span class="status-dot {{ p.status_class }}"></span>
+          <span class="poll-name" title="{{ p.cinema_id }}">{{ p.name }}</span>
+          <span class="poll-meta">{{ p.watch_count }}w</span>
+          <span class="poll-meta">{{ p.duration }} · {{ p.shows }} 场</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+    </div>
+  </section>
+
+  <section class="grid-bottom">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Activity</p>
+          <h2>最近事件</h2>
+        </div>
+        <span class="pill">in-memory</span>
+      </div>
+      {% if events.is_empty() %}
+      <div class="empty">还没有事件。监控首轮建基线后会开始记录。</div>
+      {% else %}
+      <div class="event-list">
+        {% for e in events %}
+        <div class="event-row">
+          <span class="event-time">{{ e.ts }}</span>
+          <span class="event-kind">{{ e.kind }}</span>
+          <span class="event-msg">{{ e.message }}</span>
+        </div>
+        {% endfor %}
+      </div>
+      {% endif %}
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Audience</p>
+          <h2>Users</h2>
+          <p>{{ user_total }} 位订阅用户</p>
+        </div>
+        <a class="btn ghost small" href="/users">详情</a>
+      </div>
+      {% if users.is_empty() %}
+      <div class="empty">小程序用户会出现在这里。</div>
+      {% else %}
+      <table class="table">
+        <thead><tr><th>User</th><th>OpenID</th><th class="num">Subs</th></tr></thead>
+        <tbody>
+        {% for u in users %}
+        <tr>
+          <td>{{ u.name }}</td>
+          <td class="mono muted">{{ u.openid }}</td>
+          <td class="num">{{ u.subs }}</td>
+        </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% endif %}
+    </div>
+  </section>
+</div>
+
+<section class="grid-chart">
+  <div class="card poll-health-card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Poll health</p>
+        <h2>Poll 健康 · 今日</h2>
+        <p>{{ poll_health.day_label }} · 00:00–24:00；曲线按 5 分钟聚合，表格列出今天最近 10 轮。</p>
+      </div>
+      <span class="badge {{ poll_health.last_status_class }}">{{ poll_health.last_status_text }}</span>
+    </div>
+    {% if poll_health.has_data %}
+    <div class="poll-health-chart">{{ poll_health.svg|safe }}</div>
+    <div class="poll-health-axis">
+      {% for label in poll_health.axis %}<span>{{ label }}</span>{% endfor %}
+    </div>
+    <div class="poll-health-legend">
+      <span><i class="ok"></i>正常</span>
+      <span><i class="warn"></i>部分失败</span>
+      <span><i class="bad"></i>风控 / 被封</span>
+    </div>
+    <table class="table poll-health-table">
+      <thead><tr><th>时间</th><th class="num">成功</th><th class="num">速度</th><th>状态</th></tr></thead>
+      <tbody>
+      {% for r in poll_health.rows %}
+      <tr{% if !r.error.is_empty() %} title="{{ r.error }}"{% endif %}>
+        <td class="mono">{{ r.time }}</td>
+        <td class="num">{{ r.ok }}/{{ r.total }}</td>
+        <td class="num">{{ r.speed }}</td>
+        <td><span class="badge {{ r.status_class }}">{{ r.status_text }}</span></td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+    <div class="empty">今天还没有 poll 记录。启用 watch 并跑完一轮后会开始采样。</div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Today overview</p>
+        <h2>今日概览</h2>
+        <p>只统计今天 00:00–24:00 的轮询。</p>
+      </div>
+    </div>
+    <div class="health-row"><span class="health-key">轮询次数</span><span class="health-val">{{ poll_health.rounds }}</span></div>
+    <div class="health-row"><span class="health-key">总成功率</span><span class="health-val">{{ poll_health.success_rate }}</span></div>
+    <div class="health-row"><span class="health-key">平均速度</span><span class="health-val">{{ poll_health.avg_speed }} / 影院</span></div>
+    <div class="health-row"><span class="health-key">风控轮次</span><span class="health-val">{{ poll_health.blocked_rounds }}</span></div>
+    <div class="health-row"><span class="health-key">失败轮次</span><span class="health-val">{{ poll_health.failed_rounds }}</span></div>
+    <div class="health-row"><span class="health-key">最近轮询</span><span class="health-val">{{ poll_health.last_time }}</span></div>
+    <div class="health-row">
+      <span class="health-key">最近状态</span>
+      <span class="health-val">{{ poll_health.last_detail }}</span>
+    </div>
+    <div class="health-row">
+      <span class="health-key">结果</span>
+      <span class="badge {{ poll_health.last_status_class }}">{{ poll_health.last_status_text }}</span>
+    </div>
+    {% if !poll_health.last_error.is_empty() %}
+    <div class="alert-strip"><strong>最近一次错误 · {{ poll_health.last_error_time }}</strong><br>{{ poll_health.last_error }}</div>
+    {% endif %}
+    <div class="form-note" style="margin-top:16px">速度是单影院平均抓取耗时；风控轮次表示这一轮至少有一个影院返回 406 / captcha / 风控页。</div>
+  </div>
+</section>
+
+<dialog id="interval-dialog">
+  <h2>检查间隔</h2>
+  <p>修改后主服务会立即重新计算下一轮倒计时。</p>
+  <form hx-post="/actions/settings/interval"
+        hx-target="#auto-refresh" hx-select="#auto-refresh" hx-swap="outerHTML">
+    <div class="form-field">
+      <label for="interval">秒</label>
+      <input class="input mono" id="interval" name="interval" type="number" min="1" value="{{ interval }}" required>
+    </div>
+    <div class="form-actions">
+      <button class="btn clay" type="submit">保存</button>
+      <button class="btn ghost" type="button" onclick="document.getElementById('interval-dialog').close()">取消</button>
+    </div>
+  </form>
+</dialog>
+{% endblock %}

@@ -1,33 +1,29 @@
 [package]
 name = "ticket-tracker"
-version = "1.5.3"
+version = "4.2.1"
 edition = "2021"
-description = "猫眼影城影片预售监测 CLI + TUI，Rust 重写版（CLI 1:1 对齐 py/，TUI 用 ratatui）"
+description = "猫眼影城影片预售监测：v4 无头主服务 + Web 面板（通知/锁票投递给外部 Gofer）"
 license = "MIT"
 repository = "https://github.com/kuicao55/ticket_tracker"
-keywords = ["maoyan", "ticket", "movie", "monitor", "cli", "tui", "ratatui"]
+keywords = ["maoyan", "ticket", "movie", "monitor", "web"]
 categories = ["command-line-utilities"]
 
 
 
 
-# Cargo.lock 必须提交给 binary crate
+# v4：无头主服务（monitor + API + Web 面板 + SQLite）
 [[bin]]
-name = "tt"
-path = "src/main.rs"
+name = "tt-server"
+path = "src/bin/tt-server.rs"
 
 [lib]
 name = "ticket_tracker"
 path = "src/lib.rs"
 
 [dependencies]
-# TUI
-ratatui = "0.29"
-crossterm = "0.28"
-
 # Async + HTTP
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "cookies", "gzip"], default-features = false }
 
 # Serde / time / errors
 serde = { version = "1", features = ["derive"] }
@@ -36,21 +32,31 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 uuid = { version = "1", features = ["v4"] }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 dirs = "5"
+
+# 本地 watch API / Web 面板
+axum = "0.7"
+tower-http = { version = "0.5", features = ["fs", "compression-gzip", "trace"] }
+askama = "0.12"
+
+# SQLite（主服务数据库）
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "macros"] }
+
+# 配置文件跨进程锁
+fs2 = "0.4"
 
 # Misc
 anyhow = "1"
-thiserror = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-shell-words = "1"
-rand = "0.8"
 regex = "1"
 
 [dev-dependencies]
 pretty_assertions = "1"
 tempfile = "3"
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 lto = "thin"

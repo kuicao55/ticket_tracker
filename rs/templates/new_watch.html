@@ -1,0 +1,144 @@
+{% extends "base.html" %}
+{% block title %}New watch · ticket-tracker{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+  <a href="/">Overview</a><span>/</span><a href="/watches">Watches</a><span>/</span><span>new</span>
+</div>
+
+<section class="hero" style="padding-bottom:12px">
+  <div>
+    <p class="eyebrow">Watch registry</p>
+    <h1>New watch.</h1>
+    <p class="lede">从弹窗里选电影、影院和时间；相同过滤条件会自动复用已有 watch。</p>
+  </div>
+</section>
+
+{% if error != "" %}
+<div class="alert-strip" style="margin:0 0 12px">{{ error }}</div>
+{% endif %}
+{% if movie_error %}
+<div class="alert-strip" style="margin:0 0 12px">电影列表刷新失败，已保留缓存；可以稍后重试。</div>
+{% endif %}
+
+<div class="card" style="max-width:980px">
+  <div class="card-head">
+    <div>
+      <p class="eyebrow">Filters</p>
+      <h2>创建 / 复用 watch</h2>
+      <p>电影、影院、时间都从弹窗选择；ID 仅作为只读信息展示。</p>
+    </div>
+    <form method="post" action="/actions/movies/refresh">
+      <input type="hidden" name="next" value="/watches/new">
+      <button class="btn ghost small" type="submit">刷新电影列表</button>
+    </form>
+  </div>
+
+  <form method="post" action="/actions/watches" data-picker-form>
+    <div class="form-field">
+      <label>电影</label>
+      <button type="button" class="select-trigger" data-movie-open>
+        <span class="select-main" data-movie-label>选择电影</span>
+        <span class="select-sub mono" data-movie-id></span>
+        <span class="menu-caret">⌄</span>
+      </button>
+      <input type="hidden" name="movie_id" data-movie-value value="">
+    </div>
+
+    <div class="form-field" style="margin-top:16px">
+      <label>影院（可多选）</label>
+      <button type="button" class="select-trigger" data-cinema-open>
+        <span class="select-main" data-cinema-label>选择影院</span>
+        <span class="menu-caret">⌄</span>
+      </button>
+      <input type="hidden" name="cinemas" data-cinema-value value="">
+      <div class="chips" data-cinema-chips></div>
+    </div>
+
+    <div class="form-field" style="margin-top:16px">
+      <label>时间</label>
+      <div class="time-picker" data-time-picker>
+        <input type="hidden" name="time_spec" data-time-value value="{{ time_spec_json }}">
+        <div class="segmented time-modes">
+          <button type="button" data-time-mode="all">不限</button>
+          <button type="button" data-time-mode="daily">每天固定时段</button>
+          <button type="button" data-time-mode="dates">指定日期</button>
+        </div>
+        <div data-time-panel="daily" hidden>
+          <p class="form-note">点击或拖动方块选择小时；每格 1 小时。</p>
+          <div class="hour-grid" data-daily-grid></div>
+        </div>
+        <div data-time-panel="dates" hidden>
+          <div class="time-segments" data-time-segments></div>
+          <button type="button" class="btn ghost small" data-time-add>+ 添加日期段</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="form-field" style="margin-top:14px">
+      <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-family:var(--sans);font-size:13px;color:var(--ink)">
+        <input type="checkbox" name="imax_only" value="on"> 只看 IMAX
+      </label>
+    </div>
+
+    <div class="form-actions">
+      <button class="btn clay" type="submit">创建 / 复用</button>
+      <a class="btn ghost" href="/watches">取消</a>
+    </div>
+  </form>
+</div>
+
+<dialog id="movie-dialog" class="picker-dialog">
+  <div class="picker-head">
+    <div><p class="eyebrow">Movie</p><h2>选择电影</h2></div>
+    <button type="button" class="btn ghost small" data-movie-close>关闭</button>
+  </div>
+  <input class="input picker-search" data-movie-search placeholder="搜索任意电影名 / ID" autocomplete="off">
+  <div class="picker-list" data-movie-results>
+    <div class="menu-empty">输入片名或 ID 搜索；留空显示本地电影。</div>
+  </div>
+</dialog>
+
+<dialog id="cinema-dialog" class="picker-dialog" data-city-id="{{ city_id }}">
+  <div class="picker-head">
+    <div><p class="eyebrow">Cinema</p><h2>选择影院</h2></div>
+    <button type="button" class="btn ghost small" data-cinema-close>关闭</button>
+  </div>
+  <div class="picker-toolbar">
+    <select class="input picker-city" data-cinema-city></select>
+    <input class="input picker-search" data-cinema-search placeholder="搜索影院名 / ID / 地址" autocomplete="off">
+  </div>
+  <div class="picker-list" data-cinema-results>
+    {% for c in cinemas %}
+    <label class="menu-row" data-cinema-option data-id="{{ c.id }}" data-name="{{ c.name }}" data-search="{{ c.name }} {{ c.id }}">
+      <input type="checkbox" value="{{ c.id }}" {% if c.selected %}checked{% endif %}>
+      <span class="menu-row-main">
+        <span class="menu-row-name">{{ c.name }}</span>
+        <span class="menu-row-sub mono">{{ c.id }}</span>
+      </span>
+    </label>
+    {% endfor %}
+  </div>
+  <div class="picker-footer">
+    <span class="form-note" data-cinema-hint>可多选；支持猫眼影院搜索</span>
+    <button type="button" class="btn clay small" data-cinema-done>完成</button>
+  </div>
+</dialog>
+
+<dialog id="date-dialog" class="date-dialog">
+  <div class="date-head">
+    <div><p class="eyebrow">Date range</p><h2>选择日期</h2></div>
+    <button type="button" class="btn ghost small" data-date-close>关闭</button>
+  </div>
+  <div class="date-nav">
+    <button type="button" class="date-nav-btn" data-date-prev>‹</button>
+    <span class="mono muted" data-date-title></span>
+    <button type="button" class="date-nav-btn" data-date-next>›</button>
+  </div>
+  <div class="date-months" data-date-months></div>
+  <div class="date-footer">
+    <span class="form-note" data-date-hint>先选开始日期，再选结束日期</span>
+    <button type="button" class="btn ghost small" data-date-clear>清除</button>
+    <button type="button" class="btn clay small" data-date-apply>应用</button>
+  </div>
+</dialog>
+{% endblock %}

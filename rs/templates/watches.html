@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+{% block title %}Watches · ticket-tracker{% endblock %}
+{% block content %}
+<section class="hero" style="padding-bottom:12px">
+  <div>
+    <p class="eyebrow">Watch registry</p>
+    <h1>All watches.</h1>
+    <p class="lede">按订阅人数排序。相同过滤条件自动复用同一个 watch，用户“自建”只是新增订阅关系。</p>
+  </div>
+  <div class="hero-meta"><span class="pill">{{ count }} watches</span><a class="btn clay small" href="/watches/new">新建 watch</a></div>
+</section>
+
+<div class="card">
+  <table class="table">
+    <thead>
+      <tr><th>Watch</th><th>Movie</th><th>Cinemas</th><th class="num">Subs</th><th>Status</th><th>Last trigger</th></tr>
+    </thead>
+    <tbody>
+    {% for w in watches %}
+    <tr>
+      <td><a href="{{ w.href }}">{{ w.name }}</a><div class="watch-sub mono">{{ w.id }}</div></td>
+      <td class="mono">{{ w.movie_id }}</td>
+      <td class="mono">{{ w.cinemas }}</td>
+      <td class="num">{{ w.subs }}</td>
+      <td><span class="badge {{ w.status_class }}">{{ w.status_text }}</span></td>
+      <td class="mono muted">{{ w.last_trigger }}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if watches.is_empty() %}
+  <div class="empty">还没有 watch。</div>
+  {% endif %}
+</div>
+{% endblock %}

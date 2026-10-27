@@ -37,8 +37,8 @@ jobs:
         id: rename
         shell: bash
         run: |
-          BIN="rs/target/${{ matrix.target }}/release/tt"
-          OUT="tt-${{ matrix.target }}"
+          BIN="rs/target/${{ matrix.target }}/release/tt-server"
+          OUT="tt-server-${{ matrix.target }}"
           case "${{ matrix.os }}" in
             windows-*) BIN="$BIN.exe"; OUT="$OUT.exe" ;;
           esac

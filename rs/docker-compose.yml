@@ -1,0 +1,19 @@
+services:
+  tt-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ticket-tracker:latest
+    container_name: ticket-tracker
+    restart: unless-stopped
+    environment:
+      TT_BIND: 0.0.0.0:8787
+      TT_DB: /data/ticket-tracker.db
+      TT_WEB_DIR: /app/web
+      TZ: Asia/Shanghai
+      RUST_LOG: info
+    ports:
+      # 只发布到宿主机 localhost；远程通过 SSH 隧道访问
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - ./data:/data

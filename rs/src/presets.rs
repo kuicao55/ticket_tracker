@@ -1,4 +1,4 @@
-//! 内置常用影院预设（与 py/.../presets.py 1:1）。
+//! 内置常用影院预设；首次启动写入 DB，方便 Web 影院选择器。
 
 use serde::Serialize;
 
@@ -10,7 +10,7 @@ pub struct Preset {
     pub note: &'static str,
 }
 
-/// 与 Python `PRESETS` dict 同序（Py 3.7+ dict 保序）。
+/// 常用影院预设列表。
 pub static PRESETS: &[(&str, Preset)] = &[
     (
         "前滩太古里",
@@ -64,8 +64,5 @@ pub fn list_presets() -> &'static [(&'static str, Preset)] {
 }
 
 pub fn get_preset(name: &str) -> Option<&'static Preset> {
-    PRESETS
-        .iter()
-        .find(|(k, _)| *k == name)
-        .map(|(_, v)| v)
+    PRESETS.iter().find(|(k, _)| *k == name).map(|(_, v)| v)
 }

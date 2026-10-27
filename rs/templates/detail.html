@@ -1,0 +1,402 @@
+{% extends "base.html" %}
+{% block title %}{{ name }} · ticket-tracker{% endblock %}
+{% block content %}
+<div class="breadcrumb">
+  <a href="/">Overview</a><span>/</span><a href="/watches">Watches</a><span>/</span><span>{{ id }}</span>
+</div>
+
+<div id="detail-root"
+     hx-get="/watches/{{ id }}"
+     hx-trigger="every 5s [document.activeElement.tagName !== 'INPUT' &amp;&amp; document.activeElement.tagName !== 'TEXTAREA' &amp;&amp; document.activeElement.tagName !== 'SELECT' &amp;&amp; !document.activeElement.closest('[data-time-picker]') &amp;&amp; !document.activeElement.closest('[data-menu]') &amp;&amp; !document.querySelector('dialog[open]') &amp;&amp; !document.querySelector('[data-menu-panel]:not([hidden])')]"
+     hx-select="#detail-root" hx-target="#detail-root" hx-swap="outerHTML">
+
+  <section class="detail-hero">
+    <div>
+      <p class="eyebrow">Watch · {{ id }}</p>
+      <div class="detail-title">
+        <h1>{{ name }}</h1>
+        <span class="badge {{ status_class }}">{{ status_text }}</span>
+        <span class="badge {% if enabled %}on{% else %}flat{% endif %}">{{ enabled_text }}</span>
+      </div>
+      <div class="detail-meta">
+        <span class="mono">movie {{ movie_id }}</span>
+        <span>{{ time_spec }}</span>
+        <span>{{ imax_text }}</span>
+        <span class="mono">{{ created_at }}</span>
+      </div>
+    </div>
+    <form hx-post="/actions/watches/{{ id }}/toggle-detail"
+          hx-target="#detail-root" hx-select="#detail-root" hx-swap="outerHTML">
+      <button class="btn {% if enabled %}ghost{% else %}clay{% endif %}" type="submit">
+        {% if enabled %}停用 watch{% else %}启用 watch{% endif %}
+      </button>
+    </form>
+  </section>
+
+  <section class="detail-stats">
+    <div class="stat"><div class="label">Subscribers</div><div class="value">{{ subscriber_count }}</div></div>
+    <div class="stat"><div class="label">Cinemas</div><div class="value">{{ cinema_count }}</div></div>
+    <div class="stat"><div class="label">Total shows</div><div class="value">{{ total }}</div></div>
+    <div class="stat"><div class="label">IMAX shows</div><div class="value">{{ imax }}</div></div>
+    <div class="stat"><div class="label">Buckets</div><div class="value">{{ buckets }}</div></div>
+  </section>
+
+  <section class="grid-main">
+    <div class="card">
+      <div class="card-head">
+        <div>
+          <p class="eyebrow">Notification channels</p>
+          <h2>通知渠道</h2>
+          <p>点击绑定/配置，为该 watch 单独填写参数；微信 / 小红书 / 自动锁票由外部 Gofer 执行。</p>
+        </div>
+        <a class="btn ghost small" href="/settings#channels">全局默认</a>
+      </div>
+      <div class="channel-grid">
+        {% for ch in channels %}
+        <div class="channel {% if ch.linked %}on{% endif %}">
+          <div class="channel-head">
+            <span class="channel-type">{{ ch.type_label }}</span>
+            <span class="badge {{ ch.status_class }}">{{ ch.status_text }}</span>
+          </div>
+          <div class="channel-name">{{ ch.name }}</div>
+          <div class="channel-config">{{ ch.config_summary }}</div>
+          <div class="channel-actions">
+            <button class="btn small {% if ch.linked %}ghost{% else %}clay{% endif %}" type="button"
+                    onclick="document.getElementById('channel-dialog-{{ ch.id }}').showModal()">
+              {% if ch.linked %}配置{% else %}绑定{% endif %}
+            </button>
+            {% if ch.linked %}
+            <form hx-post="/actions/watches/{{ id }}/channels/{{ ch.id }}/toggle"
+                  hx-target="#detail-root" hx-select="#detail-root" hx-swap="outerHTML">
+              <button class="btn small ghost" type="submit">解绑</button>
+            </form>
+            {% endif %}
+            {% if ch.linked && ch.testable %}
+            <form hx-post="/actions/channels/{{ ch.id }}/test"
+                  hx-target="#detail-root" hx-select="#detail-root" hx-swap="outerHTML">
+              <input type="hidden" name="watch_id" value="{{ id }}">
+              <button class="btn small ghost" type="submit"
+                      {% if ch.local %}onclick="return confirm('会真实发送一条测试消息到本机微信/小红书，继续？')"{% endif %}>测试</button>
+            </form>
+            {% endif %}
+          </div>
+        </div>
+
+        <dialog id="channel-dialog-{{ ch.id }}" class="channel-dialog">
+          <form method="post" action="/actions/watches/{{ id }}/channels/{{ ch.id }}/config">
+            <div class="card-head">
+              <div>
+                <p class="eyebrow">{{ ch.type_label }}</p>
+                <h2>{{ ch.name }}</h2>
+                <p>{% if ch.linked %}修改该 watch 的渠道参数{% else %}填写参数并绑定到该 watch{% endif %}</p>
+              </div>
+            </div>
+
+            {% if ch.type_class == "discord" || ch.type_class == "webhook" %}
+            <div class="form-field">
+              <label>Webhook URL</label>
+              <input class="input mono" name="url" value="{{ ch.url }}" placeholder="https://..." required>
+            </div>
+            {% else if ch.type_class == "email" %}
+            <div class="form-field">
+              <label>收件人</label>
+              <input class="input mono" name="to" value="{{ ch.to }}" placeholder="you@example.com" required>
+            </div>
+            {% else if ch.type_class == "xhs_local" %}
+            <div class="form-field">
+              <label>小红书群名</label>
+              <input class="input mono" name="group" value="{{ ch.group }}" placeholder="例如：ticket-tracker" required>
+            </div>
+            {% else if ch.type_class == "wechat_local" %}
+            <p class="form-note">微信（本机）固定发到当前打开的微信会话。发送前请把微信停在目标群聊页面；无需填写群名。</p>
+            {% else if ch.type_class == "autolock" %}
+            <div class="form-grid">
+              <div class="form-field">
+                <label>票数</label>
+                <input class="input mono" type="number" min="1" name="lock_num_seats" value="{{ ch.lock_num_seats }}" required>
+              </div>
+              <div class="form-field">
+                <label>同影院重试上限</label>
+                <input class="input mono" type="number" min="1" name="lock_max_retries" value="{{ ch.lock_max_retries }}" required>
+              </div>
+            </div>
+            <div class="form-field" style="margin-top:10px">
+              <label>指定座位（空格分隔；留空=智能选座）</label>
+              <input class="input mono" name="lock_seats" value="{{ ch.lock_seats_text }}" placeholder="5排6座 6排7座">
+            </div>
+            <p class="form-note" style="margin-top:8px">开启后命中即真锁，由外部 Gofer 执行；15 分钟内到猫眼 App 付款。</p>
+            {% else %}
+            <p class="form-note">该渠道无需额外参数。</p>
+            {% endif %}
+
+            {% if ch.local %}
+            <div class="form-grid" style="margin-top:12px">
+              <div class="form-field">
+                <label>Gofer 地址（留空=全局）</label>
+                <input class="input mono" name="agent_url" value="{{ ch.agent_url }}" placeholder="http://127.0.0.1:8790">
+              </div>
+              <div class="form-field">
+                <label>Gofer token（留空=全局）</label>
+                <input class="input mono" name="agent_token" value="{{ ch.agent_token }}" placeholder="可选">
+              </div>
+            </div>
+            {% endif %}
+
+            <div class="form-actions">
+              <button class="btn clay" type="submit">{% if ch.linked %}保存配置{% else %}保存并绑定{% endif %}</button>
+              <button class="btn ghost" type="button"
+                      onclick="document.getElementById('channel-dialog-{{ ch.id }}').close()">取消</button>
+            </div>
+          </form>
+          {% if ch.type_class == "autolock" && !lock_rows.is_empty() %}
+          <div style="margin-top:16px">
+            {% for l in lock_rows %}
+            <div class="health-row">
+              <span class="health-key">{{ l.cinema_name }}<span class="mono muted"> · {{ l.cinema_id }}</span></span>
+              <span class="health-val"><span class="badge {{ l.status_class }}">{{ l.status_text }}</span> {{ l.tries }} 次</span>
+            </div>
+            {% endfor %}
+          </div>
+          {% endif %}
+        </dialog>
+        {% endfor %}
+      </div>
+    </div>
+
+    <div class="stack">
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Cinemas</p>
+            <h2>影院范围</h2>
+          </div>
+          <span class="pill">{{ cinemas.len() }} 个</span>
+        </div>
+        {% if cinemas.is_empty() %}
+        <div class="empty">还没有影院。</div>
+        {% else %}
+        {% for c in cinemas %}
+        <div class="health-row">
+          <span class="health-key mono">{{ c.id }}</span>
+          <span class="health-val">{{ c.label }}</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+      </div>
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Filter</p>
+            <h2>过滤条件</h2>
+            <p>保存后如过滤条件变化，会清空该 watch 的基线。</p>
+          </div>
+        </div>
+        <form method="post" action="/actions/watches/{{ id }}/edit" data-picker-form>
+          <div class="form-field">
+            <label>电影</label>
+            <button type="button" class="select-trigger" data-movie-open>
+              <span class="select-main" data-movie-label>{{ name }}</span>
+              <span class="select-sub mono" data-movie-id>{{ movie_id }}</span>
+              <span class="menu-caret">⌄</span>
+            </button>
+            <input type="hidden" name="movie_id" data-movie-value value="{{ movie_id }}">
+          </div>
+
+          <div class="form-field" style="margin-top:12px">
+            <label>影院（可多选）</label>
+            <button type="button" class="select-trigger" data-cinema-open>
+              <span class="select-main" data-cinema-label>选择影院</span>
+              <span class="menu-caret">⌄</span>
+            </button>
+            <input type="hidden" name="cinemas" data-cinema-value value="">
+            <div class="chips" data-cinema-chips></div>
+          </div>
+
+          <div class="form-field" style="margin-top:12px">
+            <label>时间</label>
+            <div class="time-picker" data-time-picker>
+              <input type="hidden" name="time_spec" data-time-value value="{{ time_spec_json }}">
+              <div class="segmented time-modes">
+                <button type="button" data-time-mode="all">不限</button>
+                <button type="button" data-time-mode="daily">每天固定时段</button>
+                <button type="button" data-time-mode="dates">指定日期</button>
+              </div>
+              <div data-time-panel="daily" hidden>
+                <p class="form-note">点击或拖动方块选择小时；每格 1 小时。</p>
+                <div class="hour-grid" data-daily-grid></div>
+              </div>
+              <div data-time-panel="dates" hidden>
+                <div class="time-segments" data-time-segments></div>
+                <button type="button" class="btn ghost small" data-time-add>+ 添加日期段</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="form-field" style="margin-top:10px">
+            <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-family:var(--sans);font-size:13px;color:var(--ink)">
+              <input type="checkbox" name="imax_only" value="on" {% if imax_only %}checked{% endif %}> 只看 IMAX
+            </label>
+          </div>
+          <div class="form-actions"><button class="btn small" type="submit">保存过滤条件</button></div>
+        </form>
+      </div>
+
+
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">Subscribers</p>
+            <h2>订阅用户</h2>
+          </div>
+          <span class="pill">{{ subscriber_count }}</span>
+        </div>
+        {% if subscribers.is_empty() %}
+        <div class="empty">还没有用户订阅这条 watch。</div>
+        {% else %}
+        {% for s in subscribers %}
+        <div class="subscriber-row">
+          <span>{{ s.user_name }}</span>
+          <span class="mono muted">{{ s.channel_name }}</span>
+          <span class="mono muted">{{ s.created }}</span>
+        </div>
+        {% endfor %}
+        {% endif %}
+        {% if !users.is_empty() %}
+        <form method="post" action="/actions/subscriptions" style="margin-top:14px">
+          <input type="hidden" name="watch_id" value="{{ id }}">
+          <div class="form-field">
+            <label>添加订阅</label>
+            <select name="user_id">
+              {% for u in users %}<option value="{{ u.id }}">{{ u.label }}</option>{% endfor %}
+            </select>
+          </div>
+          <div class="form-actions"><button class="btn small clay" type="submit">订阅</button></div>
+        </form>
+        {% endif %}
+      </div>
+    </div>
+  </section>
+</div>
+
+<section class="grid-chart" style="grid-template-columns: 1fr">
+  <div class="card chart-card">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Baseline history</p>
+        <h2>{{ chart.name }} 的基线</h2>
+        <p>{{ chart.subtitle }} · 当前 {{ chart.total }} 场 / IMAX {{ chart.imax }}</p>
+      </div>
+      <div class="segmented">
+        <button type="button" data-chart-range="24h" class="active">24h</button>
+        <button type="button" data-chart-range="7d">7d</button>
+        <button type="button" data-chart-range="30d">30d</button>
+      </div>
+    </div>
+    <div class="chart" data-chart-url="/api/v1/watches/{{ chart.id }}/metrics" data-range="24h"></div>
+    <div class="chart-legend"><span><i></i>Total shows</span><span><i class="brass"></i>IMAX</span></div>
+    <div class="chart-empty" style="display:none">这个时间段还没有采样。监控运行一轮后会开始记录。</div>
+  </div>
+</section>
+
+<section class="card baseline-shows" style="margin-top:12px">
+  <div class="card-head">
+    <div>
+      <p class="eyebrow">Baseline shows</p>
+      <h2>基线场次</h2>
+      <p>只展示当前基线里存在的日期和场次；没有的日期不会出现。</p>
+    </div>
+    <span class="pill">{{ baseline_days.len() }} 天</span>
+  </div>
+  {% if baseline_days.is_empty() %}
+  <div class="empty">还没有基线数据。监控完成首轮检查后会出现。</div>
+  {% else %}
+  <div class="baseline-tabs" role="tablist" aria-label="基线日期" data-baseline-tabs>
+    {% for day in baseline_days %}
+    <button type="button" role="tab" data-baseline-tab data-index="{{ loop.index0 }}"
+            class="{% if loop.first %}active{% endif %}"
+            aria-selected="{% if loop.first %}true{% else %}false{% endif %}">
+      {{ day.date }} <span class="baseline-tab-count">{{ day.count }}</span>
+    </button>
+    {% endfor %}
+  </div>
+  {% for day in baseline_days %}
+  <div class="baseline-day" data-date-index="{{ loop.index0 }}" data-date="{{ day.date }}" {% if !loop.first %}hidden{% endif %}>
+    <div class="baseline-day-head">
+      <h3>{{ day.date }}</h3>
+      <span class="pill">{{ day.count }} 场</span>
+    </div>
+    <table class="table">
+      <thead><tr><th>时间</th><th>影厅</th><th>制式</th><th>影院</th><th>IMAX</th></tr></thead>
+      <tbody>
+      {% for s in day.shows %}
+      <tr>
+        <td class="mono">{{ s.time }}</td>
+        <td>{{ s.hall }}</td>
+        <td class="mono muted">{{ s.format }}</td>
+        <td>{{ s.cinema }}</td>
+        <td>{% if s.imax %}<span class="badge warn">IMAX</span>{% endif %}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endfor %}
+  {% endif %}
+</section>
+
+<dialog id="movie-dialog" class="picker-dialog">
+  <div class="picker-head">
+    <div><p class="eyebrow">Movie</p><h2>选择电影</h2></div>
+    <button type="button" class="btn ghost small" data-movie-close>关闭</button>
+  </div>
+  <input class="input picker-search" data-movie-search placeholder="搜索任意电影名 / ID" autocomplete="off">
+  <div class="picker-list" data-movie-results>
+    <div class="menu-empty">输入片名或 ID 搜索；留空显示本地电影。</div>
+  </div>
+</dialog>
+
+<dialog id="cinema-dialog" class="picker-dialog" data-city-id="{{ city_id }}">
+  <div class="picker-head">
+    <div><p class="eyebrow">Cinema</p><h2>选择影院</h2></div>
+    <button type="button" class="btn ghost small" data-cinema-close>关闭</button>
+  </div>
+  <div class="picker-toolbar">
+    <select class="input picker-city" data-cinema-city></select>
+    <input class="input picker-search" data-cinema-search placeholder="搜索影院名 / ID / 地址" autocomplete="off">
+  </div>
+  <div class="picker-list" data-cinema-results>
+    {% for c in cinema_choices %}
+    <label class="menu-row" data-cinema-option data-id="{{ c.id }}" data-name="{{ c.name }}" data-search="{{ c.name }} {{ c.id }}">
+      <input type="checkbox" value="{{ c.id }}" {% if c.selected %}checked{% endif %}>
+      <span class="menu-row-main">
+        <span class="menu-row-name">{{ c.name }}</span>
+        <span class="menu-row-sub mono">{{ c.id }}</span>
+      </span>
+    </label>
+    {% endfor %}
+  </div>
+  <div class="picker-footer">
+    <span class="form-note" data-cinema-hint>可多选；支持猫眼影院搜索</span>
+    <button type="button" class="btn clay small" data-cinema-done>完成</button>
+  </div>
+</dialog>
+
+<dialog id="date-dialog" class="date-dialog">
+  <div class="date-head">
+    <div><p class="eyebrow">Date range</p><h2>选择日期</h2></div>
+    <button type="button" class="btn ghost small" data-date-close>关闭</button>
+  </div>
+  <div class="date-nav">
+    <button type="button" class="date-nav-btn" data-date-prev>‹</button>
+    <span class="mono muted" data-date-title></span>
+    <button type="button" class="date-nav-btn" data-date-next>›</button>
+  </div>
+  <div class="date-months" data-date-months></div>
+  <div class="date-footer">
+    <span class="form-note" data-date-hint>先选开始日期，再选结束日期</span>
+    <button type="button" class="btn ghost small" data-date-clear>清除</button>
+    <button type="button" class="btn clay small" data-date-apply>应用</button>
+  </div>
+</dialog>
+{% endblock %}

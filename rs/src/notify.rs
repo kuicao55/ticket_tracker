@@ -1,20 +1,34 @@
-//! 通知层：Discord Webhook + macOS 电脑通知（带 caffeinate 防休眠）。
+//! 通知层：只负责**远程**通道。
 //!
-//! 与 py/.../notify.py 1:1 对齐。参考：RUST_PORT.md §5.5、§5.6。
+//! - Discord Webhook / 通用结果 webhook
+//! - 邮件（本地 msmtp）
+//!
+//! 微信 / 小红书 / 锁票由独立 Gofer 服务执行，不在主服务内。
 
-use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::process::{Command, Stdio};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::Result;
 
-const USER_AGENT: &str = "ticket-tracker/1.0 (+Rust reqwest)";
+const USER_AGENT: &str = "ticket-tracker/2.0 (+Rust reqwest)";
 const DISCORD_HOST: &str = "https://discord.com/api/webhooks/";
 
-#[cfg(target_os = "macos")]
-pub const IS_MAC: bool = true;
-#[cfg(not(target_os = "macos"))]
-pub const IS_MAC: bool = false;
+static NOTIFY_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+
+fn http_client() -> &'static reqwest::Client {
+    NOTIFY_CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .user_agent(USER_AGENT)
+            .timeout(Duration::from_secs(15))
+            .connect_timeout(Duration::from_secs(5))
+            .pool_max_idle_per_host(8)
+            .gzip(true)
+            .danger_accept_invalid_certs(true)
+            .build()
+            .expect("reqwest notify client")
+    })
+}
 
 // ----------------- Discord -----------------
 
@@ -36,12 +50,7 @@ pub async fn notify_discord_async(
     }
     let payload = serde_json::json!({ "content": content });
 
-    let cli = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build()?;
-
+    let cli = http_client();
     let mut last: Option<String> = None;
     for i in 0..3 {
         match cli.post(wh).json(&payload).send().await {
@@ -53,18 +62,8 @@ pub async fn notify_discord_async(
             tokio::time::sleep(Duration::from_secs(3)).await;
         }
     }
-    let _ = last; // 同 Python：warn 即可
+    let _ = last; // 失败只记录，不阻塞调用方
     Ok(false)
-}
-
-pub fn notify_discord(
-    webhook: Option<&str>,
-    title: &str,
-    message: &str,
-    url: Option<&str>,
-) -> Result<bool> {
-    let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(notify_discord_async(webhook, title, message, url))
 }
 
 // ----------------- 结果通知（仅告警，不发心跳） -----------------
@@ -102,11 +101,7 @@ pub async fn notify_results_webhook_async(
         })
     };
 
-    let cli = reqwest::Client::builder()
-        .user_agent(USER_AGENT)
-        .timeout(Duration::from_secs(15))
-        .danger_accept_invalid_certs(true)
-        .build()?;
+    let cli = http_client();
     let mut last: Option<String> = None;
     for i in 0..3 {
         match cli.post(u).json(&payload).send().await {
@@ -126,6 +121,23 @@ pub async fn notify_results_webhook_async(
 /// 收件人从 config 的 `notify_email_to` 读，SMTP 凭证 / 发件人由用户在自己
 /// 的 `~/.msmtprc` 里配置（`brew install msmtp` 一次，永久免维护）。
 /// `msmtp` 不在 PATH / 未安装时静默失败（不抛错），避免告警被吞。
+pub async fn notify_results_email_async(
+    to_addr: Option<&str>,
+    title: &str,
+    message: &str,
+    click_url: Option<&str>,
+) -> bool {
+    let to_addr = to_addr.map(String::from);
+    let title = title.to_string();
+    let message = message.to_string();
+    let click_url = click_url.map(String::from);
+    tokio::task::spawn_blocking(move || {
+        notify_results_email(to_addr.as_deref(), &title, &message, click_url.as_deref())
+    })
+    .await
+    .unwrap_or(false)
+}
+
 pub fn notify_results_email(
     to_addr: Option<&str>,
     title: &str,
@@ -162,211 +174,8 @@ pub fn notify_results_email(
                 use std::io::Write;
                 let _ = stdin.write_all(body.as_bytes());
             }
-            match child.wait() {
-                Ok(s) if s.success() => true,
-                _ => false,
-            }
+            matches!(child.wait(), Ok(s) if s.success())
         }
         Err(_) => false,
-    }
-}
-
-// ----------------- 小红书群聊通知（per-watch xhs_group） -----------------
-
-/// 通过本地 xhs-notify.py 脚本把通知推送到小红书指定群聊。
-/// 脚本路径在编译期定死 (`$CARGO_MANIFEST_DIR/scripts/xhs-notify.py`),
-/// 部署到新位置需重新 `cargo build`。
-///
-/// 行为约定:
-/// - 群名为空 / 脚本文件不存在 → 静默返回 false,并在 stderr 留一行提示(配置问题要让用户看见)
-/// - 脚本运行失败(agent-browser 超时、找不到群聊等)→ 静默 false,不刷屏(运行时问题)
-pub fn notify_xhs(group: &str, title: &str, body: &str, url: Option<&str>) -> bool {
-    let group = group.trim();
-    if group.is_empty() {
-        return false;
-    }
-    let script = format!("{}/scripts/xhs-notify.py", env!("CARGO_MANIFEST_DIR"));
-    if !std::path::Path::new(&script).exists() {
-        eprintln!(
-            "⚠ xhs-notify.py 未找到: {} (请确认 rs/scripts/ 目录已复制脚本)",
-            script
-        );
-        return false;
-    }
-    let mut cmd = Command::new("python3");
-    cmd.arg(&script)
-        .arg("--group")
-        .arg(group)
-        .arg("--title")
-        .arg(title)
-        .arg("--body")
-        .arg(body);
-    if let Some(u) = url {
-        if !u.is_empty() {
-            cmd.arg("--url").arg(u);
-        }
-    }
-    let result = cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn();
-    match result {
-        Ok(mut child) => match child.wait() {
-            Ok(s) if s.success() => true,
-            _ => false,
-        },
-        Err(_) => false,
-    }
-}
-
-// ----------------- 微信大群通知（per-watch wechat_notify） -----------------
-
-/// 通过本地 wechat-notify-fast.py 脚本把消息推送到微信「当前打开的会话」。
-///
-/// 脚本机制：剪贴板写入 → Cmd+V 粘贴 → Enter 发送。Enter 在微信里是「发送」，
-/// 所以 message 里的换行会被原样粘贴成多行输入，**整段作为一条消息发出**
-/// （不像 xhs 脚本那样 \n 触发多次发送）。因此 wechat 模板里可以放心用 \n 排版。
-///
-/// 路径同样编译期定死在 `$CARGO_MANIFEST_DIR/scripts/wechat-notify-fast.py`，
-/// 部署到新位置需重新 `cargo build`。
-///
-/// 行为约定：
-/// - 脚本文件不存在 → stderr 留一行提示，静默 false
-/// - 微信未启动 / 没停在目标会话 / 缺权限 → 静默 false（脚本内部已 stderr 提示）
-pub fn notify_wechat(message: &str) -> bool {
-    let script = format!(
-        "{}/scripts/wechat-notify-fast.py",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    if !std::path::Path::new(&script).exists() {
-        eprintln!(
-            "⚠ wechat-notify-fast.py 未找到: {} (请确认 rs/scripts/ 目录已复制脚本)",
-            script
-        );
-        return false;
-    }
-    let result = Command::new("python3")
-        .arg(&script)
-        .arg("--message")
-        .arg(message)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn();
-    match result {
-        Ok(mut child) => match child.wait() {
-            Ok(s) if s.success() => true,
-            _ => false,
-        },
-        Err(_) => false,
-    }
-}
-
-// ----------------- macOS 电脑通知 -----------------
-
-/// 在 macOS 上发系统通知 + 周期性响铃 + 语音 + 自动打开购票页。
-/// 非 macOS 平台静默返回。
-pub fn notify_macos(title: &str, message: &str, sound: bool, open_url: Option<&str>, duration_secs: u64) {
-    if !IS_MAC {
-        return;
-    }
-    // 弹窗
-    let script = format!(
-        "display notification \"{}\" with title \"{}\" sound name \"Glass\"",
-        message.replace('"', "'"),
-        title.replace('"', "'")
-    );
-    let _ = Command::new("osascript")
-        .arg("-e")
-        .arg(&script)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
-    // 自动打开购票页（只开一次）
-    if let Some(u) = open_url {
-        let _ = Command::new("open").arg(u).spawn();
-    }
-    // 周期性响铃 + 一次性语音
-    if !sound {
-        return;
-    }
-    let start = std::time::Instant::now();
-    let mut said = false;
-    while start.elapsed() < Duration::from_secs(duration_secs.max(1)) {
-        print!("\x07");
-        use std::io::Write;
-        let _ = std::io::stdout().flush();
-        let _ = Command::new("afplay")
-            .arg("/System/Library/Sounds/Glass.aiff")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        if !said {
-            let _ = Command::new("say")
-                .arg("预售已开启，快去抢票")
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            said = true;
-        }
-        std::thread::sleep(Duration::from_secs(3));
-    }
-}
-
-// ----------------- caffeinate 防休眠 -----------------
-
-static CAFFEINATE: OnceLock<Mutex<Option<Child>>> = OnceLock::new();
-
-fn cell() -> &'static Mutex<Option<Child>> {
-    CAFFEINATE.get_or_init(|| Mutex::new(None))
-}
-
-pub fn caffeinate_start(child_pid: u32) -> Option<u32> {
-    if !IS_MAC {
-        return None;
-    }
-    let mut guard = cell().lock().ok()?;
-    // 若已有，先 terminate
-    if let Some(mut c) = guard.take() {
-        let _ = c.kill();
-    }
-    match Command::new("caffeinate")
-        .args(["-i", "-s", "-w", &child_pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(c) => {
-            let pid = c.id();
-            *guard = Some(c);
-            Some(pid)
-        }
-        Err(_) => None,
-    }
-}
-
-pub fn caffeinate_stop() {
-    if !IS_MAC {
-        return;
-    }
-    if let Ok(mut g) = cell().lock() {
-        if let Some(mut c) = g.take() {
-            let _ = c.kill();
-            let _ = c.wait();
-        }
-    }
-}
-
-pub fn is_caffeinated() -> Option<bool> {
-    if !IS_MAC {
-        return None;
-    }
-    let mut g = cell().lock().ok()?;
-    match g.as_mut() {
-        Some(c) => {
-            // try_wait 不卡死
-            match c.try_wait() {
-                Ok(None) => Some(true),
-                _ => Some(false),
-            }
-        }
-        None => Some(false),
     }
 }

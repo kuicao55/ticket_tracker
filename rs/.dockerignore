@@ -1,0 +1,9 @@
+target
+.git
+.gitignore
+data
+*.db
+*.sqlite
+Dockerfile
+docker-compose.yml
+tests

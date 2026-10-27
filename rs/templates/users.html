@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Users · ticket-tracker{% endblock %}
+{% block content %}
+<section class="hero" style="padding-bottom:12px">
+  <div>
+    <p class="eyebrow">Audience</p>
+    <h1>Users.</h1>
+    <p class="lede">小程序用户与订阅关系。真实微信登录 / 订阅消息适配器留到下一阶段接入。</p>
+  </div>
+  <div class="hero-meta">
+    <span class="pill">{{ total }} users</span>
+    <span class="pill">{{ subscriptions }} subscriptions</span>
+  </div>
+</section>
+
+<section class="grid-main">
+  <div class="card">
+    <div class="card-head">
+      <div><p class="eyebrow">Registry</p><h2>用户列表</h2></div>
+    </div>
+    <table class="table">
+      <thead><tr><th>User</th><th>OpenID</th><th class="num">Subs</th><th>Created</th></tr></thead>
+      <tbody>
+      {% for u in users %}
+      <tr>
+        <td>{{ u.name }}<div class="watch-sub mono">{{ u.id }}</div></td>
+        <td class="mono muted">{{ u.openid }}</td>
+        <td class="num">{{ u.subs }}</td>
+        <td class="mono muted">{{ u.created }}</td>
+      </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+    {% if users.is_empty() %}<div class="empty">还没有用户。</div>{% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-head">
+      <div><p class="eyebrow">Dev / test</p><h2>添加用户</h2><p>小程序接入前，可手动造测试用户。</p></div>
+    </div>
+    <form method="post" action="/actions/users">
+      <div class="form-field">
+        <label for="nickname">昵称</label>
+        <input class="input" id="nickname" name="nickname" placeholder="测试用户" required>
+      </div>
+      <div class="form-field" style="margin-top:12px">
+        <label for="openid">OpenID（可空）</label>
+        <input class="input mono" id="openid" name="openid" placeholder="o_xxx">
+      </div>
+      <div class="form-actions"><button class="btn clay" type="submit">创建</button></div>
+    </form>
+  </div>
+</section>
+{% endblock %}

@@ -1,0 +1,138 @@
+{% extends "base.html" %}
+{% block title %}Settings · ticket-tracker{% endblock %}
+{% block content %}
+<section class="hero" style="padding-bottom:12px">
+  <div>
+    <p class="eyebrow">Control plane</p>
+    <h1>Settings.</h1>
+    <p class="lede">主服务设置、外部 Gofer 投递、通知渠道配置。所有改动即时写入 SQLite，不需要重启。</p>
+  </div>
+  <div class="hero-meta">
+    <span class="badge flat">Gofer 外部投递 · 不探活</span>
+  </div>
+</section>
+
+<div id="settings-root">
+  <section class="grid-main">
+    <div class="card">
+      <div class="card-head">
+        <div><p class="eyebrow">Global</p><h2>主服务设置</h2><p>检查间隔与静默窗口会热生效。</p></div>
+      </div>
+      <form method="post" action="/actions/settings" hx-post="/actions/settings"
+            hx-target="#settings-root" hx-select="#settings-root" hx-swap="outerHTML">
+        <div class="form-grid">
+          <div class="form-field">
+            <label for="interval">检查间隔（秒）</label>
+            <input class="input mono" id="interval" name="interval" type="number" min="1" value="{{ interval }}">
+          </div>
+          <div class="form-field">
+            <label for="silent">静默窗口</label>
+            <input class="input mono" id="silent" name="silent" value="{{ silent }}" placeholder="01:00-06:00">
+          </div>
+          <div class="form-field full">
+            <label for="discord_webhook">Discord 健康告警 webhook</label>
+            <input class="input mono" id="discord_webhook" name="discord_webhook" value="{{ discord_webhook }}" placeholder="https://discord.com/api/webhooks/...">
+          </div>
+          <div class="form-field">
+            <label for="agent_url">Gofer URL</label>
+            <input class="input mono" id="agent_url" name="agent_url" value="{{ agent_url }}">
+          </div>
+          <div class="form-field">
+            <label for="maoyan_city_id">猫眼城市 ID（影院搜索）</label>
+            <input class="input mono" id="maoyan_city_id" name="maoyan_city_id" type="number" min="1" value="{{ maoyan_city_id }}">
+          </div>
+          <div class="form-field">
+            <label for="agent_token">Gofer token</label>
+            <input class="input mono" id="agent_token" name="agent_token" value="{{ agent_token }}">
+          </div>
+          <div class="form-field">
+            <label for="metrics_retention_days">图表保留天数</label>
+            <input class="input mono" id="metrics_retention_days" name="metrics_retention_days" type="number" min="1" value="{{ metrics_retention_days }}">
+          </div>
+          <div class="form-field">
+            <label for="lock_headless">锁票无头模式</label>
+            <select id="lock_headless" name="lock_headless">
+              <option value="true" {% if lock_headless %}selected{% endif %}>开（推荐）</option>
+              <option value="false" {% if !lock_headless %}selected{% endif %}>关（带浏览器调试）</option>
+            </select>
+          </div>
+          <div class="form-field">
+            <label for="wx_appid">小程序 AppID</label>
+            <input class="input mono" id="wx_appid" name="wx_appid" value="{{ wx_appid }}">
+          </div>
+          <div class="form-field">
+            <label for="wx_template_id">小程序模板 ID</label>
+            <input class="input mono" id="wx_template_id" name="wx_template_id" value="{{ wx_template_id }}">
+          </div>
+          <div class="form-field full">
+            <label for="wx_secret">小程序 AppSecret</label>
+            <input class="input mono" id="wx_secret" name="wx_secret" value="{{ wx_secret }}">
+          </div>
+        </div>
+        <div class="form-actions">
+          <button class="btn clay" type="submit">保存设置</button>
+          <span class="form-note">小程序推送适配器本期未启用真实发送。</span>
+        </div>
+      </form>
+    </div>
+
+    <div class="card" id="agent">
+      <div class="card-head">
+        <div><p class="eyebrow">Delivery</p><h2>外部 Gofer</h2></div>
+        <span class="badge flat">不探活</span>
+      </div>
+      <div class="health-row"><span class="health-key">地址</span><span class="health-val mono">{{ agent_url }}</span></div>
+      <div class="health-row"><span class="health-key">Token</span><span class="health-val">{% if agent_token != "" %}已配置{% else %}—{% endif %}</span></div>
+      <p class="form-note" style="margin-top:14px">主服务只负责向 Gofer POST <span class="mono">/notify</span> 和 <span class="mono">/lock</span>。不检查 Gofer / 微信 / 小红书状态，Gofer 离线不会触发健康异常。</p>
+      <p class="form-note" style="margin-top:8px">Gofer 面板通常在同一地址：<span class="mono">{{ agent_url }}</span>。</p>
+    </div>
+  </section>
+
+  <section class="card" id="channels" style="margin-top:12px">
+    <div class="card-head">
+      <div>
+        <p class="eyebrow">Channels</p>
+        <h2>渠道默认值</h2>
+        <p>这里只保存默认值；watch 详情页点「绑定/配置」会写入该 watch 自己的参数。Discord / webhook / 邮箱由主服务直接发送；微信、小红书和自动锁票转发给外部 Gofer。</p>
+      </div>
+    </div>
+    <div class="channel-grid">
+      {% for ch in channels %}
+      <div class="channel">
+        <div class="channel-head">
+          <span class="channel-type">{{ ch.type_label }}</span>
+          <span class="badge {% if ch.enabled %}on{% else %}flat{% endif %}">{% if ch.enabled %}启用{% else %}停用{% endif %}</span>
+        </div>
+        <form method="post" action="/actions/channels/{{ ch.id }}/config">
+          <div class="form-field">
+            <label>名称</label>
+            <input class="input" name="name" value="{{ ch.name }}">
+          </div>
+          {% if ch.channel_type == "discord" || ch.channel_type == "webhook" %}
+          <div class="form-field" style="margin-top:10px">
+            <label>Webhook URL</label>
+            <input class="input mono" name="url" value="{{ ch.url }}">
+          </div>
+          {% else if ch.channel_type == "email" %}
+          <div class="form-field" style="margin-top:10px">
+            <label>收件人</label>
+            <input class="input mono" name="to" value="{{ ch.to }}">
+          </div>
+          {% else if ch.channel_type == "xhs_local" %}
+          <div class="form-field" style="margin-top:10px">
+            <label>小红书群名</label>
+            <input class="input mono" name="group" value="{{ ch.group }}">
+          </div>
+          {% else %}
+          <p class="form-note" style="margin-top:10px">该渠道无需额外配置。</p>
+          {% endif %}
+          <div class="form-actions">
+            <button class="btn small" type="submit">保存</button>
+          </div>
+        </form>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+</div>
+{% endblock %}

@@ -44,6 +44,6 @@ jobs:
       - name: Build
         run: cargo build --manifest-path rs/Cargo.toml --release --locked
       - name: Smoke (--version)
-        run: ./rs/target/release/tt --version
+        run: ./rs/target/release/tt-server --version
       - name: Smoke (--help)
-        run: ./rs/target/release/tt --help
+        run: ./rs/target/release/tt-server --help
