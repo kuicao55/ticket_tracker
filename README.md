@@ -15,13 +15,14 @@
 
 ## 当前版本
 
-**v4.2.1** —— 只保留 v4 服务端：
+**v4.3.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）
 - 每 watch 独立通知渠道参数
 - 今日 Poll 健康图
 - 监控暂停 / 恢复开关
+- GitHub Release 面板自动更新
 
 ---
 
@@ -66,7 +67,33 @@ cargo build --release --bin tt-server
 默认面板：<http://127.0.0.1:8787>。  
 默认数据库：`~/.local/state/ticket-tracker/ticket-tracker.db`。
 
-### 3. 启动 Gofer（需要微信 / 小红书 / 锁票时）
+### 3. 更新
+
+面板顶部 **Update**：检查 GitHub Release、显示 release notes，
+一键下载经 SHA256 校验的新 `tt-server`，替换并重启。
+
+macOS 通过 launchd 部署时，更新后由 KeepAlive 拉起新进程；
+通过 `start-server.sh` 部署时，更新会用重启助手接管 PID 和日志。
+
+更新源是 GitHub Release，资产命名：
+
+```text
+tt-server-aarch64-apple-darwin
+tt-server-x86_64-apple-darwin
+SHA256SUMS
+```
+
+发版：
+
+```bash
+git tag v4.3.0
+git push origin v4.3.0
+```
+
+公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
+launchd 模板已设置 `TT_SUPERVISED=launchd`，更新后由 KeepAlive 重启。
+
+### 4. 启动 Gofer（需要微信 / 小红书 / 锁票时）
 
 Gofer 是独立项目：
 
@@ -110,6 +137,15 @@ cargo build --release
 | `maoyan_city_id` | 影院搜索城市 | `10` |
 | `metrics_retention_days` | 图表保留天数 | `7` |
 | `monitor_enabled` | 监控开关 | `true` |
+
+自动更新相关环境变量：
+
+| 变量 | 作用 |
+|---|---|
+| `TT_UPDATE_TOKEN` | 可选；GitHub 只读 token，避免限流 |
+| `TT_UPDATE_API_BASE` | 可选；测试/镜像 API 地址 |
+| `TT_SUPERVISED` | `launchd` 时更新后只退出，由 launchd 拉起 |
+| `TT_PID_FILE` / `TT_LOG_FILE` | start-server.sh 的重启助手使用 |
 
 ---
 

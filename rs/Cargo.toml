@@ -1,6 +1,6 @@
 [package]
 name = "ticket-tracker"
-version = "4.2.1"
+version = "4.3.0"
 edition = "2021"
 description = "猫眼影城影片预售监测：v4 无头主服务 + Web 面板（通知/锁票投递给外部 Gofer）"
 license = "MIT"
@@ -48,6 +48,7 @@ fs2 = "0.4"
 
 # Misc
 anyhow = "1"
+sha2 = "0.10"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 regex = "1"

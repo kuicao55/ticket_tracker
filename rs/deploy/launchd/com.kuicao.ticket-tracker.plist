@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.kuicao.ticket-tracker</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/kuicao/Applications/ticket_tracker/rs/target/release/tt-server</string>
+    <string>--bind</string>
+    <string>127.0.0.1:8787</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>TT_DB</key>
+    <string>/Users/kuicao/.local/state/ticket-tracker/ticket-tracker.db</string>
+    <key>TT_BIND</key>
+    <string>127.0.0.1:8787</string>
+    <key>TT_WEB_DIR</key>
+    <string>/Users/kuicao/Applications/ticket_tracker/rs/web</string>
+    <!-- 面板更新：launchd 模式退出后由 KeepAlive 拉起新二进制 -->
+    <key>TT_SUPERVISED</key>
+    <string>launchd</string>
+    <!-- 公开仓库通常不需要；如遇 GitHub 限流可填只读 token -->
+    <key>TT_UPDATE_TOKEN</key>
+    <string></string>
+    <!-- Gofer 锁票结果回调 -->
+    <key>TT_CALLBACK_URL</key>
+    <string>http://127.0.0.1:8787/api/v1/agent/lock-result</string>
+    <key>TZ</key>
+    <string>Asia/Shanghai</string>
+  </dict>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+  <key>StandardOutPath</key>
+  <string>/Users/kuicao/Library/Logs/ticket-tracker.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/kuicao/Library/Logs/ticket-tracker.log</string>
+</dict>
+</plist>

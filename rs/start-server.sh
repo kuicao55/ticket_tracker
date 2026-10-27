@@ -151,7 +151,7 @@ start_server() {
 
   build_if_needed
 
-  local envs=(TT_BIND="$BIND" TT_DB="$DB")
+  local envs=(TT_BIND="$BIND" TT_DB="$DB" TT_PID_FILE="$PID_FILE" TT_LOG_FILE="$LOG_FILE")
   envs+=("TT_CALLBACK_URL=${TT_CALLBACK_URL:-http://${DISPLAY_HOST}:${PORT}/api/v1/agent/lock-result}")
   if [ -d "$WEB_DIR" ]; then
     envs+=(TT_WEB_DIR="$WEB_DIR")

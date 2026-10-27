@@ -51,6 +51,8 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/actions/settings/interval", post(action_interval))
         .route("/actions/settings", post(action_settings))
         .route("/actions/monitor/toggle", post(action_monitor_toggle))
+        .route("/update", get(update_page))
+        .route("/actions/update/install", post(action_update_install))
         .route("/actions/watches", post(action_create_watch))
         .route("/actions/movies/refresh", post(action_refresh_movies))
         .route("/actions/watches/:id/edit", post(action_edit_watch))
@@ -362,6 +364,26 @@ struct UsersTemplate {
     total: i64,
     subscriptions: i64,
     users: Vec<UserItemView>,
+}
+
+#[derive(Template)]
+#[template(path = "update.html")]
+struct UpdateTemplate {
+    version: String,
+    now: String,
+    page: String,
+    info: crate::update::UpdateInfo,
+}
+
+#[derive(Template)]
+#[template(path = "update_result.html")]
+struct UpdateResultTemplate {
+    version: String,
+    now: String,
+    page: String,
+    ok: bool,
+    title: String,
+    message: String,
 }
 
 #[derive(Template)]
@@ -1510,6 +1532,50 @@ async fn build_settings(st: &Arc<AppState>) -> anyhow::Result<SettingsTemplate> 
 #[derive(Debug, Deserialize)]
 struct IntervalForm {
     interval: u64,
+}
+
+async fn update_page() -> Response {
+    let (version, now) = meta();
+    let info = crate::update::check().await;
+    render(&UpdateTemplate {
+        version,
+        now,
+        page: "update".into(),
+        info,
+    })
+    .into_response()
+}
+
+async fn action_update_install() -> Response {
+    let (version, now) = meta();
+    match crate::update::install_latest().await {
+        Ok(out) => {
+            crate::update::schedule_exit();
+            render(&UpdateResultTemplate {
+                version,
+                now,
+                page: "update".into(),
+                ok: true,
+                title: format!("已更新到 {}", out.version),
+                message: if out.supervised {
+                    "服务正在由 launchd 重启；几秒后刷新页面。".into()
+                } else {
+                    "已下载并替换二进制，重启助手会在当前进程退出后拉起新版本；几秒后刷新页面。"
+                        .into()
+                },
+            })
+            .into_response()
+        }
+        Err(e) => render(&UpdateResultTemplate {
+            version,
+            now,
+            page: "update".into(),
+            ok: false,
+            title: "更新失败".into(),
+            message: e.to_string(),
+        })
+        .into_response(),
+    }
 }
 
 async fn action_monitor_toggle(State(st): State<Arc<AppState>>) -> Response {

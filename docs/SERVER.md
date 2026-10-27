@@ -231,6 +231,8 @@ curl -X POST http://127.0.0.1:8787/api/v1/subscriptions \
 - `/users`：用户列表 + 测试用户创建。
 - `/settings`：检查间隔、静默窗口、Discord 健康告警、Gofer 投递地址、渠道默认值、
   小程序配置、影院搜索城市（`maoyan_city_id`，默认 10=上海）。
+- `/update`：检查 GitHub Release、显示 release notes、SHA256 校验后替换二进制并重启。
+  launchd 部署用 `TT_SUPERVISED=launchd`；start-server.sh 部署由重启助手接管 PID/日志。
 
 视觉：warm parchment + editorial serif + monospace 数据 + clay/ember 强调。
 HTMX 每 5 秒刷新片段；倒计时和 uPlot 图表由本地 JS 驱动。
@@ -257,10 +259,8 @@ watch 触发
 
 ```text
 watch 触发
-  → 主服务检查 autolock 渠道绑定 / watch.auto_lock
-  → 用该绑定的 agent_url/token（留空回退全局）POST Gofer /lock
   → lock_state 未 ok / 未 exhausted
-  → POST Gofer /lock (confirm=true)
+  → 用该绑定的 agent_url/token（留空回退全局）POST Gofer /lock (confirm=true)
   → Gofer 串行执行 booker
   → Gofer 记录结果（监控不依赖回调）
 
@@ -298,3 +298,22 @@ watch 触发
 - 不要把 8787 直接暴露公网；小程序公网 API 需要单独的鉴权/HTTPS/备案域名。
 - Docker 只发布到宿主机 localhost。
 - SQLite 单实例 + WAL；多实例请换 Postgres。
+- launchd 模板：`rs/deploy/launchd/com.kuicao.ticket-tracker.plist`。
+
+## 11. 自动更新 / Release
+
+- 面板 `/update` 从 GitHub `releases/latest` 检查更新。
+- Release 资产：
+  - `tt-server-aarch64-apple-darwin`
+  - `tt-server-x86_64-apple-darwin`
+  - `SHA256SUMS`
+- 下载后强制校验 SHA256；校验通过才替换当前二进制，并保留 `.bak`。
+- 发版：
+  ```bash
+  git tag v4.3.0
+  git push origin v4.3.0
+  ```
+  `.github/workflows/release.yml` 会构建 macOS x86_64/aarch64 二进制、生成
+  `SHA256SUMS` 并发布 Release。
+- 公开仓库通常无需 token；限流时设置 `TT_UPDATE_TOKEN`。
+- 旧二进制备份：同目录下的 `tt-server.bak`。

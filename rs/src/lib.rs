@@ -19,6 +19,7 @@ pub mod presets;
 pub mod server;
 pub mod silent;
 pub mod time_spec;
+pub mod update;
 
 pub use paths::{log_file, pid_file, state_dir};
 pub use presets::{get_preset, list_presets, PRESETS};
