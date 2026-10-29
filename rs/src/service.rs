@@ -52,6 +52,39 @@ pub fn base_url_from_bind(bind: &str) -> String {
     format!("http://{}:{}", display_host, port)
 }
 
+/// 可选的对外地址（`TT_PUBLIC_URL`），例如 Tailscale / 反向代理地址。
+///
+/// 只接受完整的 http(s) URL；无效或空值会被忽略，回退到本地监听地址。
+pub fn normalize_public_url(value: &str) -> Option<String> {
+    let value = value.trim().trim_end_matches('/');
+    if value.is_empty() {
+        return None;
+    }
+    let lower = value.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+/// iGlance 展示/打开面板时使用的地址：优先对外地址，否则本地 base URL。
+pub fn display_base_url(base: &str, public_url: Option<&str>) -> String {
+    public_url
+        .and_then(normalize_public_url)
+        .unwrap_or_else(|| base.trim_end_matches('/').to_string())
+}
+
+/// Web 面板绝对地址。始终以 `/` 结尾，避免浏览器落到 API 路径。
+pub fn panel_url(display_base: &str) -> String {
+    format!("{}/", display_base.trim_end_matches('/'))
+}
+
+/// 读取 `TT_PUBLIC_URL`；无效值忽略。
+pub fn env_public_url() -> Option<String> {
+    env_nonempty("TT_PUBLIC_URL").and_then(|v| normalize_public_url(&v))
+}
+
 /// iGlance 启动命令读取的一行握手。**不包含 token。**
 pub fn manifest_line(base_url: &str) -> String {
     let manifest = json!({
@@ -68,6 +101,7 @@ pub fn manifest_line(base_url: &str) -> String {
         },
         "endpoints": {
             "health": "/health",
+            "panel": "/",
             "status": "/api/v1/service",
             "memory": "/api/v1/service/memory",
             "pause": "/api/v1/service/pause",
@@ -640,8 +674,24 @@ mod tests {
         assert_eq!(value["schema"], MANIFEST_SCHEMA);
         assert_eq!(value["base_url"], "http://127.0.0.1:8787");
         assert_eq!(value["service"]["id"], SERVICE_ID);
+        assert_eq!(value["endpoints"]["panel"], "/");
         assert!(value.get("token").is_none());
         assert!(!line.contains("token\":\""));
+    }
+
+    #[test]
+    fn panel_url_prefers_public_base_and_keeps_trailing_slash() {
+        let base = "http://127.0.0.1:8787";
+        assert_eq!(
+            display_base_url(base, Some("https://tt.example.com/")),
+            "https://tt.example.com"
+        );
+        assert_eq!(
+            panel_url("https://tt.example.com/"),
+            "https://tt.example.com/"
+        );
+        assert_eq!(display_base_url(base, Some("ftp://tt.example.com")), base);
+        assert_eq!(panel_url(base), "http://127.0.0.1:8787/");
     }
 
     #[test]

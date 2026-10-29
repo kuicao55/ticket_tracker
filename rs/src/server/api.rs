@@ -1114,7 +1114,8 @@ async fn service_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
         "running"
     };
     let base = st.base_url();
-    let display = base.clone();
+    let display = st.display_base_url();
+    let panel = service::panel_url(&display);
     let body = json!({
         "schema": service::MANIFEST_SCHEMA,
         "ok": true,
@@ -1134,6 +1135,7 @@ async fn service_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> 
             "base": base,
             "display": display,
             "health": format!("{}/health", display.trim_end_matches('/')),
+            "panel": panel,
         },
         "auth": {
             "header": service::TOKEN_HEADER,

@@ -15,11 +15,11 @@
 
 ## 当前版本
 
-**v4.4.0** —— 只保留 v4 服务端：
+**v4.5.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）
-- iGlance `iglance.service.v1` 服务绑定（状态 / 内存 / 暂停 / 恢复 / 停止）
+- iGlance `iglance.service.v1` 服务绑定（状态 / 内存 / 暂停 / 恢复 / 停止 / 一键打开面板）
 - 每 watch 独立通知渠道参数
 - 今日 Poll 健康图
 - 监控暂停 / 恢复开关
@@ -87,8 +87,8 @@ SHA256SUMS
 发版：
 
 ```bash
-git tag v4.4.0
-git push origin v4.4.0
+git tag v4.5.0
+git push origin v4.5.0
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -147,6 +147,7 @@ cargo build --release
 | `TT_UPDATE_TOKEN` | 可选；GitHub 只读 token，避免限流 |
 | `TT_UPDATE_API_BASE` | 可选；测试/镜像 API 地址 |
 | `TT_SERVICE_TOKEN` | 可选；覆盖 `panel_token` 作为服务接口 token（不写日志） |
+| `TT_PUBLIC_URL` | 可选；对外面板地址（如 Tailscale / 反代），用于 `urls.display` / `urls.panel` |
 | `TT_START_COMMAND` | 可选；覆盖 `controls.start` 返回的启动命令 |
 | `TT_START_SCRIPT` | 可选；指定启动脚本路径 |
 | `TT_SUPERVISED` | `launchd` 时更新后只退出/停止时 bootout，由 launchd 拉起 |
@@ -258,6 +259,7 @@ rs/target/release/tt-server manifest --base-url http://127.0.0.1:8787
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 公开健康检查，不需要 token |
+| GET | `/` | Web 面板（对应 `endpoints.panel` / `urls.panel`） |
 | GET | `/api/v1/service` | `schema` / `state` / `pid` / `memory.groups` / `controls.start` |
 | GET | `/api/v1/service/memory` | 仅内存快照 |
 | POST | `/api/v1/service/pause` | `{"ok":true,"state":"paused","paused":true}` |
@@ -302,6 +304,14 @@ RSS 会重复计算共享内存，因此是估算值。`ps` 采集失败时 `ava
 4. 进程退出。
 
 `cleanup=false` 只退出主进程。停止不会改变暂停状态。
+
+### 打开网页面板
+
+manifest 的 `endpoints.panel` 和 `GET /api/v1/service` 的 `urls.panel` 都指向
+ticket_tracker 的 Web 面板（默认 `/`），iGlance 可以用它在浏览器里一键打开。
+默认使用本地监听地址；设置 `TT_PUBLIC_URL`（如 `https://tt.example.com`）后，
+`urls.display` / `urls.panel` 会改用对外地址。面板 URL 始终以 `/` 结尾，
+不包含 token 或 query，需要登录时由浏览器处理。
 
 ---
 

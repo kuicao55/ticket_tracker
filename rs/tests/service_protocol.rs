@@ -41,6 +41,7 @@ fn manifest_subcommand_prints_one_line_without_starting_service() {
     assert_eq!(v["schema"], "iglance.service.v1");
     assert_eq!(v["base_url"], "http://127.0.0.1:9999");
     assert_eq!(v["service"]["id"], "ticket_tracker");
+    assert_eq!(v["endpoints"]["panel"], "/");
     assert!(v["auth"].get("token").is_none());
     assert!(!stdout.contains("token\":\""));
 }
@@ -76,6 +77,11 @@ async fn service_status_exposes_protocol_fields_and_memory_groups() {
 
     assert!(v["urls"]["base"].as_str().unwrap().starts_with("http://"));
     assert!(v["urls"]["health"].as_str().unwrap().ends_with("/health"));
+    let display = v["urls"]["display"].as_str().unwrap();
+    assert_eq!(
+        v["urls"]["panel"].as_str().unwrap(),
+        format!("{}/", display.trim_end_matches('/'))
+    );
     assert_eq!(v["auth"]["header"], "X-Gofer-Token");
     assert_eq!(v["auth"]["token_required"], false);
 

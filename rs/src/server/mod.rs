@@ -59,6 +59,8 @@ pub struct AppState {
     pub started_at: f64,
     /// 实际监听地址（`TT_BIND`），用于生成 iGlance 的 `base_url`。
     pub bind: String,
+    /// 可选对外地址（`TT_PUBLIC_URL`），用于 iGlance 的 display / panel。
+    pub public_url: Option<String>,
     pub health: StdMutex<HealthState>,
     pub watch_status: StdMutex<HashMap<String, WatchStatus>>,
     pub events: StdMutex<VecDeque<EventItem>>,
@@ -87,6 +89,7 @@ impl AppState {
             db,
             started_at: now_secs(),
             bind: bind.into(),
+            public_url: service::env_public_url(),
             health: StdMutex::new(HealthState {
                 health_ok: true,
                 ..Default::default()
@@ -104,6 +107,11 @@ impl AppState {
     /// iGlance 可访问的 base URL。
     pub fn base_url(&self) -> String {
         service::base_url_from_bind(&self.bind)
+    }
+
+    /// 面板/展示地址：优先 `TT_PUBLIC_URL`，否则本地 base URL。
+    pub fn display_base_url(&self) -> String {
+        service::display_base_url(&self.base_url(), self.public_url.as_deref())
     }
 
     pub fn is_stopping(&self) -> bool {

@@ -96,7 +96,7 @@ fallback_manifest() {
   local version
   version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" 2>/dev/null | head -n1)"
   [ -n "$version" ] || version="0.0.0"
-  printf 'IGLANCE_SERVICE_MANIFEST {"schema":"iglance.service.v1","service":{"id":"ticket_tracker","name":"Ticket Tracker","version":"%s"},"base_url":"%s","auth":{"type":"header","header":"X-Gofer-Token"},"endpoints":{"health":"/health","status":"/api/v1/service","memory":"/api/v1/service/memory","pause":"/api/v1/service/pause","resume":"/api/v1/service/resume","toggle":"/api/v1/service/toggle","stop":"/api/v1/service/stop"}}\n' "$version" "$URL"
+  printf 'IGLANCE_SERVICE_MANIFEST {"schema":"iglance.service.v1","service":{"id":"ticket_tracker","name":"Ticket Tracker","version":"%s"},"base_url":"%s","auth":{"type":"header","header":"X-Gofer-Token"},"endpoints":{"health":"/health","panel":"/","status":"/api/v1/service","memory":"/api/v1/service/memory","pause":"/api/v1/service/pause","resume":"/api/v1/service/resume","toggle":"/api/v1/service/toggle","stop":"/api/v1/service/stop"}}\n' "$version" "$URL"
 }
 
 print_manifest() {

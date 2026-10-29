@@ -173,6 +173,7 @@ SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 公开健康检查（iGlance 使用） |
+| GET | `/` | Web 面板（iGlance 通过 `endpoints.panel` / `urls.panel` 打开） |
 | GET | `/api/v1/health` | uptime、last/next poll、paused、fetch ok/err、DB、delivery |
 | GET | `/api/v1/service` | iGlance `iglance.service.v1` 状态 + 内存 + controls（`/v1/service` 同义） |
 | GET | `/api/v1/service/memory` | 仅内存快照 |
@@ -303,6 +304,8 @@ watch 触发
   `X-Gofer-Token` / `X-Agent-Token` / `Authorization: Bearer`，`/health` 始终公开。
   Gofer callback 可用 `agent_token` 校验（best-effort，不参与健康）。
 - 不要把 8787 直接暴露公网；小程序公网 API 需要单独的鉴权/HTTPS/备案域名。
+- 可选 `TT_PUBLIC_URL` 指定对外面板地址（Tailscale / 反代）；iGlance 的
+  `urls.display` / `urls.panel` 会基于它生成，默认回退到本地监听地址。
 - Docker 只发布到宿主机 localhost。
 - SQLite 单实例 + WAL；多实例请换 Postgres。
 - launchd 模板：`rs/deploy/launchd/com.kuicao.ticket-tracker.plist`。
@@ -317,8 +320,8 @@ watch 触发
 - 下载后强制校验 SHA256；校验通过才替换当前二进制，并保留 `.bak`。
 - 发版：
   ```bash
-  git tag v4.4.0
-  git push origin v4.4.0
+  git tag v4.5.0
+  git push origin v4.5.0
   ```
   `.github/workflows/release.yml` 会构建 macOS x86_64/aarch64 二进制、生成
   `SHA256SUMS` 并发布 Release。
