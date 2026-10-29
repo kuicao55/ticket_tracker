@@ -72,14 +72,34 @@ pub struct AppState {
     pub lock_inflight: StdMutex<HashMap<String, f64>>,
     /// `/api/v1/service/stop` 已受理；避免重复触发退出。
     pub stopping: AtomicBool,
+    /// 面板登录状态；`None` 表示看守关闭（库/测试用，正式服务始终启用）。
+    pub auth: Option<crate::auth::AuthState>,
 }
 
 impl AppState {
+    /// 库/测试用：不启用面板登录。
     pub fn new(db: Db) -> Arc<Self> {
         Self::with_bind(db, default_bind())
     }
 
     pub fn with_bind(db: Db, bind: impl Into<String>) -> Arc<Self> {
+        Self::build(db, bind, None)
+    }
+
+    /// 正式服务 / 登录测试用。
+    pub fn with_bind_auth(
+        db: Db,
+        bind: impl Into<String>,
+        auth: crate::auth::AuthState,
+    ) -> Arc<Self> {
+        Self::build(db, bind, Some(auth))
+    }
+
+    pub fn new_with_auth(db: Db, auth: crate::auth::AuthState) -> Arc<Self> {
+        Self::build(db, default_bind(), Some(auth))
+    }
+
+    fn build(db: Db, bind: impl Into<String>, auth: Option<crate::auth::AuthState>) -> Arc<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(3))
@@ -101,6 +121,7 @@ impl AppState {
             wake: tokio::sync::Notify::new(),
             lock_inflight: StdMutex::new(HashMap::new()),
             stopping: AtomicBool::new(false),
+            auth,
         })
     }
 
@@ -256,7 +277,10 @@ pub async fn run() -> Result<()> {
     // 单实例锁，避免两个 tt-server 同时轮询。
     let _instance_lock = acquire_instance_lock()?;
 
-    let state = AppState::with_bind(db.clone(), args.bind.clone());
+    let auth = crate::auth::AuthState::load(&db)
+        .await
+        .context("初始化面板登录失败")?;
+    let state = AppState::with_bind_auth(db.clone(), args.bind.clone(), auth);
     // 首次启动时后台预热电影列表，让 Web 弹窗打开就有可选电影。
     spawn_movie_warmup(db.clone());
     if !args.no_monitor {

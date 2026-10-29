@@ -15,12 +15,13 @@
 
 ## 当前版本
 
-**v4.7.0** —— 只保留 v4 服务端：
+**v4.8.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）；watch 渠道可复用 Settings 里的全局绑定
 - iGlance `iglance.service.v1` 服务绑定（状态 / 内存 / 暂停 / 恢复 / 停止 / 一键打开面板）
 - Release 二进制内置 Web 资产，可扁平安装（`tt-server` + `start-ticket-tracker.sh`）
+- Web 面板密码登录：首次升级引导 `/setup` 设密，Argon2 哈希 + 会话 Cookie
 - 每 watch 独立通知渠道参数
 - 今日 Poll 健康图
 - 监控暂停 / 恢复开关
@@ -115,8 +116,8 @@ SHA256SUMS
 发版：
 
 ```bash
-git tag v4.7.0
-git push origin v4.7.0
+git tag v4.8.0
+git push origin v4.8.0
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -148,6 +149,20 @@ cargo build --release
 - `/users`：用户与订阅。
 - `/settings`：检查间隔、静默窗口、Discord 健康告警、Gofer 地址/token、渠道默认值、影院城市。
 
+### 面板登录
+
+- 首次启动或从旧版本升级后，访问 `/` 会跳到 `/setup` 创建面板密码（至少 8 个字符）。
+  密码用 Argon2 哈希，只新增 `settings` 表里的 `panel.password_hash` /
+  `panel.session_secret` 两行，不改表结构、不影响现有 watch / 数据库数据。
+- 之后通过 `/login` 登录，会话 Cookie `tt_session` 有效期 7 天，
+  `HttpOnly` + `SameSite=Strict`；右上角「退出」可清除会话。
+- 忘记密码：设置 `TT_ADMIN_PASSWORD`（至少 8 个字符）后重启一次，
+  新密码会写回数据库并让旧会话失效；之后可移除该环境变量。
+- 登录只保护 Web 面板。`/health`、`/static/*`、`/api/v1/*` 保持公开，
+  方便 iGlance、Gofer 回调和外部脚本继续工作。
+- 通过 HTTPS / 反向代理访问时，设置 `TT_PUBLIC_URL=https://...` 或
+  `TT_COOKIE_SECURE=true`，让会话 Cookie 带上 `Secure`。
+
 ---
 
 ## 配置
@@ -175,6 +190,8 @@ cargo build --release
 | `TT_UPDATE_TOKEN` | 可选；GitHub 只读 token，避免限流 |
 | `TT_UPDATE_API_BASE` | 可选；测试/镜像 API 地址 |
 | `TT_SERVICE_TOKEN` | 可选；覆盖 `panel_token` 作为服务接口 token（不写日志） |
+| `TT_ADMIN_PASSWORD` | 可选；重置面板登录密码（至少 8 字符，写入数据库后失效） |
+| `TT_COOKIE_SECURE` | `true` / `1` 时会话 Cookie 带 `Secure`（HTTPS 反代时使用） |
 | `TT_PUBLIC_URL` | 可选；对外面板地址（如 Tailscale / 反代），用于 `urls.display` / `urls.panel` |
 | `TT_START_COMMAND` | 可选；覆盖 `controls.start` 返回的启动命令 |
 | `TT_START_SCRIPT` | 可选；指定启动脚本路径 |
@@ -488,6 +505,8 @@ tail -f ~/.local/state/gofer/gofer.log
 ## 安全
 
 - 默认只监听 `127.0.0.1`；远程访问用 SSH 隧道。
+- Web 面板现在需要密码登录；首次升级后访问 `/setup` 创建。密码与 API token 相互独立。
+- `/api/v1/*` 仍保持原有公开行为（`/api/v1/service*` 可选 `panel_token`），不要把 8787 直接暴露公网。
 - Gofer 的 `agent_token` 与 Gofer 的 `GOFER_TOKEN` 必须一致；token 泄露等于交出本机通知/锁票能力。
 - 不要把 8787 / 8790 直接暴露公网。
 - 锁票是真锁，生产 watch 的 `auto_lock` 请谨慎开启。

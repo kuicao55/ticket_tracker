@@ -65,11 +65,39 @@ async fn bundled_panel_works_without_repo_or_web_dir() {
         .unwrap();
     let mut guard = KillOnDrop(child);
 
-    let client = reqwest::Client::new();
+    // 新库首次访问会进入 /setup；不自动跟随重定向以捕获 Set-Cookie。
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
     // 通过 guard 访问子进程做健康轮询；KillOnDrop 仍负责最终清理。
     wait_for_health(&client, &base, &mut guard.0, &logs).await;
 
-    let panel = client.get(format!("{base}/")).send().await.unwrap();
+    let setup = client
+        .post(format!("{base}/setup"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("password=flat-install-pass&confirm=flat-install-pass")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(setup.status(), reqwest::StatusCode::SEE_OTHER);
+    let cookie = setup
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+
+    let panel = client
+        .get(format!("{base}/"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
     assert_eq!(panel.status(), reqwest::StatusCode::OK);
     assert!(panel
         .headers()

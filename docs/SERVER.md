@@ -173,7 +173,10 @@ SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/health` | 公开健康检查（iGlance 使用） |
-| GET | `/` | Web 面板（iGlance 通过 `endpoints.panel` / `urls.panel` 打开） |
+| GET | `/` | Web 面板（需要登录；iGlance 通过 `endpoints.panel` / `urls.panel` 打开） |
+| GET/POST | `/setup` | 首次升级创建面板密码 |
+| GET/POST | `/login` | 面板登录 |
+| POST | `/logout` | 退出面板会话 |
 | GET | `/api/v1/health` | uptime、last/next poll、paused、fetch ok/err、DB、delivery |
 | GET | `/api/v1/service` | iGlance `iglance.service.v1` 状态 + 内存 + controls（`/v1/service` 同义） |
 | GET | `/api/v1/service/memory` | 仅内存快照 |
@@ -300,6 +303,8 @@ watch 触发
 ## 10. 安全与部署
 
 - 默认只绑定 `127.0.0.1`；远程请用 SSH 隧道或 Tailscale。
+- Web 面板需要密码登录（Argon2 哈希 + HMAC 会话 Cookie）。首次升级后访问 `/setup` 创建密码；
+  密码哈希和 session secret 只写入现有 `settings` 表的新 key，不改旧数据。
 - 业务 API 尚未内置鉴权；`/api/v1/service*` 在设置 `panel_token`（或 `TT_SERVICE_TOKEN`）后要求
   `X-Gofer-Token` / `X-Agent-Token` / `Authorization: Bearer`，`/health` 始终公开。
   Gofer callback 可用 `agent_token` 校验（best-effort，不参与健康）。
@@ -321,8 +326,8 @@ watch 触发
 - 下载后强制校验 SHA256；校验通过才替换当前二进制，并保留 `.bak`。
 - 发版：
   ```bash
-  git tag v4.7.0
-  git push origin v4.7.0
+  git tag v4.8.0
+  git push origin v4.8.0
   ```
   `.github/workflows/release.yml` 会构建 macOS x86_64/aarch64 二进制、生成
   `SHA256SUMS` 并发布 Release。

@@ -413,6 +413,20 @@ impl Db {
         Ok(())
     }
 
+    /// 仅当 key 不存在时写入；返回 true 表示本次写入成功。
+    /// 用于首次设密，避免并发 setup 覆盖已有密码。
+    pub async fn set_setting_if_absent(&self, key: &str, value: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "INSERT OR IGNORE INTO settings(key, value, updated_at)
+             VALUES (?, ?, datetime('now'))",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn set_settings(&self, pairs: &[(String, String)]) -> Result<()> {
         let mut tx = self.pool.begin().await?;
         for (k, v) in pairs {

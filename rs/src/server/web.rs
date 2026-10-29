@@ -8,7 +8,8 @@ use std::sync::Arc;
 
 use askama::Template;
 use axum::extract::{Form, Path, Query, State};
-use axum::http::HeaderMap;
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
+use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
@@ -18,6 +19,7 @@ use serde_json::{json, Value};
 use tower_http::services::ServeDir;
 
 use super::{now_secs, AppState};
+use crate::auth;
 use crate::db::{ChannelRow, MetricRow, PollHealthRow, Settings, WatchRow};
 use crate::engine::WatchCinemaState;
 use crate::time_spec::{date_from_id, TimeSpec};
@@ -41,7 +43,7 @@ fn web_dir() -> String {
 }
 
 pub fn router(state: Arc<AppState>) -> Router {
-    Router::new()
+    let protected = Router::new()
         .route("/", get(dashboard))
         .route("/watches", get(watches_page))
         .route("/watches/new", get(new_watch_page))
@@ -74,6 +76,16 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/actions/channels/:cid/test", post(action_test_channel))
         .route("/actions/channels/:cid/config", post(action_channel_config))
         .route("/actions/users", post(action_create_user))
+        .route("/logout", post(logout))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_panel,
+        ));
+
+    Router::new()
+        .merge(protected)
+        .route("/login", get(login_page).post(login_submit))
+        .route("/setup", get(setup_page).post(setup_submit))
         .nest_service("/static", ServeDir::new(web_dir()))
         .with_state(state)
 }
@@ -388,6 +400,22 @@ struct UpdateResultTemplate {
     ok: bool,
     title: String,
     message: String,
+}
+
+#[derive(Template)]
+#[template(path = "login.html")]
+struct LoginTemplate {
+    version: String,
+    now: String,
+    error: String,
+}
+
+#[derive(Template)]
+#[template(path = "setup.html")]
+struct SetupTemplate {
+    version: String,
+    now: String,
+    error: String,
 }
 
 #[derive(Template)]
@@ -1526,6 +1554,219 @@ async fn users_page(State(st): State<Arc<AppState>>) -> Response {
         users,
     };
     render(&t).into_response()
+}
+
+// ------------------------- 面板登录 -------------------------
+
+fn no_store(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
+fn render_no_store<T: Template>(t: &T) -> Response {
+    no_store(render(t).into_response())
+}
+
+fn render_no_store_status<T: Template>(t: &T, status: StatusCode) -> Response {
+    let mut response = render(t).into_response();
+    *response.status_mut() = status;
+    no_store(response)
+}
+
+fn session_redirect(cookie: String, location: &str) -> Response {
+    let mut response = Redirect::to(location).into_response();
+    if let Ok(value) = HeaderValue::from_str(&cookie) {
+        response.headers_mut().insert(header::SET_COOKIE, value);
+    }
+    no_store(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct SetupForm {
+    password: String,
+    confirm: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginForm {
+    password: String,
+}
+
+async fn setup_page(State(st): State<Arc<AppState>>) -> Response {
+    let Some(auth) = st.auth.as_ref() else {
+        return Redirect::to("/").into_response();
+    };
+    if auth.has_admin_password() {
+        return Redirect::to("/login").into_response();
+    }
+    let (version, now) = meta();
+    render_no_store(&SetupTemplate {
+        version,
+        now,
+        error: String::new(),
+    })
+}
+
+async fn setup_submit(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<SetupForm>,
+) -> Response {
+    let Some(auth_state) = st.auth.as_ref() else {
+        return Redirect::to("/").into_response();
+    };
+    if !auth::same_origin_ok(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+    }
+    if auth_state.has_admin_password() {
+        return Redirect::to("/login").into_response();
+    }
+
+    let len = form.password.chars().count();
+    let error = if len < 8 {
+        "面板密码至少需要 8 个字符"
+    } else if len > 256 {
+        "面板密码过长"
+    } else if form.password != form.confirm {
+        "两次输入的密码不一致"
+    } else {
+        ""
+    };
+    if !error.is_empty() {
+        let (version, now) = meta();
+        return render_no_store_status(
+            &SetupTemplate {
+                version,
+                now,
+                error: error.into(),
+            },
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    let _guard = auth_state.setup_lock.lock().await;
+    if auth_state.has_admin_password() {
+        return Redirect::to("/login").into_response();
+    }
+
+    let hash = match auth::hash_password_async(form.password).await {
+        Ok(hash) => hash,
+        Err(e) => {
+            let (version, now) = meta();
+            return render_no_store_status(
+                &SetupTemplate {
+                    version,
+                    now,
+                    error: format!("创建面板密码失败: {e}"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    };
+
+    match st
+        .db
+        .set_setting_if_absent(auth::ADMIN_HASH_KEY, &hash)
+        .await
+    {
+        Ok(true) => {}
+        Ok(false) => return Redirect::to("/login").into_response(),
+        Err(e) => {
+            let (version, now) = meta();
+            return render_no_store_status(
+                &SetupTemplate {
+                    version,
+                    now,
+                    error: format!("保存面板密码失败: {e}"),
+                },
+                StatusCode::INTERNAL_SERVER_ERROR,
+            );
+        }
+    }
+
+    auth_state.set_admin_hash(Some(hash));
+    let secret = auth_state.rotate_session_secret();
+    if let Err(e) = st
+        .db
+        .set_setting(auth::SESSION_SECRET_KEY, &auth::hex_encode(&secret))
+        .await
+    {
+        tracing::warn!("持久化 panel session secret 失败: {e}");
+    }
+
+    let cookie = auth::session_cookie(&auth_state.issue_session(), auth_state.cookie_secure());
+    session_redirect(cookie, "/")
+}
+
+async fn login_page(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    let Some(auth_state) = st.auth.as_ref() else {
+        return Redirect::to("/").into_response();
+    };
+    if auth::session_from_headers(&headers).is_some_and(|value| auth_state.valid_session(&value)) {
+        return Redirect::to("/").into_response();
+    }
+    if !auth_state.has_admin_password() {
+        return Redirect::to("/setup").into_response();
+    }
+    let (version, now) = meta();
+    render_no_store(&LoginTemplate {
+        version,
+        now,
+        error: String::new(),
+    })
+}
+
+async fn login_submit(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Form(form): Form<LoginForm>,
+) -> Response {
+    let Some(auth_state) = st.auth.as_ref() else {
+        return Redirect::to("/").into_response();
+    };
+    if !auth::same_origin_ok(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+    }
+    if !auth_state.has_admin_password() {
+        return Redirect::to("/setup").into_response();
+    }
+    if form.password.is_empty() {
+        let (version, now) = meta();
+        return render_no_store_status(
+            &LoginTemplate {
+                version,
+                now,
+                error: "请输入面板密码".into(),
+            },
+            StatusCode::BAD_REQUEST,
+        );
+    }
+
+    if auth_state.verify_admin_password(form.password).await {
+        let cookie = auth::session_cookie(&auth_state.issue_session(), auth_state.cookie_secure());
+        session_redirect(cookie, "/")
+    } else {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let (version, now) = meta();
+        render_no_store_status(
+            &LoginTemplate {
+                version,
+                now,
+                error: "密码错误".into(),
+            },
+            StatusCode::UNAUTHORIZED,
+        )
+    }
+}
+
+async fn logout(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if !auth::same_origin_ok(&headers) {
+        return (StatusCode::FORBIDDEN, "cross-origin request").into_response();
+    }
+    let secure = st.auth.as_ref().map(|a| a.cookie_secure()).unwrap_or(false);
+    session_redirect(auth::clear_session_cookie(secure), "/login")
 }
 
 async fn settings_page(State(st): State<Arc<AppState>>) -> Response {

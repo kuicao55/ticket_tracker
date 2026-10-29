@@ -26,6 +26,9 @@
       <div class="topbar-meta">
         <span class="mono">v{{ version }}</span>
         <span class="mono muted">{{ now }}</span>
+        <form method="post" action="/logout" style="margin:0">
+          <button class="btn ghost small" type="submit">退出</button>
+        </form>
       </div>
     </header>
     {% block content %}{% endblock %}
