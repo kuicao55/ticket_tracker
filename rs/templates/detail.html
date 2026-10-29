@@ -130,13 +130,32 @@
             {% endif %}
 
             {% if ch.local %}
-            <div class="form-grid" style="margin-top:12px">
+            <div class="form-field" style="margin-top:12px">
+              <label>Gofer 来源</label>
+              <label style="display:block; margin-top:6px">
+                <input type="radio" name="agent_source" value="global"
+                       {% if ch.agent_source == "global" %}checked{% endif %}
+                       onchange="var b=document.getElementById('agent-custom-{{ ch.id }}'),u=document.getElementById('agent-url-{{ ch.id }}'); b.style.display='none'; if(u)u.required=false;">
+                使用设置里的全局 Gofer
+              </label>
+              <p class="form-note" style="margin:4px 0 8px 22px">当前全局：<span class="mono">{{ ch.global_agent_url }}</span>{% if !ch.global_agent_token_set %} · token 未配置{% endif %}</p>
+              <label style="display:block">
+                <input type="radio" name="agent_source" value="custom"
+                       {% if ch.agent_source == "custom" %}checked{% endif %}
+                       onchange="var b=document.getElementById('agent-custom-{{ ch.id }}'),u=document.getElementById('agent-url-{{ ch.id }}'); b.style.display='grid'; if(u)u.required=true;">
+                手动填写 Gofer
+              </label>
+            </div>
+            <div id="agent-custom-{{ ch.id }}" class="form-grid"
+                 style="margin-top:12px; display:{% if ch.agent_source == "custom" %}grid{% else %}none{% endif %};">
               <div class="form-field">
-                <label>Gofer 地址（留空=全局）</label>
-                <input class="input mono" name="agent_url" value="{{ ch.agent_url }}" placeholder="http://127.0.0.1:8790">
+                <label>Gofer 地址</label>
+                <input class="input mono" id="agent-url-{{ ch.id }}" name="agent_url"
+                       value="{{ ch.agent_url }}" placeholder="http://127.0.0.1:8790"
+                       {% if ch.agent_source == "custom" %}required{% endif %}>
               </div>
               <div class="form-field">
-                <label>Gofer token（留空=全局）</label>
+                <label>Gofer token</label>
                 <input class="input mono" name="agent_token" value="{{ ch.agent_token }}" placeholder="可选">
               </div>
             </div>

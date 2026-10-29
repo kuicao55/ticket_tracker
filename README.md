@@ -15,10 +15,10 @@
 
 ## 当前版本
 
-**v4.6.0** —— 只保留 v4 服务端：
+**v4.7.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
-- 外部 Gofer：微信 / 小红书 / 锁票（独立项目）
+- 外部 Gofer：微信 / 小红书 / 锁票（独立项目）；watch 渠道可复用 Settings 里的全局绑定
 - iGlance `iglance.service.v1` 服务绑定（状态 / 内存 / 暂停 / 恢复 / 停止 / 一键打开面板）
 - Release 二进制内置 Web 资产，可扁平安装（`tt-server` + `start-ticket-tracker.sh`）
 - 每 watch 独立通知渠道参数
@@ -39,6 +39,7 @@
   - 小红书：群名
   - 微信：发到当前打开的会话
   - 自动锁票：票数 / 重试 / 座位
+  - 微信 / 小红书 / 自动锁票的 Gofer：可复用 Settings 里的全局 Gofer，也可单独填写地址和 token
 - **服务开关**：Dashboard 顶部暂停/恢复监控；暂停期间面板在线，不轮询、不通知、不锁票。
 - **投递解耦**：监控不探活 Gofer / 微信 / 小红书；Gofer 离线只记录一条投递失败，不影响监控健康。
 - **Docker**：主服务可容器化；Gofer 因 GUI 依赖必须原生运行在 Mac 上。
@@ -114,8 +115,8 @@ SHA256SUMS
 发版：
 
 ```bash
-git tag v4.6.0
-git push origin v4.6.0
+git tag v4.7.0
+git push origin v4.7.0
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -159,8 +160,8 @@ cargo build --release
 | `silent_window` | 静默时段，如 `01:00-06:00` | `01:00-06:00` |
 | `fetch_concurrency` | 影院抓取并发 | `8` |
 | `discord_webhook` | 健康告警 webhook | 空 |
-| `agent_url` | Gofer 地址 | `http://127.0.0.1:8790` |
-| `agent_token` | Gofer token | 空 |
+| `agent_url` | 全局 Gofer 地址（watch 可复用） | `http://127.0.0.1:8790` |
+| `agent_token` | 全局 Gofer token（watch 可复用） | 空 |
 | `panel_token` | iGlance / 服务接口 token（空则不鉴权；可用 `TT_SERVICE_TOKEN` 覆盖） | 空 |
 | `lock_headless` | 锁票默认 headless | `true` |
 | `maoyan_city_id` | 影院搜索城市 | `10` |

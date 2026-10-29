@@ -286,3 +286,126 @@ async fn monitor_toggle_pauses_and_resumes() {
         Some("true")
     );
 }
+
+#[tokio::test]
+async fn watch_local_channel_can_reuse_global_gofer() {
+    let db = Db::connect_memory().await.unwrap();
+    db.set_setting("agent_url", "http://global-gofer:8790")
+        .await
+        .unwrap();
+    db.set_setting("agent_token", "global-token").await.unwrap();
+    let state: Arc<AppState> = AppState::new(db.clone());
+    let app = api::router(state.clone()).merge(web::router(state.clone()));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/watches")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "movie_id": 11, "movie_name": "Gofer 复用测试",
+                        "cinemas": ["2"], "time": "all"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let wid = v["watch_id"].as_str().unwrap().to_string();
+
+    let post_config = |body: &'static str| {
+        let app = app.clone();
+        let wid = wid.clone();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/actions/watches/{wid}/channels/wechat-local/config"
+                    ))
+                    .header("content-type", "application/x-www-form-urlencoded")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // 选择全局时，即使表单里残留自定义地址/ token，也不能写进 watch。
+    let resp = post_config(
+        "agent_source=global&agent_url=http%3A%2F%2Fshould-not-save%3A9999&agent_token=ignored",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cfg = db.watch_channel_config(&wid, "wechat-local").await.unwrap();
+    assert!(cfg.get("agent_url").is_none(), "global must not store URL");
+    assert!(
+        cfg.get("agent_token").is_none(),
+        "global must not store token"
+    );
+
+    let html = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/watches/{wid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    let html = String::from_utf8(html).unwrap();
+    assert!(html.contains("使用设置里的全局 Gofer"));
+    assert!(html.contains("http://global-gofer:8790"));
+    assert!(html.contains("Gofer 全局"));
+
+    // 手动填写时保存到该 watch 自己的配置。
+    let resp = post_config(
+        "agent_source=custom&agent_url=http%3A%2F%2Fcustom-gofer%3A9999&agent_token=custom-token",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cfg = db.watch_channel_config(&wid, "wechat-local").await.unwrap();
+    assert_eq!(cfg["agent_url"], "http://custom-gofer:9999");
+    assert_eq!(cfg["agent_token"], "custom-token");
+
+    let html = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/watches/{wid}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .into_body()
+        .collect()
+        .await
+        .unwrap()
+        .to_bytes()
+        .to_vec();
+    let html = String::from_utf8(html).unwrap();
+    assert!(html.contains("Gofer 自定义"));
+    assert!(html.contains("http://custom-gofer:9999"));
+
+    // 再切回全局会清掉该 watch 的自定义配置。
+    let resp = post_config("agent_source=global").await;
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+    let cfg = db.watch_channel_config(&wid, "wechat-local").await.unwrap();
+    assert!(cfg.get("agent_url").is_none());
+    assert!(cfg.get("agent_token").is_none());
+}

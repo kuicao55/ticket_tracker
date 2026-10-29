@@ -34,7 +34,7 @@
             <input class="input mono" id="discord_webhook" name="discord_webhook" value="{{ discord_webhook }}" placeholder="https://discord.com/api/webhooks/...">
           </div>
           <div class="form-field">
-            <label for="agent_url">Gofer URL</label>
+            <label for="agent_url">Gofer URL（watch 可复用）</label>
             <input class="input mono" id="agent_url" name="agent_url" value="{{ agent_url }}">
           </div>
           <div class="form-field">
@@ -42,7 +42,7 @@
             <input class="input mono" id="maoyan_city_id" name="maoyan_city_id" type="number" min="1" value="{{ maoyan_city_id }}">
           </div>
           <div class="form-field">
-            <label for="agent_token">Gofer token</label>
+            <label for="agent_token">Gofer token（watch 可复用）</label>
             <input class="input mono" id="agent_token" name="agent_token" value="{{ agent_token }}">
           </div>
           <div class="form-field">
@@ -78,12 +78,13 @@
 
     <div class="card" id="agent">
       <div class="card-head">
-        <div><p class="eyebrow">Delivery</p><h2>外部 Gofer</h2></div>
+        <div><p class="eyebrow">Delivery</p><h2>外部 Gofer（全局）</h2></div>
         <span class="badge flat">不探活</span>
       </div>
       <div class="health-row"><span class="health-key">地址</span><span class="health-val mono">{{ agent_url }}</span></div>
       <div class="health-row"><span class="health-key">Token</span><span class="health-val">{% if agent_token != "" %}已配置{% else %}—{% endif %}</span></div>
-      <p class="form-note" style="margin-top:14px">主服务只负责向 Gofer POST <span class="mono">/notify</span> 和 <span class="mono">/lock</span>。不检查 Gofer / 微信 / 小红书状态，Gofer 离线不会触发健康异常。</p>
+      <p class="form-note" style="margin-top:14px">watch 详情页的微信 / 小红书 / 自动锁票渠道可以直接选择「使用设置里的全局 Gofer」，也可以单独填自定义地址。</p>
+      <p class="form-note" style="margin-top:8px">主服务只负责向 Gofer POST <span class="mono">/notify</span> 和 <span class="mono">/lock</span>。不检查 Gofer / 微信 / 小红书状态，Gofer 离线不会触发健康异常。</p>
       <p class="form-note" style="margin-top:8px">Gofer 面板通常在同一地址：<span class="mono">{{ agent_url }}</span>。</p>
     </div>
   </section>

@@ -224,6 +224,10 @@ pub struct ChannelView {
     pub group: String,
     pub agent_url: String,
     pub agent_token: String,
+    /// `global` = 复用 Settings 里的 Gofer；`custom` = 使用本 watch 的地址。
+    pub agent_source: String,
+    pub global_agent_url: String,
+    pub global_agent_token_set: bool,
     pub lock_num_seats: String,
     pub lock_max_retries: String,
     pub lock_seats_text: String,
@@ -1163,6 +1167,8 @@ fn channel_views(
     linked: &HashSet<String>,
     bindings: &HashMap<String, Value>,
     watch: &WatchRow,
+    global_agent_url: &str,
+    global_agent_token_set: bool,
 ) -> Vec<ChannelView> {
     all.iter()
         .map(|ch| {
@@ -1178,6 +1184,20 @@ fn channel_views(
             let to = cfg_str(&cfg, "to");
             let agent_url = cfg_str(&cfg, "agent_url");
             let agent_token = cfg_str(&cfg, "agent_token");
+            let agent_source = if agent_url.is_empty() {
+                "global"
+            } else {
+                "custom"
+            };
+            let gofer_note = if local {
+                if agent_url.is_empty() {
+                    "Gofer 全局"
+                } else {
+                    "Gofer 自定义"
+                }
+            } else {
+                ""
+            };
             let lock_num_seats = cfg
                 .get("lock_num_seats")
                 .and_then(|v| v.as_i64())
@@ -1233,17 +1253,20 @@ fn channel_views(
                 }
                 "xhs_local" => {
                     if group.is_empty() {
-                        "群：未配置".into()
+                        format!("群：未配置 · {}", gofer_note)
                     } else {
-                        format!("群：{}", group)
+                        format!("群：{} · {}", group, gofer_note)
                     }
                 }
-                "wechat_local" => "发到当前打开的微信会话".into(),
+                "wechat_local" => format!("发到当前打开的微信会话 · {}", gofer_note),
                 "autolock" => {
                     if on {
-                        format!("{} 座 · 重试 {}", lock_num_seats, lock_max_retries)
+                        format!(
+                            "{} 座 · 重试 {} · {}",
+                            lock_num_seats, lock_max_retries, gofer_note
+                        )
                     } else {
-                        "开启后命中即真锁".into()
+                        format!("开启后命中即真锁 · {}", gofer_note)
                     }
                 }
                 "wechat_miniprogram" => "微信订阅消息（本期未启用）".into(),
@@ -1267,6 +1290,9 @@ fn channel_views(
                 group,
                 agent_url,
                 agent_token,
+                agent_source: agent_source.into(),
+                global_agent_url: global_agent_url.to_string(),
+                global_agent_token_set,
                 lock_num_seats,
                 lock_max_retries,
                 lock_seats_text,
@@ -1282,10 +1308,16 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
         .await?
         .ok_or_else(|| anyhow::anyhow!("watch 不存在"))?;
     let (version, now) = meta();
-    let city_id = Settings::load(&st.db)
-        .await
-        .map(|s| s.maoyan_city_id)
-        .unwrap_or(10);
+    let settings = Settings::load(&st.db).await.ok();
+    let city_id = settings.as_ref().map(|s| s.maoyan_city_id).unwrap_or(10);
+    let global_agent_url = settings
+        .as_ref()
+        .map(|s| s.agent_url.clone())
+        .unwrap_or_else(|| crate::db::DEFAULT_AGENT_URL.to_string());
+    let global_agent_token_set = settings
+        .as_ref()
+        .and_then(|s| s.agent_token.as_ref())
+        .is_some();
     let status = st.watch_status_snapshot();
     let stt = status.get(id);
     let (status_text, status_class) = watch_status_text(stt, w.enabled);
@@ -1332,7 +1364,14 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
         .map(|c| c.id)
         .collect();
     let bindings = st.db.watch_channel_bindings(id).await?;
-    let channels = channel_views(&all_channels, &linked, &bindings, &w);
+    let channels = channel_views(
+        &all_channels,
+        &linked,
+        &bindings,
+        &w,
+        &global_agent_url,
+        global_agent_token_set,
+    );
 
     let subscribers = st
         .db
@@ -2083,6 +2122,10 @@ struct WatchChannelConfigForm {
     agent_url: String,
     #[serde(default)]
     agent_token: String,
+    /// `global` = 复用 Settings；`custom` = 使用本 watch 地址。
+    /// 旧表单没有该字段时按 agent_url 是否为空推断。
+    #[serde(default)]
+    agent_source: Option<String>,
     #[serde(default)]
     lock_num_seats: Option<i64>,
     #[serde(default)]
@@ -2103,11 +2146,19 @@ async fn action_watch_channel_config(
     if let Some(obj) = cfg.as_object_mut() {
         let agent_url = f.agent_url.trim();
         let agent_token = f.agent_token.trim();
-        if !agent_url.is_empty() {
-            obj.insert("agent_url".into(), json!(agent_url));
-        }
-        if !agent_token.is_empty() {
-            obj.insert("agent_token".into(), json!(agent_token));
+        let custom_agent = match f.agent_source.as_deref().map(str::trim) {
+            Some("global") => false,
+            Some("custom") => true,
+            // 兼容旧表单 / API：填了地址就视为自定义。
+            _ => !agent_url.is_empty(),
+        };
+        if custom_agent {
+            if !agent_url.is_empty() {
+                obj.insert("agent_url".into(), json!(agent_url));
+            }
+            if !agent_token.is_empty() {
+                obj.insert("agent_token".into(), json!(agent_token));
+            }
         }
         match ch.channel_type.as_str() {
             "discord" | "webhook" => {
