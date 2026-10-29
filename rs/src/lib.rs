@@ -9,6 +9,7 @@
 //! - [`server`] —— axum API + Web 面板 + DB-backed monitor
 //! - [`silent`] / [`time_spec`] / [`paths`] / [`presets`] —— 共享工具
 
+pub mod assets;
 pub mod db;
 pub mod engine;
 pub mod lock;

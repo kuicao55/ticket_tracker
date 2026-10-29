@@ -1,9 +1,349 @@
 #!/usr/bin/env bash
-# 仓库根目录入口 → rs/start-server.sh
+# ticket-tracker 自包含启动入口（Release 二进制 + 本脚本即可运行）。
 #
-# iGlance 绑定可直接使用：
-#   /path/to/ticket_tracker/start-ticket-tracker.sh start --manifest
+# 用法:
+#   ./start-ticket-tracker.sh                 # 后台启动（默认）
+#   ./start-ticket-tracker.sh start --open    # 启动并打开浏览器
+#   ./start-ticket-tracker.sh start --foreground
+#   ./start-ticket-tracker.sh status
+#   ./start-ticket-tracker.sh logs
+#   ./start-ticket-tracker.sh stop
+#   ./start-ticket-tracker.sh restart
+#   ./start-ticket-tracker.sh manifest         # 只打印 iGlance manifest
+#   ./start-ticket-tracker.sh start --manifest # 启动并就绪后打印 manifest
 #
-# 只打印 manifest（不启动服务）：
-#   /path/to/ticket_tracker/start-ticket-tracker.sh manifest
-exec "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/rs/start-server.sh" "$@"
+# 二进制查找顺序:
+#   TT_SERVER_BIN → 同目录 tt-server → 上级目录 tt-server →
+#   target/release/tt-server → Release 资产名 → PATH
+#
+# Web 静态资源默认已编进二进制，启动时释放到
+# ~/.local/state/ticket-tracker/runtime/v<version>/web。
+# 设置 TT_WEB_DIR 可覆盖为外部目录（开发时热改 CSS/JS）。
+#
+# 可用环境变量:
+#   TT_BIND        监听地址，默认 127.0.0.1:8787
+#   TT_DB          SQLite 路径，默认 ~/.local/state/ticket-tracker/ticket-tracker.db
+#   TT_SERVER_BIN  指定二进制路径
+#   TT_WEB_DIR     外部 Web 资源目录（可选）
+#   TT_PID_FILE    脚本 pid 文件
+#   TT_LOG_FILE    日志文件
+
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+
+STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+STATE_DIR="$STATE_HOME/ticket-tracker"
+BIND="${TT_BIND:-127.0.0.1:8787}"
+DB="${TT_DB:-$STATE_DIR/ticket-tracker.db}"
+PID_FILE="${TT_PID_FILE:-$STATE_DIR/tt-server.pid}"
+LOG_FILE="${TT_LOG_FILE:-$STATE_DIR/tt-server.log}"
+
+# 仓库布局（cargo build 时需要）；扁平安装时为空。
+CARGO_DIR=""
+if [ -f "$ROOT/Cargo.toml" ]; then
+  CARGO_DIR="$ROOT"
+elif [ -f "$ROOT/rs/Cargo.toml" ]; then
+  CARGO_DIR="$ROOT/rs"
+fi
+
+# Web 目录：显式 TT_WEB_DIR 优先；仓库开发时用源码目录；
+# 都没有时不传，二进制会释放内置资源。
+WEB_DIR=""
+WEB_DIR_EXPLICIT=0
+if [ -n "${TT_WEB_DIR:-}" ]; then
+  WEB_DIR="$TT_WEB_DIR"
+  WEB_DIR_EXPLICIT=1
+elif [ -d "$ROOT/web" ]; then
+  WEB_DIR="$ROOT/web"
+elif [ -d "$ROOT/../web" ]; then
+  WEB_DIR="$ROOT/../web"
+elif [ -d "$ROOT/rs/web" ]; then
+  WEB_DIR="$ROOT/rs/web"
+fi
+
+mkdir -p "$(dirname "$PID_FILE")" "$(dirname "$DB")" "$(dirname "$LOG_FILE")"
+
+HOST="${BIND%:*}"
+PORT="${BIND##*:}"
+case "$HOST" in
+  0.0.0.0|::|"[::]"|"") DISPLAY_HOST="127.0.0.1" ;;
+  *) DISPLAY_HOST="$HOST" ;;
+esac
+URL="http://${DISPLAY_HOST}:${PORT}"
+
+CMD="${1:-start}"
+shift || true
+OPEN=0
+FOREGROUND=0
+FORCE_BUILD=0
+PRINT_MANIFEST=0
+for arg in "$@"; do
+  case "$arg" in
+    --open) OPEN=1 ;;
+    --foreground) FOREGROUND=1 ;;
+    --build) FORCE_BUILD=1 ;;
+    --manifest) PRINT_MANIFEST=1 ;;
+    -h|--help|help) CMD="help" ;;
+    *) echo "未知参数: $arg" >&2; CMD="help" ;;
+  esac
+done
+
+usage() {
+  cat <<'USAGE'
+用法: ./start-ticket-tracker.sh [start|stop|restart|status|logs|manifest|open]
+                                [--open] [--foreground] [--build] [--manifest]
+
+  start        后台启动主服务（默认）
+  stop         停止主服务
+  restart      重启
+  status       查看 pid / health
+  logs         实时跟踪日志
+  manifest     只打印 iGlance manifest（不启动服务）
+  open         在浏览器打开面板
+
+  start --manifest  就绪后输出 IGLANCE_SERVICE_MANIFEST 行，供 iGlance 绑定
+
+环境变量:
+  TT_BIND=127.0.0.1:8787
+  TT_DB=~/.local/state/ticket-tracker/ticket-tracker.db
+  TT_SERVER_BIN=/path/to/tt-server
+  TT_WEB_DIR=/path/to/web        # 可选，开发时覆盖内置资源
+USAGE
+}
+
+resolve_bin() {
+  BIN=""
+  if [ -n "${TT_SERVER_BIN:-}" ] && [ -x "$TT_SERVER_BIN" ]; then
+    BIN="$TT_SERVER_BIN"
+    return 0
+  fi
+
+  local arch candidate
+  arch="$(uname -m 2>/dev/null || echo unknown)"
+  case "$arch" in
+    arm64|aarch64) arch="aarch64" ;;
+    x86_64|amd64) arch="x86_64" ;;
+  esac
+
+  # 顺序：同目录 → 上级目录 → target/release → 仓库 target → Release 资产名
+  for candidate in \
+    "$ROOT/tt-server" \
+    "$ROOT/../tt-server" \
+    "$ROOT/target/release/tt-server" \
+    "$ROOT/rs/target/release/tt-server" \
+    "$ROOT/tt-server-$arch-apple-darwin" \
+    "$ROOT/tt-server-aarch64-apple-darwin" \
+    "$ROOT/tt-server-x86_64-apple-darwin"
+  do
+    if [ -x "$candidate" ]; then
+      BIN="$candidate"
+      return 0
+    fi
+  done
+
+  if command -v tt-server >/dev/null 2>&1; then
+    BIN="$(command -v tt-server)"
+    return 0
+  fi
+
+  BIN="$ROOT/tt-server"
+}
+
+fallback_manifest() {
+  local version="0.0.0"
+  if [ -n "$CARGO_DIR" ] && [ -f "$CARGO_DIR/Cargo.toml" ]; then
+    version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$CARGO_DIR/Cargo.toml" 2>/dev/null | head -n1)"
+    [ -n "$version" ] || version="0.0.0"
+  fi
+  printf 'IGLANCE_SERVICE_MANIFEST {"schema":"iglance.service.v1","service":{"id":"ticket_tracker","name":"Ticket Tracker","version":"%s"},"base_url":"%s","auth":{"type":"header","header":"X-Gofer-Token"},"endpoints":{"health":"/health","panel":"/","status":"/api/v1/service","memory":"/api/v1/service/memory","pause":"/api/v1/service/pause","resume":"/api/v1/service/resume","toggle":"/api/v1/service/toggle","stop":"/api/v1/service/stop"}}\n' "$version" "$URL"
+}
+
+print_manifest() {
+  resolve_bin
+  local payload
+  if [ -x "$BIN" ] && payload="$("$BIN" manifest --base-url "$URL" 2>/dev/null)" && [ -n "$payload" ]; then
+    printf '%s\n' "$payload"
+  else
+    # 二进制缺失或较旧时仍给出可用 manifest。
+    fallback_manifest
+  fi
+}
+
+build_if_needed() {
+  resolve_bin
+  if [ "$FORCE_BUILD" = "1" ] || [ ! -x "$BIN" ]; then
+    if [ -z "$CARGO_DIR" ]; then
+      echo "✗ 找不到可执行的 tt-server（目录：$ROOT）" >&2
+      echo "  请把 tt-server 放在脚本同目录，或设置 TT_SERVER_BIN。" >&2
+      return 1
+    fi
+    echo "==> 构建 tt-server（release）..."
+    (cd "$CARGO_DIR" && cargo build --release --locked --bin tt-server)
+    BIN="$CARGO_DIR/target/release/tt-server"
+  fi
+}
+
+pid_alive() {
+  local pid="${1:-}"
+  [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null
+}
+
+read_pid() {
+  [ -f "$PID_FILE" ] && tr -d ' \n' < "$PID_FILE" || true
+}
+
+health_ok() {
+  curl -fsS --max-time 1 "$URL/api/v1/health" >/dev/null 2>&1
+}
+
+print_url() {
+  echo ""
+  echo "  Web 面板: $URL"
+  echo "  健康检查: $URL/api/v1/health"
+  echo "  日志:     $LOG_FILE"
+  echo "  停止:     $0 stop"
+  echo ""
+  if [ "$HOST" != "127.0.0.1" ] && [ "$HOST" != "localhost" ]; then
+    echo "  远程访问（在本机执行）："
+    echo "    ssh -L ${PORT}:127.0.0.1:${PORT} user@your-server"
+    echo "    然后打开 http://127.0.0.1:${PORT}"
+    echo ""
+  fi
+}
+
+maybe_open() {
+  [ "$OPEN" = "1" ] || return 0
+  if command -v open >/dev/null 2>&1; then
+    open "$URL"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$URL" >/dev/null 2>&1 &
+  else
+    echo "（未找到 open / xdg-open，请手动打开 ${URL}）"
+  fi
+}
+
+start_server() {
+  local pid
+  pid="$(read_pid)"
+  if pid_alive "$pid"; then
+    echo "✓ tt-server 已在运行 (pid=$pid)"
+    print_url
+    maybe_open
+    [ "$PRINT_MANIFEST" = "1" ] && print_manifest
+    return 0
+  fi
+  if health_ok; then
+    echo "✓ $URL 已经有服务在响应（可能是手动启动的 tt-server）"
+    print_url
+    maybe_open
+    [ "$PRINT_MANIFEST" = "1" ] && print_manifest
+    return 0
+  fi
+
+  build_if_needed
+
+  local envs=(TT_BIND="$BIND" TT_DB="$DB" TT_PID_FILE="$PID_FILE" TT_LOG_FILE="$LOG_FILE")
+  envs+=("TT_CALLBACK_URL=${TT_CALLBACK_URL:-http://${DISPLAY_HOST}:${PORT}/api/v1/agent/lock-result}")
+  if [ -n "$WEB_DIR" ] && { [ "$WEB_DIR_EXPLICIT" = "1" ] || [ -d "$WEB_DIR" ]; }; then
+    envs+=(TT_WEB_DIR="$WEB_DIR")
+  fi
+
+  if [ "$FOREGROUND" = "1" ]; then
+    if [ "$PRINT_MANIFEST" = "1" ]; then
+      echo "✗ --manifest 需要后台启动（前台模式无法在 exec 后继续输出）" >&2
+      return 1
+    fi
+    echo "==> 前台启动：$BIN"
+    echo "    db=$DB  bind=$BIND"
+    exec env "${envs[@]}" "$BIN"
+  fi
+
+  echo "==> 启动 tt-server ..."
+  echo "    bin=$BIN"
+  echo "    db=$DB"
+  echo "    bind=$BIND"
+  nohup env "${envs[@]}" "$BIN" </dev/null >>"$LOG_FILE" 2>&1 &
+  pid=$!
+  echo "$pid" > "$PID_FILE"
+
+  # 健康检查最多等待 10 秒（iGlance 启动超时建议 >= 15 秒）。
+  local deadline=$((SECONDS + 10))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if health_ok; then
+      echo "✓ tt-server 已启动 (pid=$pid)"
+      print_url
+      maybe_open
+      [ "$PRINT_MANIFEST" = "1" ] && print_manifest
+      return 0
+    fi
+    if ! pid_alive "$pid"; then
+      echo "✗ tt-server 启动失败，最近日志：" >&2
+      tail -n 30 "$LOG_FILE" >&2 || true
+      rm -f "$PID_FILE"
+      return 1
+    fi
+    sleep 0.25
+  done
+
+  echo "✗ 启动超时（10s 内 health 未响应），最近日志：" >&2
+  tail -n 30 "$LOG_FILE" >&2 || true
+  return 1
+}
+
+stop_server() {
+  local pid
+  pid="$(read_pid)"
+  if ! pid_alive "$pid"; then
+    echo "tt-server 未运行（清理 stale pid）"
+    rm -f "$PID_FILE"
+    return 0
+  fi
+  echo "==> 停止 tt-server pid=$pid ..."
+  kill -TERM "$pid" 2>/dev/null || true
+  local i
+  for i in $(seq 1 40); do
+    if ! pid_alive "$pid"; then
+      rm -f "$PID_FILE"
+      echo "✓ 已停止"
+      return 0
+    fi
+    sleep 0.25
+  done
+  echo "==> 进程未退出，强制 kill -9"
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$PID_FILE"
+}
+
+status_server() {
+  local pid
+  pid="$(read_pid)"
+  if pid_alive "$pid"; then
+    echo "tt-server 运行中 (pid=$pid)"
+  else
+    echo "tt-server 未运行（pid 文件：${PID_FILE}）"
+  fi
+  if health_ok; then
+    echo "health: $URL/api/v1/health"
+    curl -s "$URL/api/v1/health"
+    echo ""
+  else
+    echo "health: 无响应（$URL/api/v1/health）"
+  fi
+}
+
+case "$CMD" in
+  start) start_server ;;
+  stop) stop_server ;;
+  restart) stop_server; start_server ;;
+  status) status_server ;;
+  manifest) print_manifest ;;
+  logs)
+    [ -f "$LOG_FILE" ] || { echo "日志不存在: $LOG_FILE"; exit 1; }
+    tail -n 100 -f "$LOG_FILE"
+    ;;
+  open) maybe_open ;;
+  help) usage ;;
+  *) usage; exit 1 ;;
+esac

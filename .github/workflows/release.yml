@@ -35,6 +35,8 @@ jobs:
           mkdir -p dist
           cp "rs/target/${{ matrix.target }}/release/tt-server" \
              "dist/tt-server-${{ matrix.target }}"
+          cp start-ticket-tracker.sh dist/start-ticket-tracker.sh
+          chmod +x dist/start-ticket-tracker.sh
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:

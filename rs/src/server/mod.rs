@@ -241,6 +241,8 @@ pub async fn run() -> Result<()> {
     }
 
     init_tracing();
+    // Release 二进制自带 Web 资产；显式 TT_WEB_DIR 时保留外部目录。
+    crate::assets::materialize().context("释放内置 Web 资源失败")?;
     let db_path = if args.db.trim().is_empty() {
         default_db_path()
     } else {

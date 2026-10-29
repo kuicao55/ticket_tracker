@@ -316,12 +316,13 @@ watch 触发
 - Release 资产：
   - `tt-server-aarch64-apple-darwin`
   - `tt-server-x86_64-apple-darwin`
+  - `start-ticket-tracker.sh`
   - `SHA256SUMS`
 - 下载后强制校验 SHA256；校验通过才替换当前二进制，并保留 `.bak`。
 - 发版：
   ```bash
-  git tag v4.5.0
-  git push origin v4.5.0
+  git tag v4.6.0
+  git push origin v4.6.0
   ```
   `.github/workflows/release.yml` 会构建 macOS x86_64/aarch64 二进制、生成
   `SHA256SUMS` 并发布 Release。

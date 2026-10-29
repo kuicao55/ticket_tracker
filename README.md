@@ -15,11 +15,12 @@
 
 ## 当前版本
 
-**v4.5.0** —— 只保留 v4 服务端：
+**v4.6.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）
 - iGlance `iglance.service.v1` 服务绑定（状态 / 内存 / 暂停 / 恢复 / 停止 / 一键打开面板）
+- Release 二进制内置 Web 资产，可扁平安装（`tt-server` + `start-ticket-tracker.sh`）
 - 每 watch 独立通知渠道参数
 - 今日 Poll 健康图
 - 监控暂停 / 恢复开关
@@ -45,6 +46,31 @@
 ---
 
 ## 快速开始
+
+### 新 Mac 安装（Release 二进制，无需 clone 仓库）
+
+Web 静态资源（CSS / JS / favicon）已经编进 `tt-server`，安装只需要两个文件：
+
+```bash
+mkdir -p ~/Services/ticket_tracker
+cd ~/Services/ticket_tracker
+
+# Apple Silicon 用 aarch64；Intel 换成 x86_64
+BASE=https://github.com/kuicao55/ticket_tracker/releases/latest/download
+curl -fL -o tt-server "$BASE/tt-server-aarch64-apple-darwin"
+curl -fL -o start-ticket-tracker.sh "$BASE/start-ticket-tracker.sh"
+chmod +x tt-server start-ticket-tracker.sh
+
+./start-ticket-tracker.sh start --manifest
+# 面板：http://127.0.0.1:8787
+```
+
+- 脚本会自动查找同目录的 `tt-server`，不需要设置 `TT_SERVER_BIN`。
+- 不需要仓库里的 `rs/web`；首次启动会把内置资源释放到
+  `~/.local/state/ticket-tracker/runtime/v<version>/web`，内容相同不会重写。
+- 开发时如需热改 CSS/JS，可显式设置 `TT_WEB_DIR=/path/to/rs/web`。
+- `tt-server` 不带参数运行时默认 serve `127.0.0.1:8787`，数据库默认
+  `~/.local/state/ticket-tracker/ticket-tracker.db`。
 
 ### 1. 编译主服务
 
@@ -81,14 +107,15 @@ macOS 通过 launchd 部署时，更新后由 KeepAlive 拉起新进程；
 ```text
 tt-server-aarch64-apple-darwin
 tt-server-x86_64-apple-darwin
+start-ticket-tracker.sh
 SHA256SUMS
 ```
 
 发版：
 
 ```bash
-git tag v4.5.0
-git push origin v4.5.0
+git tag v4.6.0
+git push origin v4.6.0
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -394,6 +421,7 @@ ticket_tracker/
 │   ├── src/
 │   │   ├── bin/tt-server.rs   # 主服务入口
 │   │   ├── server/            # axum API / Web / DB monitor / dispatcher
+│   │   ├── assets.rs          # include_dir! 内置 Web 资产 + 启动释放
 │   │   ├── db.rs              # SQLite
 │   │   ├── engine.rs          # poll / watch 纯逻辑
 │   │   ├── maoyan.rs          # 猫眼客户端
@@ -412,7 +440,7 @@ ticket_tracker/
 │   ├── SERVER.md
 │   └── assets/
 ├── start-server.sh            # 兼容入口 → rs/start-server.sh
-├── start-ticket-tracker.sh    # iGlance 绑定入口（支持 start --manifest / manifest）
+├── start-ticket-tracker.sh    # 自包含启动入口（扁平安装 / iGlance 绑定）
 └── README.md
 ```
 
