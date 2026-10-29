@@ -17,6 +17,7 @@ pub mod notify;
 pub mod paths;
 pub mod presets;
 pub mod server;
+pub mod service;
 pub mod silent;
 pub mod time_spec;
 pub mod update;

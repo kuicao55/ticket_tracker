@@ -172,7 +172,12 @@ SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/health` | 公开健康检查（iGlance 使用） |
 | GET | `/api/v1/health` | uptime、last/next poll、paused、fetch ok/err、DB、delivery |
+| GET | `/api/v1/service` | iGlance `iglance.service.v1` 状态 + 内存 + controls（`/v1/service` 同义） |
+| GET | `/api/v1/service/memory` | 仅内存快照 |
+| POST | `/api/v1/service/pause` / `resume` / `toggle` | 暂停 / 恢复监控 |
+| POST | `/api/v1/service/stop` | `202` 后退出，清理 PID / launchd job |
 | GET | `/api/v1/dashboard` | KPI + top watches/polls + events + health |
 | GET | `/api/v1/polls` | poll 列表 |
 | GET/POST | `/api/v1/watches` | 列表（`sort=subscribers`）/ 创建或复用 |
@@ -294,7 +299,9 @@ watch 触发
 ## 10. 安全与部署
 
 - 默认只绑定 `127.0.0.1`；远程请用 SSH 隧道或 Tailscale。
-- 当前内置 API 鉴权尚未启用；Gofer callback 可用 `agent_token` 校验（best-effort，不参与健康）。
+- 业务 API 尚未内置鉴权；`/api/v1/service*` 在设置 `panel_token`（或 `TT_SERVICE_TOKEN`）后要求
+  `X-Gofer-Token` / `X-Agent-Token` / `Authorization: Bearer`，`/health` 始终公开。
+  Gofer callback 可用 `agent_token` 校验（best-effort，不参与健康）。
 - 不要把 8787 直接暴露公网；小程序公网 API 需要单独的鉴权/HTTPS/备案域名。
 - Docker 只发布到宿主机 localhost。
 - SQLite 单实例 + WAL；多实例请换 Postgres。
@@ -310,8 +317,8 @@ watch 触发
 - 下载后强制校验 SHA256；校验通过才替换当前二进制，并保留 `.bak`。
 - 发版：
   ```bash
-  git tag v4.3.0
-  git push origin v4.3.0
+  git tag v4.4.0
+  git push origin v4.4.0
   ```
   `.github/workflows/release.yml` 会构建 macOS x86_64/aarch64 二进制、生成
   `SHA256SUMS` 并发布 Release。

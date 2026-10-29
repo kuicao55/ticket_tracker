@@ -15,10 +15,11 @@
 
 ## 当前版本
 
-**v4.3.0** —— 只保留 v4 服务端：
+**v4.4.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）
+- iGlance `iglance.service.v1` 服务绑定（状态 / 内存 / 暂停 / 恢复 / 停止）
 - 每 watch 独立通知渠道参数
 - 今日 Poll 健康图
 - 监控暂停 / 恢复开关
@@ -86,8 +87,8 @@ SHA256SUMS
 发版：
 
 ```bash
-git tag v4.3.0
-git push origin v4.3.0
+git tag v4.4.0
+git push origin v4.4.0
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -133,6 +134,7 @@ cargo build --release
 | `discord_webhook` | 健康告警 webhook | 空 |
 | `agent_url` | Gofer 地址 | `http://127.0.0.1:8790` |
 | `agent_token` | Gofer token | 空 |
+| `panel_token` | iGlance / 服务接口 token（空则不鉴权；可用 `TT_SERVICE_TOKEN` 覆盖） | 空 |
 | `lock_headless` | 锁票默认 headless | `true` |
 | `maoyan_city_id` | 影院搜索城市 | `10` |
 | `metrics_retention_days` | 图表保留天数 | `7` |
@@ -144,8 +146,12 @@ cargo build --release
 |---|---|
 | `TT_UPDATE_TOKEN` | 可选；GitHub 只读 token，避免限流 |
 | `TT_UPDATE_API_BASE` | 可选；测试/镜像 API 地址 |
-| `TT_SUPERVISED` | `launchd` 时更新后只退出，由 launchd 拉起 |
-| `TT_PID_FILE` / `TT_LOG_FILE` | start-server.sh 的重启助手使用 |
+| `TT_SERVICE_TOKEN` | 可选；覆盖 `panel_token` 作为服务接口 token（不写日志） |
+| `TT_START_COMMAND` | 可选；覆盖 `controls.start` 返回的启动命令 |
+| `TT_START_SCRIPT` | 可选；指定启动脚本路径 |
+| `TT_SUPERVISED` | `launchd` 时更新后只退出/停止时 bootout，由 launchd 拉起 |
+| `TT_LAUNCHD_LABEL` | launchd label，默认 `com.kuicao.ticket-tracker` |
+| `TT_PID_FILE` / `TT_LOG_FILE` | start-server.sh 的 PID / 日志文件 |
 
 ---
 
@@ -155,7 +161,14 @@ cargo build --release
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| GET | `/health` | 公开健康检查（iGlance manifest 使用） |
 | GET | `/api/v1/health` | 服务健康、轮询状态、paused、fetch 统计 |
+| GET | `/api/v1/service` | iGlance 服务状态 + 内存 + 控制信息（`/v1/service` 同义） |
+| GET | `/api/v1/service/memory` | 仅内存快照 |
+| POST | `/api/v1/service/pause` | 暂停监控 |
+| POST | `/api/v1/service/resume` | 恢复监控 |
+| POST | `/api/v1/service/toggle` | 切换暂停/恢复 |
+| POST | `/api/v1/service/stop` | 返回 202 后退出进程 |
 | GET | `/api/v1/dashboard` | KPI + watch/poll + events + health |
 | GET | `/api/v1/polls` | poll 列表 |
 | GET/POST | `/api/v1/watches` | 列表 / 创建或复用 |
@@ -202,6 +215,93 @@ curl -X PATCH http://127.0.0.1:8787/api/v1/settings \
 ```
 
 暂停后 `/api/v1/health` 中 `paused: true`，下一轮不会再抓取。
+
+---
+
+## iGlance 服务绑定
+
+ticket_tracker 实现了 [`iglance.service.v1`](https://github.com/kuicao55/iGlance/issues/1)，
+可以在 iGlance 的 **Services** 里像绑定 Gofer 一样绑定它。
+
+### 绑定
+
+iGlance 新增服务时填写：
+
+- 名称：`Ticket Tracker`
+- 启动命令：
+
+  ```bash
+  /Users/me/Applications/ticket_tracker/start-ticket-tracker.sh start --manifest
+  ```
+
+- API token：可选。已设置 `panel_token`（`PATCH /api/v1/settings`）时填写同一个值；
+  也可以启动前设置 `TT_SERVICE_TOKEN` 覆盖。
+
+命令启动成功（或已经在运行）后会在 stdout 输出一行：
+
+```text
+IGLANCE_SERVICE_MANIFEST {"schema":"iglance.service.v1","service":{"id":"ticket_tracker",...},"base_url":"http://127.0.0.1:8787",...}
+```
+
+iGlance 解析该行后自动获得状态、内存和启停接口。**token 不会出现在 manifest、日志或启动命令输出里。**
+
+### 不启动服务，只打印 manifest
+
+```bash
+./start-ticket-tracker.sh manifest
+# 或直接用二进制
+rs/target/release/tt-server manifest --base-url http://127.0.0.1:8787
+```
+
+### 接口
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/health` | 公开健康检查，不需要 token |
+| GET | `/api/v1/service` | `schema` / `state` / `pid` / `memory.groups` / `controls.start` |
+| GET | `/api/v1/service/memory` | 仅内存快照 |
+| POST | `/api/v1/service/pause` | `{"ok":true,"state":"paused","paused":true}` |
+| POST | `/api/v1/service/resume` | `{"ok":true,"state":"running","paused":false}` |
+| POST | `/api/v1/service/toggle` | 切换并返回当前状态 |
+| POST | `/api/v1/service/stop` | `202`，随后退出进程并清理 PID 文件 |
+
+`/v1/service*` 与 `/api/v1/service*` 等价。暂停/恢复就是面板上的监控开关；
+`state` 取值为 `running` / `paused` / `stopping`。
+
+鉴权在设置 token 后生效，接受：
+
+```text
+X-Gofer-Token: <token>
+X-Agent-Token: <token>
+Authorization: Bearer <token>
+```
+
+没有 token 时放行；token 错误或缺失返回 `401`。
+
+### 内存分组
+
+`memory.groups` 来自一次 `ps -axo pid=,ppid=,rss=,command=` 快照，单位 bytes：
+
+| 分组 | 含义 |
+|---|---|
+| `service` | tt-server 主进程 |
+| `workers` | tt-server 派生的子进程 |
+
+ticket_tracker 不派生 Playwright / Chromium，也不直接驱动微信，因此不统计
+浏览器和微信进程。`total_rss_bytes` 是各组之和，`total_processes` 是去重后的进程数。
+RSS 会重复计算共享内存，因此是估算值。`ps` 采集失败时 `available:false` 并带 `error`，
+接口本身仍返回 200。
+
+### 停止语义
+
+`POST /api/v1/service/stop` 先返回 `202`，约 350ms 后：
+
+1. `?cleanup=true`（默认）终止 tt-server 的派生进程；
+2. 删除指向当前进程的 PID 文件；
+3. 如果设置了 `TT_SUPERVISED=launchd`，先 `launchctl bootout`，避免 KeepAlive 立即拉起；
+4. 进程退出。
+
+`cleanup=false` 只退出主进程。停止不会改变暂停状态。
 
 ---
 
@@ -289,6 +389,7 @@ ticket_tracker/
 │   │   ├── maoyan.rs          # 猫眼客户端
 │   │   ├── notify.rs          # Discord / webhook / 邮件
 │   │   ├── lock.rs            # 锁票结果类型
+│   │   ├── service.rs         # iGlance service.v1 manifest / 内存 / 停止清理
 │   │   ├── time_spec.rs
 │   │   ├── silent.rs
 │   │   ├── paths.rs
@@ -300,7 +401,8 @@ ticket_tracker/
 ├── docs/
 │   ├── SERVER.md
 │   └── assets/
-├── start-server.sh
+├── start-server.sh            # 兼容入口 → rs/start-server.sh
+├── start-ticket-tracker.sh    # iGlance 绑定入口（支持 start --manifest / manifest）
 └── README.md
 ```
 

@@ -4,8 +4,8 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, patch, post};
 use axum::{Json, Router};
 use serde::Deserialize;
@@ -15,6 +15,7 @@ use super::{now_secs, AppState};
 use crate::db::{NewWatch, Settings, WatchPatch};
 use crate::lock::{self, LockResult};
 use crate::maoyan;
+use crate::service;
 use crate::time_spec::TimeSpec;
 
 type ApiError = (StatusCode, Json<Value>);
@@ -34,7 +35,22 @@ fn bad(e: impl std::fmt::Display) -> ApiError {
 
 pub fn router(state: Arc<AppState>) -> Router {
     Router::new()
+        // 公开健康检查：iGlance manifest 里的 endpoints.health。
+        .route("/health", get(health))
         .route("/api/v1/health", get(health))
+        // iGlance service.v1；/v1/service* 是 /api/v1/service* 的别名。
+        .route("/api/v1/service", get(service_status))
+        .route("/v1/service", get(service_status))
+        .route("/api/v1/service/memory", get(service_memory))
+        .route("/v1/service/memory", get(service_memory))
+        .route("/api/v1/service/pause", post(service_pause))
+        .route("/v1/service/pause", post(service_pause))
+        .route("/api/v1/service/resume", post(service_resume))
+        .route("/v1/service/resume", post(service_resume))
+        .route("/api/v1/service/toggle", post(service_toggle))
+        .route("/v1/service/toggle", post(service_toggle))
+        .route("/api/v1/service/stop", post(service_stop))
+        .route("/v1/service/stop", post(service_stop))
         .route("/api/v1/dashboard", get(dashboard))
         .route("/api/v1/polls", get(list_polls))
         .route("/api/v1/watches", get(list_watches).post(create_watch))
@@ -829,6 +845,7 @@ async fn patch_settings(
         "metrics_retention_days",
         "lock_headless",
         "maoyan_city_id",
+        "monitor_enabled",
     ] {
         if let Some(v) = body.remove(key) {
             let s = match v {
@@ -1046,4 +1063,206 @@ async fn wx_login_stub() -> ApiResult<Json<Value>> {
         StatusCode::NOT_IMPLEMENTED,
         "微信小程序登录尚未启用：需要配置 wx_appid/wx_secret/template_id，并实现 jscode2session",
     ))
+}
+
+// ------------------------- iGlance service.v1 -------------------------
+
+/// 服务接口鉴权：未设置 token 时放行；设置后接受
+/// `X-Gofer-Token` / `X-Agent-Token` / `Authorization: Bearer <token>`。
+async fn service_auth(st: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
+    let expected = service::expected_token(&st.db)
+        .await
+        .map_err(|e| internal(format!("读取服务 token 失败: {e}")))?;
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    let provided = service::token_from_headers(headers);
+    if service::token_matches(&expected, provided.as_deref()) {
+        Ok(())
+    } else {
+        Err(err(StatusCode::UNAUTHORIZED, "缺少或错误的 API token"))
+    }
+}
+
+async fn service_status(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = service_auth(&st, &headers).await {
+        return e.into_response();
+    }
+    let settings = match Settings::load(&st.db).await {
+        Ok(s) => s,
+        Err(e) => return internal(e).into_response(),
+    };
+    let token_required = match service::expected_token(&st.db).await {
+        Ok(t) => t.is_some(),
+        Err(e) => return internal(e).into_response(),
+    };
+    let db_ok = sqlx::query_scalar::<_, i64>("SELECT 1")
+        .fetch_one(&st.db.pool)
+        .await
+        .is_ok();
+    let memory = tokio::task::spawn_blocking(service::collect_memory)
+        .await
+        .unwrap_or_else(|e| service::MemorySnapshot::unavailable(format!("内存采集任务失败: {e}")));
+
+    let paused = !settings.monitor_enabled;
+    let stopping = st.is_stopping();
+    let state = if stopping {
+        "stopping"
+    } else if paused {
+        "paused"
+    } else {
+        "running"
+    };
+    let base = st.base_url();
+    let display = base.clone();
+    let body = json!({
+        "schema": service::MANIFEST_SCHEMA,
+        "ok": true,
+        "service": {
+            "id": service::SERVICE_ID,
+            "name": service::SERVICE_NAME,
+            "version": service::version(),
+            "kind": "headless-service",
+        },
+        "state": state,
+        "paused": paused,
+        "stopping": stopping,
+        "pid": std::process::id(),
+        "started_at": service::started_at_iso(st.started_at),
+        "uptime_sec": (now_secs() - st.started_at).max(0.0) as u64,
+        "urls": {
+            "base": base,
+            "display": display,
+            "health": format!("{}/health", display.trim_end_matches('/')),
+        },
+        "auth": {
+            "header": service::TOKEN_HEADER,
+            "token_required": token_required,
+        },
+        "queue": {},
+        "ready": {
+            "db": db_ok,
+            "monitor": settings.monitor_enabled,
+        },
+        "memory": memory,
+        "controls": service::controls(&st.base_url()),
+    });
+    Json(body).into_response()
+}
+
+async fn service_memory(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = service_auth(&st, &headers).await {
+        return e.into_response();
+    }
+    let memory = tokio::task::spawn_blocking(service::collect_memory)
+        .await
+        .unwrap_or_else(|e| service::MemorySnapshot::unavailable(format!("内存采集任务失败: {e}")));
+    Json(json!({
+        "ok": true,
+        "service": service::SERVICE_ID,
+        "pid": std::process::id(),
+        "memory": memory,
+    }))
+    .into_response()
+}
+
+async fn service_pause(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = service_auth(&st, &headers).await {
+        return e.into_response();
+    }
+    if let Err(e) = set_service_paused(&st, true).await {
+        return e.into_response();
+    }
+    Json(json!({"ok": true, "state": "paused", "paused": true})).into_response()
+}
+
+async fn service_resume(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = service_auth(&st, &headers).await {
+        return e.into_response();
+    }
+    if let Err(e) = set_service_paused(&st, false).await {
+        return e.into_response();
+    }
+    Json(json!({"ok": true, "state": "running", "paused": false})).into_response()
+}
+
+async fn service_toggle(State(st): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Err(e) = service_auth(&st, &headers).await {
+        return e.into_response();
+    }
+    let settings = match Settings::load(&st.db).await {
+        Ok(s) => s,
+        Err(e) => return internal(e).into_response(),
+    };
+    let paused = settings.monitor_enabled;
+    if let Err(e) = set_service_paused(&st, paused).await {
+        return e.into_response();
+    }
+    let state = if paused { "paused" } else { "running" };
+    Json(json!({"ok": true, "state": state, "paused": paused})).into_response()
+}
+
+async fn set_service_paused(st: &Arc<AppState>, paused: bool) -> Result<(), ApiError> {
+    st.db
+        .set_setting("monitor_enabled", if paused { "false" } else { "true" })
+        .await
+        .map_err(internal)?;
+    // 面板 / metrics 立刻看到新状态，不必等 monitor 下一轮。
+    st.health.lock().unwrap().paused = paused;
+    st.wake.notify_one();
+    st.push_event(
+        "service",
+        None,
+        if paused {
+            "服务暂停：不再轮询、通知或锁票"
+        } else {
+            "服务恢复：继续监控"
+        },
+    );
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct StopQuery {
+    cleanup: Option<bool>,
+    #[allow(dead_code)]
+    close_browser: Option<bool>,
+}
+
+async fn service_stop(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(q): Query<StopQuery>,
+) -> Response {
+    if let Err(e) = service_auth(&st, &headers).await {
+        return e.into_response();
+    }
+    if st.stopping.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return (
+            StatusCode::ACCEPTED,
+            Json(json!({"ok": true, "state": "stopping", "already_stopping": true})),
+        )
+            .into_response();
+    }
+
+    let cleanup = q.cleanup.unwrap_or(true);
+    tokio::spawn(async move {
+        // 先让 202 响应发出去。
+        tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        service::stop_cleanup(cleanup).await;
+        service::remove_pid_file();
+        service::bootout_launchd().await;
+        std::process::exit(0);
+    });
+
+    (
+        StatusCode::ACCEPTED,
+        Json(json!({
+            "ok": true,
+            "state": "stopping",
+            "cleanup": cleanup,
+            "message": "ticket_tracker 正在停止；完全停止后使用 controls.start 中的命令重新启动。",
+        })),
+    )
+        .into_response()
 }

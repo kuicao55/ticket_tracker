@@ -7,17 +7,19 @@ pub mod web;
 
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use fs2::FileExt;
 use serde::Serialize;
 
 use sqlx::SqlitePool;
 
 use crate::db::Db;
+use crate::service;
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct WatchStatus {
@@ -55,6 +57,8 @@ pub struct HealthState {
 pub struct AppState {
     pub db: Db,
     pub started_at: f64,
+    /// 实际监听地址（`TT_BIND`），用于生成 iGlance 的 `base_url`。
+    pub bind: String,
     pub health: StdMutex<HealthState>,
     pub watch_status: StdMutex<HashMap<String, WatchStatus>>,
     pub events: StdMutex<VecDeque<EventItem>>,
@@ -64,10 +68,16 @@ pub struct AppState {
     pub wake: tokio::sync::Notify,
     /// 正在等待 Gofer 回调的 lock key（watch_id:cinema_id），避免重复提交。
     pub lock_inflight: StdMutex<HashMap<String, f64>>,
+    /// `/api/v1/service/stop` 已受理；避免重复触发退出。
+    pub stopping: AtomicBool,
 }
 
 impl AppState {
     pub fn new(db: Db) -> Arc<Self> {
+        Self::with_bind(db, default_bind())
+    }
+
+    pub fn with_bind(db: Db, bind: impl Into<String>) -> Arc<Self> {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(10))
             .connect_timeout(std::time::Duration::from_secs(3))
@@ -76,6 +86,7 @@ impl AppState {
         Arc::new(Self {
             db,
             started_at: now_secs(),
+            bind: bind.into(),
             health: StdMutex::new(HealthState {
                 health_ok: true,
                 ..Default::default()
@@ -86,7 +97,17 @@ impl AppState {
             http,
             wake: tokio::sync::Notify::new(),
             lock_inflight: StdMutex::new(HashMap::new()),
+            stopping: AtomicBool::new(false),
         })
+    }
+
+    /// iGlance 可访问的 base URL。
+    pub fn base_url(&self) -> String {
+        service::base_url_from_bind(&self.bind)
+    }
+
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
     }
 
     pub fn push_event(&self, kind: &str, watch_id: Option<&str>, message: impl Into<String>) {
@@ -157,6 +178,24 @@ pub fn now_secs() -> f64 {
         .unwrap_or(0.0)
 }
 
+pub fn default_bind() -> String {
+    std::env::var("TT_BIND")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "127.0.0.1:8787".to_string())
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ServerCommand {
+    /// 只打印 iGlance manifest，不启动服务
+    Manifest {
+        /// 服务 HTTP 根地址；省略时用 --bind / TT_BIND
+        #[arg(long)]
+        base_url: Option<String>,
+    },
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "tt-server", version, about = "ticket-tracker 无头主服务")]
 pub struct ServerArgs {
@@ -169,6 +208,8 @@ pub struct ServerArgs {
     /// 只启动 API/面板，不跑监控（测试用）
     #[arg(long, env = "TT_NO_MONITOR", default_value_t = false)]
     pub no_monitor: bool,
+    #[command(subcommand)]
+    pub command: Option<ServerCommand>,
 }
 
 pub fn default_db_path() -> String {
@@ -180,6 +221,17 @@ pub fn default_db_path() -> String {
 
 pub async fn run() -> Result<()> {
     let args = ServerArgs::parse();
+
+    // iGlance 兜底命令：不启动服务、不初始化数据库，只输出一行 manifest。
+    if let Some(ServerCommand::Manifest { base_url }) = args.command {
+        let base = base_url
+            .map(|v| v.trim().trim_end_matches('/').to_string())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| service::base_url_from_bind(&args.bind));
+        println!("{}", service::manifest_line(&base));
+        return Ok(());
+    }
+
     init_tracing();
     let db_path = if args.db.trim().is_empty() {
         default_db_path()
@@ -194,7 +246,7 @@ pub async fn run() -> Result<()> {
     // 单实例锁，避免两个 tt-server 同时轮询。
     let _instance_lock = acquire_instance_lock()?;
 
-    let state = AppState::new(db.clone());
+    let state = AppState::with_bind(db.clone(), args.bind.clone());
     // 首次启动时后台预热电影列表，让 Web 弹窗打开就有可选电影。
     spawn_movie_warmup(db.clone());
     if !args.no_monitor {
