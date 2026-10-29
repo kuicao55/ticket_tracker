@@ -594,6 +594,20 @@ impl Db {
         Ok(rows.into_iter().map(|r| r.0).collect())
     }
 
+    /// 一次取出所有 watch 的影院绑定，供列表页批量渲染，避免 N+1 查询。
+    pub async fn all_watch_cinemas(&self) -> Result<HashMap<String, Vec<String>>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT watch_id, cinema_id FROM watch_cinemas ORDER BY watch_id, cinema_id",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        for (watch_id, cinema_id) in rows {
+            out.entry(watch_id).or_default().push(cinema_id);
+        }
+        Ok(out)
+    }
+
     pub async fn find_by_filter_key(&self, key: &str) -> Result<Option<WatchRow>> {
         Ok(sqlx::query_as::<_, WatchRow>(
             "SELECT w.*, (SELECT COUNT(*) FROM subscriptions s WHERE s.watch_id = w.id) AS subscriber_count

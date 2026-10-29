@@ -326,8 +326,8 @@ watch 触发
 - 下载后强制校验 SHA256；校验通过才替换当前二进制，并保留 `.bak`。
 - 发版：
   ```bash
-  git tag v4.8.0
-  git push origin v4.8.0
+  git tag v4.9.0
+  git push origin v4.9.0
   ```
   `.github/workflows/release.yml` 会构建 macOS x86_64/aarch64 二进制、生成
   `SHA256SUMS` 并发布 Release。

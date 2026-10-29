@@ -22,7 +22,7 @@ use super::{now_secs, AppState};
 use crate::auth;
 use crate::db::{ChannelRow, MetricRow, PollHealthRow, Settings, WatchRow};
 use crate::engine::WatchCinemaState;
-use crate::time_spec::{date_from_id, TimeSpec};
+use crate::time_spec::{date_from_id, TimeInterval, TimeSpec};
 
 fn web_dir() -> String {
     if let Ok(dir) = std::env::var("TT_WEB_DIR") {
@@ -61,6 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/actions/watches/:id/lock", post(action_update_lock))
         .route("/actions/subscriptions", post(action_subscribe))
         .route("/actions/watches/:id/toggle", post(action_toggle_watch))
+        .route("/actions/watches/:id/delete", post(action_delete_watch))
         .route(
             "/actions/watches/:id/toggle-detail",
             post(action_toggle_watch_detail),
@@ -130,6 +131,10 @@ pub struct WatchItemView {
     pub enabled: bool,
     pub last_trigger: String,
     pub cinemas: usize,
+    pub cinema_label: String,
+    pub cinema_title: String,
+    pub time_label: String,
+    pub imax_only: bool,
     pub bar_pct: i64,
     pub baseline_total: i64,
     pub sparkline: String,
@@ -555,6 +560,8 @@ fn watch_items(
     rows: &[WatchRow],
     status: &HashMap<String, super::WatchStatus>,
     max_subs: i64,
+    watch_cinemas: &HashMap<String, Vec<String>>,
+    cinema_names: &HashMap<String, String>,
 ) -> Vec<WatchItemView> {
     rows.iter()
         .map(|w| {
@@ -566,6 +573,8 @@ fn watch_items(
             } else {
                 "未触发".into()
             };
+            let cinemas = watch_cinemas.get(&w.id).map(Vec::as_slice).unwrap_or(&[]);
+            let (cinema_label, cinema_title) = cinema_labels(cinemas, cinema_names);
             WatchItemView {
                 href: format!("/watches/{}", w.id),
                 id: w.id.clone(),
@@ -580,7 +589,11 @@ fn watch_items(
                 status_class,
                 enabled: w.enabled,
                 last_trigger,
-                cinemas: 0,
+                cinemas: cinemas.len(),
+                cinema_label,
+                cinema_title,
+                time_label: time_brief(w),
+                imax_only: w.imax_only,
                 bar_pct: if max_subs <= 0 {
                     0
                 } else {
@@ -591,6 +604,105 @@ fn watch_items(
             }
         })
         .collect()
+}
+
+fn cinema_labels(ids: &[String], names: &HashMap<String, String>) -> (String, String) {
+    let resolved: Vec<String> = ids
+        .iter()
+        .map(|id| {
+            let name = names.get(id).cloned().unwrap_or_default();
+            if name.trim().is_empty() {
+                id.clone()
+            } else {
+                name
+            }
+        })
+        .collect();
+    if resolved.is_empty() {
+        return ("未绑定影院".into(), String::new());
+    }
+    let title = resolved.join("、");
+    let label = if resolved.len() > 2 {
+        format!("{}、{} 等 {} 家", resolved[0], resolved[1], resolved.len())
+    } else {
+        title.clone()
+    };
+    (label, title)
+}
+
+fn time_brief(w: &WatchRow) -> String {
+    let spec = match TimeSpec::from_json(&w.time_spec_value()) {
+        Ok(spec) => spec,
+        Err(_) => return "不限日期".into(),
+    };
+    match spec {
+        TimeSpec::All => "不限日期".into(),
+        TimeSpec::DailyHours(hours) => {
+            let mut hours = hours;
+            hours.sort_unstable();
+            hours.dedup();
+            if hours.is_empty() {
+                "不限日期".into()
+            } else if hours.len() >= 24 {
+                "每天 全天".into()
+            } else {
+                format!(
+                    "每天 {}",
+                    hours
+                        .iter()
+                        .map(|h| format!("{:02}:00", h))
+                        .collect::<Vec<_>>()
+                        .join("、")
+                )
+            }
+        }
+        TimeSpec::Intervals(v) if v.is_empty() => "不限日期".into(),
+        TimeSpec::Intervals(v) if v.len() == 1 => interval_brief(&v[0]),
+        TimeSpec::Intervals(v) => {
+            let first = &v[0];
+            let last = &v[v.len() - 1];
+            if first.start_date == last.end_date {
+                format!("{} · {} 段", first.start_date.format("%m-%d"), v.len())
+            } else {
+                format!(
+                    "{} → {} · {} 段",
+                    first.start_date.format("%m-%d"),
+                    last.end_date.format("%m-%d"),
+                    v.len()
+                )
+            }
+        }
+    }
+}
+
+fn interval_brief(i: &TimeInterval) -> String {
+    let full_day = i.start_hour == 0 && i.end_hour >= 24;
+    if i.start_date == i.end_date {
+        if full_day {
+            format!("{} 全天", i.start_date.format("%m-%d"))
+        } else {
+            format!(
+                "{} {:02}:00–{:02}:00",
+                i.start_date.format("%m-%d"),
+                i.start_hour,
+                i.end_hour.min(24)
+            )
+        }
+    } else if full_day {
+        format!(
+            "{} → {}",
+            i.start_date.format("%m-%d"),
+            i.end_date.format("%m-%d")
+        )
+    } else {
+        format!(
+            "{} {:02}:00 → {} {:02}:00",
+            i.start_date.format("%m-%d"),
+            i.start_hour,
+            i.end_date.format("%m-%d"),
+            i.end_hour.min(24)
+        )
+    }
 }
 
 fn time_summary(w: &WatchRow) -> String {
@@ -1033,9 +1145,22 @@ async fn build_dashboard(
         .map(|w| w.subscriber_count)
         .max()
         .unwrap_or(0);
-    let mut items = watch_items(&top_watches, &status, max_subs);
+    let watch_cinemas = st.db.all_watch_cinemas().await?;
+    let cinema_names: HashMap<String, String> = st
+        .db
+        .list_cinemas()
+        .await?
+        .into_iter()
+        .map(|(id, name, _)| (id, name))
+        .collect();
+    let mut items = watch_items(
+        &top_watches,
+        &status,
+        max_subs,
+        &watch_cinemas,
+        &cinema_names,
+    );
     for item in &mut items {
-        item.cinemas = st.db.watch_cinemas(&item.id).await?.len();
         let states = st.db.watch_states(&item.id).await?;
         let base = baseline_stats(&states, false).0 as i64;
         let metrics = st.db.metrics(&item.id, "-24 hours").await?;
@@ -1144,20 +1269,22 @@ async fn watches_page(State(st): State<Arc<AppState>>) -> Response {
         .await
         .unwrap_or_default();
     let max_subs = rows.iter().map(|w| w.subscriber_count).max().unwrap_or(0);
-    let mut items = watch_items(&rows, &status, max_subs);
-    for item in &mut items {
-        item.cinemas = st
-            .db
-            .watch_cinemas(&item.id)
-            .await
-            .map(|v| v.len())
-            .unwrap_or(0);
-    }
+    let watch_cinemas = st.db.all_watch_cinemas().await.unwrap_or_default();
+    let cinema_names: HashMap<String, String> = st
+        .db
+        .list_cinemas()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(id, name, _)| (id, name))
+        .collect();
+    let items = watch_items(&rows, &status, max_subs, &watch_cinemas, &cinema_names);
+    let count = st.db.watch_count().await.unwrap_or(rows.len() as i64);
     let t = WatchesTemplate {
         version,
         now,
         page: "watches".into(),
-        count: rows.len() as i64,
+        count,
         watches: items,
     };
     render(&t).into_response()
@@ -2318,6 +2445,51 @@ async fn action_toggle_watch_detail(
     match build_detail(&st, &id).await {
         Ok(t) => render(&t).into_response(),
         Err(e) => (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+    }
+}
+
+async fn action_delete_watch(
+    State(st): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let name = st
+        .db
+        .get_watch(&id)
+        .await
+        .ok()
+        .flatten()
+        .map(|w| {
+            if w.movie_name.is_empty() {
+                id.clone()
+            } else {
+                w.movie_name
+            }
+        })
+        .unwrap_or_else(|| id.clone());
+    match st.db.delete_watch(&id).await {
+        Ok(true) => {
+            st.push_event("watch", Some(&id), format!("删除 watch {} · {}", id, name));
+            st.wake.notify_one();
+            if htmx(&headers) {
+                let count = st.db.watch_count().await.unwrap_or(0);
+                Html(format!(
+                    "<span id=\"watch-count\" class=\"pill\" hx-swap-oob=\"true\">{} watches</span>",
+                    count
+                ))
+                .into_response()
+            } else {
+                Redirect::to("/watches").into_response()
+            }
+        }
+        Ok(false) => {
+            if htmx(&headers) {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                Redirect::to("/watches").into_response()
+            }
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     }
 }
 

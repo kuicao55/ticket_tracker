@@ -104,7 +104,13 @@
           <span class="rank">{{ loop.index }}</span>
           <span class="watch-main">
             <div class="watch-name">{{ w.name }}</div>
-            <div class="watch-sub">{{ w.movie_id }} · {{ w.cinemas }} 影院 · 基线 {{ w.baseline_total }} 场 · {{ w.last_trigger }}</div>
+            <div class="watch-facts">
+              <span class="fact-cinema" title="{{ w.cinema_title }}">{{ w.cinema_label }}</span>
+              <span class="fact-sep">·</span>
+              <span class="fact-date">{{ w.time_label }}</span>
+              {% if w.imax_only %}<span class="watch-tag imax">IMAX</span>{% else %}<span class="watch-tag plain">全制式</span>{% endif %}
+            </div>
+            <div class="watch-sub">{{ w.movie_id }} · 基线 {{ w.baseline_total }} 场 · {{ w.last_trigger }}</div>
             <div class="bar"><span style="width: {{ w.bar_pct }}%"></span></div>
           </span>
           <span class="sparkline" title="最近 24 小时基线变化">{{ w.sparkline|safe }}</span>

@@ -67,6 +67,76 @@ async fn watch_api_and_dashboard_render() {
 }
 
 #[tokio::test]
+async fn watch_list_shows_facts_and_deletes() {
+    let db = Db::connect_memory().await.unwrap();
+    db.upsert_cinema("37534", "万达影城（朝阳大悦城店）", false)
+        .await
+        .unwrap();
+    let state: Arc<AppState> = AppState::new(db.clone());
+    let app = api::router(state.clone()).merge(web::router(state));
+
+    let body = serde_json::json!({
+        "movie_id": 1545360,
+        "movie_name": "奥德赛",
+        "cinemas": ["37534"],
+        "time": "2026-11-12 19:00-22:00",
+        "imax_only": true
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/watches")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let wid = v["watch_id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/watches")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains("万达影城（朝阳大悦城店）"));
+    assert!(html.contains("11-12 19:00–22:00"));
+    assert!(html.contains(">IMAX</span>"));
+    assert!(html.contains(&format!("/actions/watches/{wid}/delete")));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/actions/watches/{wid}/delete"))
+                .header("hx-request", "true")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains("0 watches"));
+    assert!(db.get_watch(&wid).await.unwrap().is_none());
+    assert!(db.watch_cinemas(&wid).await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn watch_filter_key_is_deduped_via_api() {
     let app = app().await;
     let make = || {

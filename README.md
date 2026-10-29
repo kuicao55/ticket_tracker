@@ -15,7 +15,7 @@
 
 ## 当前版本
 
-**v4.8.0** —— 只保留 v4 服务端：
+**v4.9.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）；watch 渠道可复用 Settings 里的全局绑定
@@ -23,6 +23,7 @@
 - Release 二进制内置 Web 资产，可扁平安装（`tt-server` + `start-ticket-tracker.sh`）
 - Web 面板密码登录：首次升级引导 `/setup` 设密，Argon2 哈希 + 会话 Cookie
 - 每 watch 独立通知渠道参数
+- watch 列表展示影院 / 监控日期 / IMAX 摘要，支持在列表和详情页删除 watch
 - 今日 Poll 健康图
 - 监控暂停 / 恢复开关
 - GitHub Release 面板自动更新
@@ -34,6 +35,7 @@
 - **poll / watch 两层**：影院去重抓取，watch 按电影 / 影院 / 时间 / IMAX 过滤。
 - **小时桶差分**：首轮静默建基线；任一桶计数增加才触发，避免重复报警。
 - **Web 面板**：KPI、watch leaderboard、poll 列表、poll 健康、用户、事件、渠道配置。
+  watch 列表会展示影院、监控日期与 IMAX 摘要，并可在列表 / 详情页删除 watch。
 - **每 watch 独立渠道**：
   - Discord / webhook：URL
   - Email：收件人
@@ -116,8 +118,8 @@ SHA256SUMS
 发版：
 
 ```bash
-git tag v4.8.0
-git push origin v4.8.0
+git tag v4.9.0
+git push origin v4.9.0
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -143,9 +145,9 @@ cargo build --release
 ## Web 面板
 
 - `/`：总览、监控开关、watch leaderboard、poll 列表、poll 健康、事件、用户。
-- `/watches`：全部 watch。
+- `/watches`：全部 watch，附带影院 / 监控日期 / IMAX 摘要，可直接删除。
 - `/watches/new`：电影/影院搜索弹窗 + 日期范围 + 小时方块；不需要输入 ID。
-- `/watches/:id`：过滤条件、渠道配置、自动锁票、基线图、基线场次表。
+- `/watches/:id`：过滤条件、渠道配置、自动锁票、基线图、基线场次表；可删除 watch。
 - `/users`：用户与订阅。
 - `/settings`：检查间隔、静默窗口、Discord 健康告警、Gofer 地址/token、渠道默认值、影院城市。
 

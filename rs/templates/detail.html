@@ -25,12 +25,18 @@
         <span class="mono">{{ created_at }}</span>
       </div>
     </div>
-    <form hx-post="/actions/watches/{{ id }}/toggle-detail"
-          hx-target="#detail-root" hx-select="#detail-root" hx-swap="outerHTML">
-      <button class="btn {% if enabled %}ghost{% else %}clay{% endif %}" type="submit">
-        {% if enabled %}停用 watch{% else %}启用 watch{% endif %}
-      </button>
-    </form>
+    <div class="detail-actions">
+      <form hx-post="/actions/watches/{{ id }}/toggle-detail"
+            hx-target="#detail-root" hx-select="#detail-root" hx-swap="outerHTML">
+        <button class="btn {% if enabled %}ghost{% else %}clay{% endif %}" type="submit">
+          {% if enabled %}停用 watch{% else %}启用 watch{% endif %}
+        </button>
+      </form>
+      <form method="post" action="/actions/watches/{{ id }}/delete"
+            onsubmit="return confirm('确定删除 watch {{ id }}？订阅关系、基线和渠道绑定会一并删除，无法恢复。')">
+        <button class="btn danger-ghost" type="submit">删除</button>
+      </form>
+    </div>
   </section>
 
   <section class="detail-stats">

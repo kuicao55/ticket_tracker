@@ -7,27 +7,45 @@
     <h1>All watches.</h1>
     <p class="lede">按订阅人数排序。相同过滤条件自动复用同一个 watch，用户“自建”只是新增订阅关系。</p>
   </div>
-  <div class="hero-meta"><span class="pill">{{ count }} watches</span><a class="btn clay small" href="/watches/new">新建 watch</a></div>
+  <div class="hero-meta"><span class="pill" id="watch-count">{{ count }} watches</span><a class="btn clay small" href="/watches/new">新建 watch</a></div>
 </section>
 
 <div class="card">
-  <table class="table">
+  <div class="table-scroll">
+  <table class="table watches-table">
     <thead>
-      <tr><th>Watch</th><th>Movie</th><th>Cinemas</th><th class="num">Subs</th><th>Status</th><th>Last trigger</th></tr>
+      <tr><th>Watch</th><th>Movie</th><th>Cinemas</th><th class="num">Subs</th><th>Status</th><th>Last trigger</th><th class="actions-col"></th></tr>
     </thead>
     <tbody>
     {% for w in watches %}
     <tr>
-      <td><a href="{{ w.href }}">{{ w.name }}</a><div class="watch-sub mono">{{ w.id }}</div></td>
+      <td>
+        <a class="watch-name" href="{{ w.href }}">{{ w.name }}</a>
+        <div class="watch-facts">
+          <span class="fact-cinema" title="{{ w.cinema_title }}">{{ w.cinema_label }}</span>
+          <span class="fact-sep">·</span>
+          <span class="fact-date">{{ w.time_label }}</span>
+          {% if w.imax_only %}<span class="watch-tag imax">IMAX</span>{% else %}<span class="watch-tag plain">全制式</span>{% endif %}
+        </div>
+        <div class="watch-sub mono">{{ w.id }}</div>
+      </td>
       <td class="mono">{{ w.movie_id }}</td>
       <td class="mono">{{ w.cinemas }}</td>
       <td class="num">{{ w.subs }}</td>
       <td><span class="badge {{ w.status_class }}">{{ w.status_text }}</span></td>
       <td class="mono muted">{{ w.last_trigger }}</td>
+      <td class="actions-col">
+        <form hx-post="/actions/watches/{{ w.id }}/delete"
+              hx-confirm="确定删除「{{ w.name }}」？订阅关系、基线和渠道绑定会一并删除，无法恢复。"
+              hx-target="closest tr" hx-swap="delete">
+          <button class="btn danger-quiet small" type="submit">删除</button>
+        </form>
+      </td>
     </tr>
     {% endfor %}
     </tbody>
   </table>
+  </div>
   {% if watches.is_empty() %}
   <div class="empty">还没有 watch。</div>
   {% endif %}
