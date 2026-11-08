@@ -3,6 +3,7 @@
 //! 只保留服务端需要的模块：
 //! - [`db`]  —— SQLite 数据层
 //! - [`engine`] —— 单轮询引擎：影院并集抓取 + 纯内存分发
+//! - [`city`] / [`cities`] —— 全城开售 watch：城市接口解析与城市列表
 //! - [`maoyan`] —— 猫眼 HTTP 客户端
 //! - [`notify`] —— Discord / webhook / 邮件（本机通知由 Gofer 负责）
 //! - [`lock`] —— 锁票结果类型（实际执行在 Gofer）
@@ -11,6 +12,8 @@
 
 pub mod assets;
 pub mod auth;
+pub mod cities;
+pub mod city;
 pub mod db;
 pub mod engine;
 pub mod lock;

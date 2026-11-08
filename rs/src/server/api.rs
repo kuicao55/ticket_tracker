@@ -63,6 +63,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             get(get_watch_channels).put(put_watch_channels),
         )
         .route("/api/v1/watches/:id/metrics", get(watch_metrics))
+        .route("/api/v1/watches/:id/rearm", post(rearm_watch))
         .route("/api/v1/channels", get(list_channels).post(create_channel))
         .route(
             "/api/v1/channels/:id",
@@ -196,6 +197,9 @@ async fn list_watches(
             "cinemas": cinemas,
             "time_spec": w.time_spec_value(),
             "imax_only": w.imax_only,
+            "scope": w.scope,
+            "city_id": w.city_id,
+            "city_name": w.city_name,
             "enabled": w.enabled,
             "created_by": w.created_by,
             "visibility": w.visibility,
@@ -216,6 +220,7 @@ struct CreateWatchRequest {
     movie_id: i64,
     #[serde(default)]
     movie_name: Option<String>,
+    #[serde(default)]
     cinemas: Vec<String>,
     #[serde(default)]
     time: Option<String>,
@@ -223,6 +228,12 @@ struct CreateWatchRequest {
     time_spec: Option<Value>,
     #[serde(default)]
     imax_only: bool,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    city_id: Option<u32>,
+    #[serde(default)]
+    city_name: Option<String>,
     #[serde(default)]
     created_by: Option<String>,
     #[serde(default)]
@@ -243,9 +254,23 @@ async fn create_watch(
     State(st): State<Arc<AppState>>,
     Json(req): Json<CreateWatchRequest>,
 ) -> ApiResult<Json<Value>> {
-    let time_spec = match req.time_spec {
-        Some(v) => TimeSpec::from_json(&v).map_err(bad)?,
-        None => TimeSpec::parse(req.time.as_deref().unwrap_or("")).map_err(bad)?,
+    let scope = req
+        .scope
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("cinema")
+        .to_string();
+    if scope != "cinema" && scope != "city" {
+        return Err(bad(format!("未知 watch scope: {}", scope)));
+    }
+    let time_spec = if scope == "city" {
+        TimeSpec::All
+    } else {
+        match req.time_spec {
+            Some(v) => TimeSpec::from_json(&v).map_err(bad)?,
+            None => TimeSpec::parse(req.time.as_deref().unwrap_or("")).map_err(bad)?,
+        }
     };
     let spec = NewWatch {
         movie_id: req.movie_id,
@@ -255,6 +280,9 @@ async fn create_watch(
         imax_only: req.imax_only,
         created_by: req.created_by,
         visibility: req.visibility.unwrap_or_else(|| "public".into()),
+        scope,
+        city_id: req.city_id.unwrap_or(0),
+        city_name: req.city_name.unwrap_or_default(),
         auto_lock: req.auto_lock,
         lock_num_seats: req
             .lock_num_seats
@@ -291,18 +319,48 @@ async fn get_watch(
     let subs = st.db.subscriptions_for_watch(&id).await.map_err(internal)?;
     let metrics = st.db.metrics(&id, "-24 hours").await.map_err(internal)?;
     let lock_states = st.db.lock_states_for_watch(&id).await.map_err(internal)?;
+    let city_state = st.db.city_state(&id).await.map_err(internal)?;
     Ok(Json(json!({
         "id": w.id, "movie_id": w.movie_id, "movie_name": w.movie_name,
         "filter_key": w.filter_key, "cinemas": cinemas,
         "time_spec": w.time_spec_value(), "imax_only": w.imax_only,
+        "scope": w.scope, "city_id": w.city_id, "city_name": w.city_name,
         "enabled": w.enabled, "created_by": w.created_by,
         "visibility": w.visibility, "auto_lock": w.auto_lock,
         "lock_num_seats": w.lock_num_seats, "lock_max_retries": w.lock_max_retries,
         "lock_seats": w.lock_seats_value(), "subscriber_count": w.subscriber_count,
         "created_at": w.created_at, "updated_at": w.updated_at,
         "channels": channels, "subscriptions": subs, "metrics": metrics,
-        "lock_states": lock_states,
+        "lock_states": lock_states, "city_state": city_state,
     })))
+}
+
+async fn rearm_watch(
+    State(st): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    if !st.db.rearm_city_watch(&id).await.map_err(internal)? {
+        return Err(err(
+            StatusCode::NOT_FOUND,
+            "watch 不存在或不是全城开售 watch",
+        ));
+    }
+    {
+        let mut inflight = st.lock_inflight.lock().unwrap();
+        let prefix = format!("{}:", id);
+        inflight.retain(|k, _| !k.starts_with(&prefix));
+    }
+    st.set_watch_status(
+        &id,
+        super::WatchStatus {
+            status: "waiting".into(),
+            last_checked_at: Some(now_secs()),
+            ..Default::default()
+        },
+    );
+    st.push_event("watch", Some(&id), "全城 watch 已重新武装".to_string());
+    st.wake.notify_one();
+    Ok(Json(json!({"rearmed": true})))
 }
 
 #[derive(Debug, Deserialize)]
@@ -319,6 +377,12 @@ struct UpdateWatchRequest {
     time_spec: Option<Value>,
     #[serde(default)]
     imax_only: Option<bool>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    city_id: Option<u32>,
+    #[serde(default)]
+    city_name: Option<String>,
     #[serde(default)]
     enabled: Option<bool>,
     #[serde(default)]
@@ -349,6 +413,9 @@ async fn update_watch(
         cinemas: req.cinemas,
         time_spec,
         imax_only: req.imax_only,
+        scope: req.scope,
+        city_id: req.city_id,
+        city_name: req.city_name,
         enabled: req.enabled,
         auto_lock: req.auto_lock,
         lock_num_seats: req.lock_num_seats,

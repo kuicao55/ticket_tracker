@@ -32,7 +32,7 @@
     <div class="card kpi">
       <div class="label">Polls</div>
       <div class="value">{{ counts.polls }}</div>
-      <div class="foot">{{ health.fetch_ok }}/{{ health.fetch_total }} 抓取正常</div>
+      <div class="foot">{{ health.fetch_ok }}/{{ health.fetch_total }} 基础 JSON 正常</div>
     </div>
     <div class="card kpi">
       <div class="label">Watches</div>
@@ -110,7 +110,7 @@
               <span class="fact-date">{{ w.time_label }}</span>
               {% if w.imax_only %}<span class="watch-tag imax">IMAX</span>{% else %}<span class="watch-tag plain">全制式</span>{% endif %}
             </div>
-            <div class="watch-sub">{{ w.movie_id }} · 基线 {{ w.baseline_total }} 场 · {{ w.last_trigger }}</div>
+            <div class="watch-sub">{{ w.movie_id }} · {% if w.is_city %}全城开售{% else %}基线 {{ w.baseline_total }} 场{% endif %} · {{ w.last_trigger }}</div>
             <div class="bar"><span style="width: {{ w.bar_pct }}%"></span></div>
           </span>
           <span class="sparkline" title="最近 24 小时基线变化">{{ w.sparkline|safe }}</span>
@@ -145,7 +145,7 @@
           <span class="health-val">{{ health.last_poll }}</span>
         </div>
         <div class="health-row">
-          <span class="health-key">抓取</span>
+          <span class="health-key">基础 JSON</span>
           <span class="health-val">{{ health.fetch_ok }} ok / {{ health.fetch_err }} err</span>
         </div>
         <div class="health-row">
@@ -165,22 +165,53 @@
         <div class="card-head">
           <div>
             <p class="eyebrow">Poll plan</p>
-            <h2>当前轮询影院</h2>
+            <h2>当前采集计划</h2>
+            <p>影院 JSON 与全城扫描 JSON 分开列示，统一计入今日健康。</p>
           </div>
-          <span class="pill">{{ counts.polls }} polls</span>
+          <span class="pill">{{ counts.polls }} 影院 · {{ counts.city_scans }} 全城</span>
         </div>
-        {% if polls.is_empty() %}
-        <div class="empty">等待首轮。添加 watch 后会自动建立 poll 列表。</div>
-        {% else %}
-        {% for p in polls %}
-        <div class="poll-row">
-          <span class="status-dot {{ p.status_class }}"></span>
-          <span class="poll-name" title="{{ p.cinema_id }}">{{ p.name }}</span>
-          <span class="poll-meta">{{ p.watch_count }}w</span>
-          <span class="poll-meta">{{ p.duration }} · {{ p.shows }} 场</span>
+        <div class="segmented" data-poll-tabs style="margin-bottom:12px">
+          <button type="button" data-poll-tab="cinema" class="active">影院轮询</button>
+          <button type="button" data-poll-tab="city">全城扫描</button>
         </div>
-        {% endfor %}
-        {% endif %}
+        <div data-poll-panel="cinema">
+          {% if polls.is_empty() %}
+          <div class="empty">等待首轮。添加影院 watch 后会自动建立 poll 列表。</div>
+          {% else %}
+          {% for p in polls %}
+          <div class="poll-row">
+            <span class="status-dot {{ p.status_class }}"></span>
+            <span class="poll-name" title="{{ p.cinema_id }}">{{ p.name }}</span>
+            <span class="poll-meta">{{ p.watch_count }}w</span>
+            <span class="poll-meta">{{ p.duration }} · {{ p.shows }} 场</span>
+          </div>
+          {% endfor %}
+          {% endif %}
+        </div>
+        <div data-poll-panel="city" hidden>
+          {% if city_scans.is_empty() %}
+          <div class="empty">还没有全城开售 watch。</div>
+          {% else %}
+          {% for c in city_scans %}
+          <a class="poll-row poll-row-city" href="{{ c.href }}" title="{{ c.title }}{% if !c.error.is_empty() %} · {{ c.error }}{% endif %}">
+            <span class="status-dot {{ c.status_class }}"></span>
+            <span class="city-poll-main">
+              <span class="poll-name">{{ c.title }}
+                {% if c.imax_only %}<span class="watch-tag imax">IMAX</span>{% endif %}
+              </span>
+              <span class="city-poll-sub">
+                <span>{{ c.status_text }}</span>
+                <span>{{ c.stage }}</span>
+                <span>{{ c.dates }}</span>
+                <span>{{ c.last_polled }}</span>
+                <span>{{ c.duration }} · {{ c.detail }}</span>
+                {% if !c.fired.is_empty() %}<span>{{ c.fired }}</span>{% endif %}
+              </span>
+            </span>
+          </a>
+          {% endfor %}
+          {% endif %}
+        </div>
       </div>
     </div>
   </section>
@@ -244,7 +275,7 @@
       <div>
         <p class="eyebrow">Poll health</p>
         <h2>Poll 健康 · 今日</h2>
-        <p>{{ poll_health.day_label }} · 00:00–24:00；曲线按 5 分钟聚合，表格列出今天最近 10 轮。</p>
+        <p>{{ poll_health.day_label }} · 00:00–24:00；影院轮询 + 全城扫描的基础 JSON 获取。纵轴为单次 JSON 耗时，线条颜色表示状态；曲线按 5 分钟聚合，表格列出今天最近 10 轮。</p>
       </div>
       <span class="badge {{ poll_health.last_status_class }}">{{ poll_health.last_status_text }}</span>
     </div>
@@ -259,7 +290,7 @@
       <span><i class="bad"></i>风控 / 被封</span>
     </div>
     <table class="table poll-health-table">
-      <thead><tr><th>时间</th><th class="num">成功</th><th class="num">速度</th><th>状态</th></tr></thead>
+      <thead><tr><th>时间</th><th class="num">JSON 成功</th><th class="num">单次耗时</th><th>状态</th></tr></thead>
       <tbody>
       {% for r in poll_health.rows %}
       <tr{% if !r.error.is_empty() %} title="{{ r.error }}"{% endif %}>
@@ -286,7 +317,7 @@
     </div>
     <div class="health-row"><span class="health-key">轮询次数</span><span class="health-val">{{ poll_health.rounds }}</span></div>
     <div class="health-row"><span class="health-key">总成功率</span><span class="health-val">{{ poll_health.success_rate }}</span></div>
-    <div class="health-row"><span class="health-key">平均速度</span><span class="health-val">{{ poll_health.avg_speed }} / 影院</span></div>
+    <div class="health-row"><span class="health-key">平均速度</span><span class="health-val">{{ poll_health.avg_speed }} / 基础 JSON</span></div>
     <div class="health-row"><span class="health-key">风控轮次</span><span class="health-val">{{ poll_health.blocked_rounds }}</span></div>
     <div class="health-row"><span class="health-key">失败轮次</span><span class="health-val">{{ poll_health.failed_rounds }}</span></div>
     <div class="health-row"><span class="health-key">最近轮询</span><span class="health-val">{{ poll_health.last_time }}</span></div>
@@ -301,7 +332,7 @@
     {% if !poll_health.last_error.is_empty() %}
     <div class="alert-strip"><strong>最近一次错误 · {{ poll_health.last_error_time }}</strong><br>{{ poll_health.last_error }}</div>
     {% endif %}
-    <div class="form-note" style="margin-top:16px">速度是单影院平均抓取耗时；风控轮次表示这一轮至少有一个影院返回 406 / captcha / 风控页。</div>
+    <div class="form-note" style="margin-top:16px">一份基础 JSON = 一次影院详情请求，或一次 showdays / 城市影院列表请求。速度是单次 JSON 平均耗时；风控轮次表示这一轮至少有一个请求返回 406 / captcha / 风控页。</div>
   </div>
 </section>
 

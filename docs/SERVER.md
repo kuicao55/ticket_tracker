@@ -36,10 +36,13 @@
 设计取舍：
 
 - **通知投递不持久化**：monitor 触发后 push 给 dispatcher；Gofer 不在线就记录失败/丢弃，可接受。
-- **不探活**：监控不检查 Gofer / 微信 / 小红书状态；Gofer 离线不是监控健康异常。
+- **不主动探活**：监控不做额外健康检查；但通知/锁票投递重试后仍失败会进入全局健康异常。
 - **Gofer 不轮询**：暴露 `POST /notify` / `POST /lock`，收到即 202，通知与锁票各自串行执行。
 - **poll 快照不落盘**：每轮抓取的影院快照只在内存；落盘的是 watch 基线、图表采样与每轮健康采样。
-- **watch 去重**：`movie_id + sorted(cinemas) + time_spec + imax_only` 相同的 watch 复用。
+- **watch 去重**：cinema watch 用 `movie_id + sorted(cinemas) + time_spec + imax_only`；
+  全城开售 watch 用独立的 `city:{city_id}|{movie_id}|all|{imax}` key，两者互不冲突。
+- **两条监控路径**：cinema watch 逐影院抓 `cinemaDetail`；city watch 每轮先查
+  `showdays`，有预售日期后再查一次城市影院列表，不逐影院抓取。
 - **用户层在业务侧**：users/subscriptions 表与 API 已就绪；真实微信登录/订阅消息适配器留接口。
 - **自动锁票在 Gofer**：主服务只把 lock 任务 push 给 Gofer；booker 在 Mac 上执行，
   结果记录在 Gofer 面板。自动锁票在监控面板里是一个 `AUTO LOCK`
@@ -125,12 +128,12 @@ HTTP：
 - `GET /health`
 
 监控主服务只在 settings 里保存 `agent_url` / `agent_token`，向 Gofer 投递，不读取
-Gofer `/health`，也不因为 Gofer 不在线产生健康告警。Gofer 的 `--dry-run` 只影响
+Gofer `/health`；投递失败会重试一次，最终失败才计入健康异常。Gofer 的 `--dry-run` 只影响
 微信/小红书通知；锁票始终真锁。
 
 ## 5. 数据库
 
-SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql`、`0003_movies.sql`、`0004_poll_health.sql`、`0005_watch_channel_config.sql`。
+SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql`、`0003_movies.sql`、`0004_poll_health.sql`、`0005_watch_channel_config.sql`、`0006_city_watch.sql`、`0007_json_fetch_health.sql`。
 
 | 表 | 作用 |
 |---|---|
@@ -138,12 +141,13 @@ SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql
 | `cinemas` | 影院注册表（收藏夹/名称缓存）；Web 影院选择器的数据源 |
 | `movies` | 电影列表缓存；从猫眼热映/即将/经典拉取，或从已有 watch 导入 |
 | `polls` | 当前被 enabled watch 使用的唯一影院 + 最近抓取状态/耗时/场次数 |
-| `watches` | watch 过滤条件 + `auto_lock` / 锁票参数；`filter_key` UNIQUE 去重 |
+| `watches` | watch 过滤条件 + `scope`（cinema/city）+ `city_id` + `auto_lock` / 锁票参数；`filter_key` UNIQUE 去重 |
+| `watch_city_state` | 全城开售 watch 的 1:1 状态：fired、首批影院/场次、最近轮询、可预售日期 |
 | `lock_state` | 每 watch × 影院的锁票状态（ok/failed/exhausted/tries/last_event_id） |
 | `watch_cinemas` | watch × cinema |
 | `watch_state` | 每个 watch × 影院的上次小时桶基线（engine JSON） |
 | `watch_metrics` | 图表采样：total / IMAX / buckets / added，保留 7 天 |
-| `poll_health` | 每轮 poll 健康采样：影院成功/失败、疑似风控数、单影院平均耗时，保留 7 天 |
+| `poll_health` | 每轮基础 JSON 采样：影院请求 + 全城扫描请求的成功/失败、疑似风控数、单次平均耗时，保留 7 天 |
 | `users` | 小程序用户（openid/unionid/nickname） |
 | `channels` | 通知渠道（discord/webhook/email/wechat_local/xhs_local/autolock/wechat_miniprogram） |
 | `watch_channels` | watch × channel 绑定 + `config_json`（该 watch 的群名/URL/agent 地址/锁票参数） |
@@ -158,13 +162,36 @@ SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql
   2. build_poll_plan → 唯一影院集合
   3. sync_polls（watch_count/last status）
   4. fetch_plan_live（并发 + gzip）
-  5. 记录 poll_health（成功率 / 风控 / 速度）
+  5. 记录 poll_health（影院 JSON + 全城扫描 JSON 的成功率 / 风控 / 速度）
   6. evaluate_cinema（engine 纯逻辑）
   7. 事务写回 watch_state + watch_metrics
   8. 有增量 → 内存事件 + dispatcher push
 ```
 
 影院快照本身不落盘；落盘的是**基线**、**图表采样**和**每轮健康采样**。
+
+### 全城开售 watch
+
+```text
+每轮（cinema watch 之外）：
+  1. 读 enabled 的 scope=city watch + watch_city_state
+  2. 已 fired → 不再发 HTTP，只回填状态
+  3. showdays（城市 + 影片）→ code=109/空日期 = 等待开售
+  4. 有可预售日期 → 按日期升序查城市影院列表，遇到首个非空日期停止
+  5. 取该日期最早场次（日期优先、时间其次）
+  6. 原子 mark fired=1 → 推送一次 → 后续轮询跳过
+```
+
+- 每个 `(city_id, movie_id)` 每轮只查一次 showdays，IMAX 变体共享。
+- IMAX 模式给城市接口加 `hallTypeIds=["2"]&hallType=["2"]`，返回 `cellShows`（含精确场次/seqNo）。
+- 全城 watch 不写 `watch_cinemas` / `watch_state`；用 `watch_city_state.fired` 做“最多推送一次”门闩。
+- 首次拿到非空结果立即推送（不静默建基线）；修改电影/城市/IMAX 或调用 rearm 会重新武装。
+- city 探测在同一个 monitor 任务内并发：showdays 按唯一 `(city, movie)` 并发，城市影院列表按 watch 并发，
+  结果回到主循环顺序落库/触发；单个请求失败不会阻塞其他 watch。
+- city 探测失败会计入全局健康（与影院抓取一起进入 health_ok / Discord 健康告警）。
+- 通知 / 锁票投递失败重试一次（webhook 层原本已有 3 次重试）；最终仍失败会写入健康异常，
+  并在下一轮 monitor 合并进 `health_ok` / 健康告警。
+- 全城 watch 仍遵守全局静默时段（默认 `01:00–06:00` 暂停轮询）。
 
 ## 6. API v1
 
@@ -188,6 +215,7 @@ SQLite + WAL，迁移文件：`rs/migrations/0001_init.sql`、`0002_autolock.sql
 | GET/PATCH/DELETE | `/api/v1/watches/:id` | 详情 / 编辑 / 删除 |
 | GET/PUT | `/api/v1/watches/:id/channels` | 绑定渠道 |
 | GET | `/api/v1/watches/:id/metrics?range=24h\|7d\|30d` | 图表数据 |
+| POST | `/api/v1/watches/:id/rearm` | 重新武装全城开售 watch |
 | GET/POST | `/api/v1/channels` | 渠道列表 / 新建 |
 | PATCH/DELETE | `/api/v1/channels/:id` | 修改 / 删除 |
 | GET/POST | `/api/v1/users` | 用户列表 / 新建 |
@@ -213,6 +241,12 @@ curl -X POST http://127.0.0.1:8787/api/v1/watches \
        "cinemas":["37534"],"time":"2026-11-12 19:00-22:00",
        "imax_only":true}'
 
+# 全城开售 watch：不传 cinemas
+curl -X POST http://127.0.0.1:8787/api/v1/watches \
+  -H 'Content-Type: application/json' \
+  -d '{"movie_id":1503101,"movie_name":"沙丘3",
+       "scope":"city","city_id":10,"imax_only":true}'
+
 curl -X POST http://127.0.0.1:8787/api/v1/users \
   -H 'Content-Type: application/json' \
   -d '{"openid":"o_xxx","nickname":"用户"}'
@@ -226,17 +260,22 @@ curl -X POST http://127.0.0.1:8787/api/v1/subscriptions \
 
 - `/`：KPI（polls / watches / users / subscriptions / 检查间隔圆环 / uptime）、
   watch leaderboard（按订阅数降序，显示当前基线场次数 + 24h 迷你折线）、顶部监控开关、健康、
-  poll 列表、最近事件、users、**Poll 健康今日图（00:00–24:00）**（成功率曲线按 5 分钟聚合，
+  poll 列表、最近事件、users、**Poll 健康今日图（00:00–24:00）**（影院轮询 + 全城扫描的基础 JSON 单次耗时曲线，纵轴为耗时、线条颜色表示状态，按 5 分钟聚合，
   正常绿 / 部分失败黄 / 风控红，附最近 10 轮状态与速度）。
 - `/watches`：全部 watch。
-- `/watches/new`：电影/影院使用**可搜索下拉菜单**（电影支持任意片名/ID，
-  影院支持名称/ID/地址），时间用「不限 / 每天固定时段 / 指定日期」；
-  日期是**酒店式范围弹层**，小时是 **GitHub 贡献图风格方块**；**不需要输入任何 ID**。
+- `/watches/new`：顶部切换两种模式：
+  - **指定影院**：电影/影院使用**可搜索下拉菜单**（电影支持任意片名/ID，
+    影院支持名称/ID/地址），时间用「不限 / 每天固定时段 / 指定日期」；
+    日期是**酒店式范围弹层**，小时是 **GitHub 贡献图风格方块**；**不需要输入任何 ID**。
+  - **全城开售**：只选电影 + 城市 + 是否 IMAX；自动跟踪所有可预售日期，
+    首批开售时推送日期/时间最早的一家影院。
 - `movies` 缓存在 SQLite；右上角「刷新电影列表」可更新热映/即将/经典。
 - `/watches/:id`：过滤条件（电影/影院弹窗 + 时间选择器）、订阅用户、**通知渠道卡片**
   （点「绑定/配置」弹窗填写该 watch 独立参数：Discord URL、邮箱、小红书群名、
   Agent 地址/token；`AUTO LOCK` 卡片含票数/重试/座位 + 每影院锁票状态）、
   固定坐标轴基线图、按日期分段标签筛选的**基线场次表**（只列基线里存在的日期/场次）。
+  全城 watch 展示城市开售状态、可预售日期、首批影院/最早场次，并提供**重新武装**按钮；
+  不显示基线场次表。
 - `/users`：用户列表 + 测试用户创建。
 - `/settings`：检查间隔、静默窗口、Discord 健康告警、Gofer 投递地址、渠道默认值、
   小程序配置、影院搜索城市（`maoyan_city_id`，默认 10=上海）。
@@ -261,8 +300,11 @@ watch 触发
   还可以在绑定里覆盖 Gofer URL / token（存储字段仍为 `agent_url` / `agent_token`，留空回退全局）。
 - 每个渠道独立失败，不互相阻塞。
 - 不持久化、不重试队列；Gofer/通知服务挂掉 = 丢事件（已接受）。
-- 静默窗口内不抓取、不发送。
+- 静默窗口内不抓取、不发送（全城开售 watch 同样遵守）。
 - 健康异常只在「正常 → 异常」时发一次 Discord；不发启动/停止/心跳。
+- 全城开售事件只包含**一条** `triggers`（首批最早影院），因此自动锁票最多提交一个影院；
+  事件额外携带 `show_time` / `seq_no` / `hall` / `format`，Gofer 代码不需要改动。
+- 全城 watch 状态：`waiting`（等待开售）、`fired`（已推送）、`error`（探测失败）。
 
 ### 自动锁票
 
@@ -326,8 +368,8 @@ watch 触发
 - 下载后强制校验 SHA256；校验通过才替换当前二进制，并保留 `.bak`。
 - 发版：
   ```bash
-  git tag v4.9.0
-  git push origin v4.9.0
+  git tag v4.11.0
+  git push origin v4.11.0
   ```
   `.github/workflows/release.yml` 会构建 macOS x86_64/aarch64 二进制、生成
   `SHA256SUMS` 并发布 Release。

@@ -13,7 +13,7 @@ use axum::middleware;
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::Router;
-use chrono::{TimeZone, Timelike};
+use chrono::{TimeZone, Timelike, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tower_http::services::ServeDir;
@@ -61,6 +61,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/actions/watches/:id/lock", post(action_update_lock))
         .route("/actions/subscriptions", post(action_subscribe))
         .route("/actions/watches/:id/toggle", post(action_toggle_watch))
+        .route("/actions/watches/:id/rearm", post(action_rearm_watch))
         .route("/actions/watches/:id/delete", post(action_delete_watch))
         .route(
             "/actions/watches/:id/toggle-detail",
@@ -96,6 +97,7 @@ pub fn router(state: Arc<AppState>) -> Router {
 #[derive(Debug, Clone)]
 pub struct CountsView {
     pub polls: i64,
+    pub city_scans: i64,
     pub watches: i64,
     pub users: i64,
     pub subscriptions: i64,
@@ -135,9 +137,18 @@ pub struct WatchItemView {
     pub cinema_title: String,
     pub time_label: String,
     pub imax_only: bool,
+    pub is_city: bool,
+    pub city_name: String,
     pub bar_pct: i64,
     pub baseline_total: i64,
     pub sparkline: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct CityChoiceView {
+    pub id: u32,
+    pub name: String,
+    pub selected: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +161,23 @@ pub struct PollItemView {
     pub last_polled: String,
     pub duration: String,
     pub shows: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct CityScanItemView {
+    pub href: String,
+    pub title: String,
+    pub city_name: String,
+    pub imax_only: bool,
+    pub status_text: String,
+    pub status_class: String,
+    pub stage: String,
+    pub dates: String,
+    pub last_polled: String,
+    pub duration: String,
+    pub detail: String,
+    pub fired: String,
+    pub error: String,
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +341,7 @@ struct DashboardTemplate {
     health: HealthView,
     top_watches: Vec<WatchItemView>,
     polls: Vec<PollItemView>,
+    city_scans: Vec<CityScanItemView>,
     events: Vec<EventView>,
     users: Vec<UserItemView>,
     user_total: i64,
@@ -340,6 +369,8 @@ struct NewWatchTemplate {
     cinemas: Vec<CinemaChoiceView>,
     time_spec_json: String,
     city_id: u32,
+    scope: String,
+    cities: Vec<CityChoiceView>,
 }
 
 #[derive(Template)]
@@ -374,6 +405,23 @@ struct DetailTemplate {
     chart: ChartView,
     baseline_days: Vec<BaselineDayView>,
     city_id: u32,
+    is_city: bool,
+    city_name: String,
+    city_choices: Vec<CityChoiceView>,
+    city_fired: bool,
+    city_fired_at: String,
+    city_fired_cinema: String,
+    city_fired_cinema_id: String,
+    city_fired_date: String,
+    city_fired_time: String,
+    city_fired_seq_no: String,
+    city_fired_is_imax: bool,
+    city_monitored_dates: String,
+    city_last_polled: String,
+    city_last_ok: String,
+    city_last_error: String,
+    city_last_cinema_count: i64,
+    city_last_show_count: i64,
 }
 
 #[derive(Template)]
@@ -496,6 +544,15 @@ fn fmt_ts(ts: Option<f64>) -> String {
         .unwrap_or_else(|| "—".into())
 }
 
+fn fmt_sqlite_since(s: Option<&str>) -> String {
+    let ts = s.and_then(|s| {
+        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+            .ok()
+            .map(|ndt| Utc.from_utc_datetime(&ndt).timestamp() as f64)
+    });
+    fmt_since(ts)
+}
+
 fn fmt_since(ts: Option<f64>) -> String {
     let Some(ts) = ts else {
         return "—".into();
@@ -515,6 +572,8 @@ fn fmt_since(ts: Option<f64>) -> String {
 fn status_label(status: &str) -> (&'static str, &'static str) {
     match status {
         "triggered" => ("有新增", "warn"),
+        "fired" => ("已推送", "on"),
+        "waiting" => ("等待开售", "flat"),
         "monitoring" => ("监控中", "on"),
         "initializing" => ("建基线", "flat"),
         "no_movie" => ("未上架", "flat"),
@@ -574,7 +633,16 @@ fn watch_items(
                 "未触发".into()
             };
             let cinemas = watch_cinemas.get(&w.id).map(Vec::as_slice).unwrap_or(&[]);
-            let (cinema_label, cinema_title) = cinema_labels(cinemas, cinema_names);
+            let (cinema_label, cinema_title) = if w.is_city() {
+                let city = if w.city_name.trim().is_empty() {
+                    crate::cities::resolve_name(w.city_id.max(0) as u32)
+                } else {
+                    w.city_name.clone()
+                };
+                (format!("全城 · {}", city), city)
+            } else {
+                cinema_labels(cinemas, cinema_names)
+            };
             WatchItemView {
                 href: format!("/watches/{}", w.id),
                 id: w.id.clone(),
@@ -589,11 +657,21 @@ fn watch_items(
                 status_class,
                 enabled: w.enabled,
                 last_trigger,
-                cinemas: cinemas.len(),
+                cinemas: if w.is_city() { 0 } else { cinemas.len() },
                 cinema_label,
                 cinema_title,
-                time_label: time_brief(w),
+                time_label: if w.is_city() {
+                    "全部开售日期".into()
+                } else {
+                    time_brief(w)
+                },
                 imax_only: w.imax_only,
+                is_city: w.is_city(),
+                city_name: if w.city_name.trim().is_empty() {
+                    crate::cities::resolve_name(w.city_id.max(0) as u32)
+                } else {
+                    w.city_name.clone()
+                },
                 bar_pct: if max_subs <= 0 {
                     0
                 } else {
@@ -776,6 +854,18 @@ struct HealthPoint {
     total: i64,
     blocked: i64,
     err: i64,
+    /// 该 5 分钟桶内按请求数加权的单次 JSON 耗时总和。
+    ms_weighted: i64,
+}
+
+impl HealthPoint {
+    fn avg_ms(&self) -> i64 {
+        if self.total > 0 {
+            self.ms_weighted / self.total
+        } else {
+            0
+        }
+    }
 }
 
 fn health_points(rows: &[PollHealthRow]) -> Vec<HealthPoint> {
@@ -789,12 +879,14 @@ fn health_points(rows: &[PollHealthRow]) -> Vec<HealthPoint> {
             total: 0,
             blocked: 0,
             err: 0,
+            ms_weighted: 0,
         });
         point.ts = point.ts.max(row.recorded_ts);
-        point.ok += row.cinemas_ok;
-        point.total += row.cinemas_total;
-        point.blocked += row.blocked_cinemas;
-        point.err += row.cinemas_err;
+        point.ok += row.json_ok();
+        point.total += row.json_total();
+        point.blocked += row.json_blocked();
+        point.err += row.json_err();
+        point.ms_weighted += row.json_avg_ms() * row.json_total();
     }
     buckets.into_values().collect()
 }
@@ -805,20 +897,25 @@ fn poll_health_svg(points: &[HealthPoint], start_ts: i64, end_ts: i64) -> String
     }
     const W: f64 = 640.0;
     const H: f64 = 158.0;
-    const LEFT: f64 = 38.0;
+    const LEFT: f64 = 48.0;
     const RIGHT: f64 = 8.0;
     const TOP: f64 = 10.0;
     const BOTTOM: f64 = 10.0;
     let span = (end_ts - start_ts).max(1) as f64;
     let px = |ts: i64| LEFT + ((ts - start_ts) as f64 / span).clamp(0.0, 1.0) * (W - LEFT - RIGHT);
-    let py = |rate: f64| TOP + (1.0 - rate.clamp(0.0, 1.0)) * (H - TOP - BOTTOM);
-    let rate = |p: &HealthPoint| {
-        if p.total > 0 {
-            p.ok as f64 / p.total as f64
-        } else {
-            0.0
-        }
+    let raw_max = points.iter().map(|p| p.avg_ms()).max().unwrap_or(0).max(1) as f64;
+    let axis_step = if raw_max <= 200.0 {
+        50.0
+    } else if raw_max <= 1000.0 {
+        100.0
+    } else if raw_max <= 5000.0 {
+        500.0
+    } else {
+        1000.0
     };
+    let axis_max = (raw_max / axis_step).ceil() * axis_step;
+    let py = |ms: f64| TOP + (1.0 - (ms / axis_max).clamp(0.0, 1.0)) * (H - TOP - BOTTOM);
+    let speed = |p: &HealthPoint| p.avg_ms() as f64;
     let color = |p: &HealthPoint| {
         if p.blocked > 0 {
             "#a64535"
@@ -830,17 +927,18 @@ fn poll_health_svg(points: &[HealthPoint], start_ts: i64, end_ts: i64) -> String
     };
 
     let mut svg = format!(
-        "<svg class=\"poll-health-svg\" viewBox=\"0 0 {W:.0} {H:.0}\" role=\"img\" aria-label=\"poll 成功率\">"
+        "<svg class=\"poll-health-svg\" viewBox=\"0 0 {W:.0} {H:.0}\" role=\"img\" aria-label=\"poll 单次 JSON 耗时\">"
     );
-    for (label, value) in [("100%", 1.0), ("50%", 0.5), ("0%", 0.0)] {
+    for value in [axis_max, axis_max / 2.0, 0.0] {
         let y = py(value);
         svg.push_str(&format!(
             "<line x1=\"{LEFT:.1}\" y1=\"{y:.1}\" x2=\"{:.1}\" y2=\"{y:.1}\" stroke=\"#e3dacc\" stroke-width=\"1\" stroke-dasharray=\"2 4\"/>",
             W - RIGHT
         ));
         svg.push_str(&format!(
-            "<text x=\"0\" y=\"{:.1}\" fill=\"#87867f\" font-family=\"'JetBrains Mono','SF Mono',monospace\" font-size=\"9\">{label}</text>",
-            y + 3.0
+            "<text x=\"0\" y=\"{:.1}\" fill=\"#87867f\" font-family=\"'JetBrains Mono','SF Mono',monospace\" font-size=\"9\">{}</text>",
+            y + 3.0,
+            fmt_axis_ms(value as i64)
         ));
     }
     for pair in points.windows(2) {
@@ -855,9 +953,9 @@ fn poll_health_svg(points: &[HealthPoint], start_ts: i64, end_ts: i64) -> String
         svg.push_str(&format!(
             "<line x1=\"{:.1}\" y1=\"{:.1}\" x2=\"{:.1}\" y2=\"{:.1}\" stroke=\"{stroke}\" stroke-width=\"2\" stroke-linecap=\"round\"/>",
             px(a.ts),
-            py(rate(a)),
+            py(speed(a)),
             px(b.ts),
-            py(rate(b))
+            py(speed(b))
         ));
     }
     for point in points {
@@ -867,10 +965,12 @@ fn poll_health_svg(points: &[HealthPoint], start_ts: i64, end_ts: i64) -> String
             .map(|d| d.format("%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "—".into());
         svg.push_str(&format!(
-            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"2.4\" fill=\"{}\"><title>{ts} · {}/{} 成功{}</title></circle>",
+            "<circle cx=\"{:.1}\" cy=\"{:.1}\" r=\"2.4\" fill=\"{}\"><title>{} · {} · {}/{} 成功{}</title></circle>",
             px(point.ts),
-            py(rate(point)),
+            py(speed(point)),
             color(point),
+            ts,
+            fmt_axis_ms(point.avg_ms()),
             point.ok,
             point.total,
             if point.blocked > 0 {
@@ -886,10 +986,20 @@ fn poll_health_svg(points: &[HealthPoint], start_ts: i64, end_ts: i64) -> String
     svg
 }
 
+fn fmt_axis_ms(ms: i64) -> String {
+    if ms <= 0 {
+        "0ms".into()
+    } else if ms < 1000 {
+        format!("{}ms", ms)
+    } else {
+        format!("{:.1}s", ms as f64 / 1000.0)
+    }
+}
+
 fn poll_health_status(row: &PollHealthRow) -> (&'static str, &'static str) {
-    if row.blocked_cinemas > 0 {
+    if row.json_blocked() > 0 {
         ("风控", "bad")
-    } else if row.cinemas_err > 0 {
+    } else if row.json_err() > 0 {
         ("部分失败", "warn")
     } else {
         ("正常", "ok")
@@ -945,17 +1055,18 @@ fn poll_health_view(
         String::new()
     };
 
-    let total: i64 = rows.iter().map(|r| r.cinemas_total).sum();
-    let ok: i64 = rows.iter().map(|r| r.cinemas_ok).sum();
+    let total: i64 = rows.iter().map(|r| r.json_total()).sum();
+    let ok: i64 = rows.iter().map(|r| r.json_ok()).sum();
     let success_rate = if total > 0 {
         format!("{:.1}%", ok as f64 * 100.0 / total as f64)
     } else {
         "—".into()
     };
-    let avg_speed = if rows.is_empty() {
-        "—".into()
+    let avg_speed = if total > 0 {
+        let weighted: i64 = rows.iter().map(|r| r.json_avg_ms() * r.json_total()).sum();
+        fmt_ms(weighted / total)
     } else {
-        fmt_ms(rows.iter().map(|r| r.duration_ms).sum::<i64>() / rows.len() as i64)
+        "—".into()
     };
     let latest = rows.last();
     let (last_status_text, last_status_class) = latest
@@ -968,10 +1079,10 @@ fn poll_health_view(
     let last_detail = latest
         .map(|r| {
             format!(
-                "{}/{} 影院成功 · {}",
-                r.cinemas_ok,
-                r.cinemas_total,
-                fmt_ms(r.duration_ms)
+                "{}/{} 基础 JSON 成功 · {}",
+                r.json_ok(),
+                r.json_total(),
+                fmt_ms(r.json_avg_ms())
             )
         })
         .unwrap_or_default();
@@ -988,9 +1099,9 @@ fn poll_health_view(
             let (status_text, status_class) = poll_health_status(r);
             PollHealthRowView {
                 time: fmt_health_clock(r.recorded_ts),
-                ok: r.cinemas_ok,
-                total: r.cinemas_total,
-                speed: fmt_ms(r.duration_ms),
+                ok: r.json_ok(),
+                total: r.json_total(),
+                speed: fmt_ms(r.json_avg_ms()),
                 status_text: status_text.into(),
                 status_class: status_class.into(),
                 error: r.error_summary.clone().unwrap_or_default(),
@@ -1011,8 +1122,8 @@ fn poll_health_view(
         rounds: rows.len(),
         success_rate,
         avg_speed,
-        blocked_rounds: rows.iter().filter(|r| r.blocked_cinemas > 0).count(),
-        failed_rounds: rows.iter().filter(|r| r.cinemas_err > 0).count(),
+        blocked_rounds: rows.iter().filter(|r| r.json_blocked() > 0).count(),
+        failed_rounds: rows.iter().filter(|r| r.json_err() > 0).count(),
         last_time,
         last_status_text,
         last_status_class,
@@ -1224,6 +1335,76 @@ async fn build_dashboard(
         })
         .collect();
 
+    let city_scans = st
+        .db
+        .list_city_scans(8)
+        .await?
+        .into_iter()
+        .map(|r| {
+            let (status_text, status_class) = match status.get(&r.watch_id) {
+                Some(st) => watch_status_text(Some(st), r.enabled),
+                None if r.fired => ("已推送".to_string(), "on".to_string()),
+                None if r.last_ok == Some(false) => ("出错".to_string(), "bad".to_string()),
+                None if r.last_ok == Some(true) => ("等待开售".to_string(), "flat".to_string()),
+                None => ("等待首轮".to_string(), "flat".to_string()),
+            };
+            let dates: Vec<String> = serde_json::from_str(&r.last_dates_json).unwrap_or_default();
+            let city_name = if r.city_name.trim().is_empty() {
+                crate::cities::resolve_name(r.city_id.max(0) as u32)
+            } else {
+                r.city_name.clone()
+            };
+            let movie_name = if r.movie_name.trim().is_empty() {
+                r.watch_id.clone()
+            } else {
+                r.movie_name.clone()
+            };
+            let dates_label = if dates.is_empty() {
+                "—".to_string()
+            } else {
+                format!(
+                    "{} 天 · {}",
+                    dates.len(),
+                    dates.first().cloned().unwrap_or_default()
+                )
+            };
+            let fired = if r.fired {
+                [
+                    r.fired_cinema_name.clone().unwrap_or_default(),
+                    r.fired_date.clone().unwrap_or_default(),
+                    r.fired_show_time.clone().unwrap_or_default(),
+                ]
+                .into_iter()
+                .filter(|s| !s.is_empty())
+                .collect::<Vec<_>>()
+                .join(" · ")
+            } else {
+                String::new()
+            };
+            CityScanItemView {
+                href: format!("/watches/{}", r.watch_id),
+                title: format!("{} · {}", city_name, movie_name),
+                city_name,
+                imax_only: r.imax_only,
+                status_text,
+                status_class,
+                stage: if r.fired {
+                    "已停止".into()
+                } else if dates.is_empty() {
+                    "showdays".into()
+                } else {
+                    "城市影院列表".into()
+                },
+                dates: dates_label,
+                last_polled: fmt_sqlite_since(r.last_polled_at.as_deref()),
+                duration: fmt_ms(r.last_duration_ms),
+                detail: format!("{} 家 · {} 场", r.last_cinema_count, r.last_show_count),
+                fired,
+                error: r.last_error.unwrap_or_default(),
+            }
+        })
+        .collect();
+
     let user_total = st.db.user_count().await?;
     let (day_start, day_end, day_label) = local_day_bounds();
     let health_today = st
@@ -1243,6 +1424,7 @@ async fn build_dashboard(
         next_poll_ts: h.next_poll_at.unwrap_or(0.0),
         counts: CountsView {
             polls: st.db.poll_count().await?,
+            city_scans: st.db.city_watch_count().await?,
             watches: st.db.watch_count().await?,
             users: user_total,
             subscriptions: st.db.subscription_count().await?,
@@ -1251,6 +1433,7 @@ async fn build_dashboard(
         health: health_view(&h),
         top_watches: items,
         polls,
+        city_scans,
         events,
         users,
         user_total,
@@ -1465,6 +1648,84 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
     let (version, now) = meta();
     let settings = Settings::load(&st.db).await.ok();
     let city_id = settings.as_ref().map(|s| s.maoyan_city_id).unwrap_or(10);
+    let is_city = w.is_city();
+    let selected_city_id = if is_city {
+        w.city_id.max(0) as u32
+    } else {
+        city_id
+    };
+    let city_name = if w.city_name.trim().is_empty() {
+        crate::cities::resolve_name(selected_city_id)
+    } else {
+        w.city_name.clone()
+    };
+    let city_choices = city_choices(selected_city_id);
+    let city_state = if is_city {
+        st.db.city_state(id).await?
+    } else {
+        None
+    };
+    let city_dates: Vec<String> = city_state
+        .as_ref()
+        .and_then(|s| serde_json::from_str::<Vec<String>>(&s.last_dates_json).ok())
+        .unwrap_or_default();
+    let city_monitored_dates = if city_dates.is_empty() {
+        "—".to_string()
+    } else {
+        city_dates.join("、")
+    };
+    let city_fired = city_state.as_ref().map(|s| s.fired).unwrap_or(false);
+    let city_fired_at = city_state
+        .as_ref()
+        .and_then(|s| s.fired_at.clone())
+        .unwrap_or_else(|| "—".into());
+    let city_fired_cinema = city_state
+        .as_ref()
+        .and_then(|s| s.fired_cinema_name.clone())
+        .unwrap_or_default();
+    let city_fired_cinema_id = city_state
+        .as_ref()
+        .and_then(|s| s.fired_cinema_id.clone())
+        .unwrap_or_default();
+    let city_fired_date = city_state
+        .as_ref()
+        .and_then(|s| s.fired_date.clone())
+        .unwrap_or_default();
+    let city_fired_time = city_state
+        .as_ref()
+        .and_then(|s| s.fired_show_time.clone())
+        .unwrap_or_default();
+    let city_fired_seq_no = city_state
+        .as_ref()
+        .and_then(|s| s.fired_seq_no.clone())
+        .unwrap_or_default();
+    let city_fired_is_imax = city_state
+        .as_ref()
+        .map(|s| s.fired_is_imax)
+        .unwrap_or(false);
+    let city_last_polled = city_state
+        .as_ref()
+        .and_then(|s| s.last_polled_at.clone())
+        .unwrap_or_else(|| "—".into());
+    let city_last_ok = match city_state.as_ref().and_then(|s| s.last_ok) {
+        Some(true) => "正常".to_string(),
+        Some(false) => "失败".to_string(),
+        None => "—".to_string(),
+    };
+    let city_last_error = city_state
+        .as_ref()
+        .and_then(|s| s.last_error.clone())
+        .unwrap_or_default();
+    let city_last_cinema_count = city_state
+        .as_ref()
+        .map(|s| s.last_cinema_count)
+        .unwrap_or(0);
+    let city_last_show_count = city_state.as_ref().map(|s| s.last_show_count).unwrap_or(0);
+    let city_last_imax_count = city_state.as_ref().map(|s| s.last_imax_count).unwrap_or(0);
+    let city_last_bucket_count = city_state
+        .as_ref()
+        .map(|s| s.last_bucket_count)
+        .unwrap_or(0);
     let global_agent_url = settings
         .as_ref()
         .map(|s| s.agent_url.clone())
@@ -1475,7 +1736,11 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
         .is_some();
     let status = st.watch_status_snapshot();
     let stt = status.get(id);
-    let (status_text, status_class) = watch_status_text(stt, w.enabled);
+    let (status_text, status_class) = if is_city && city_fired && stt.is_none() {
+        ("已推送".to_string(), "on".to_string())
+    } else {
+        watch_status_text(stt, w.enabled)
+    };
     let cinemas = st.db.watch_cinemas(id).await?;
     let selected_set: HashSet<String> = cinemas.iter().cloned().collect();
     let all_cinemas = st.db.list_cinemas().await?;
@@ -1563,7 +1828,20 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
 
     let states = st.db.watch_states(id).await?;
     let (base_total, base_imax, base_buckets) = baseline_stats(&states, w.imax_only);
-    let baseline_days = baseline_days_from_states(&states, &names);
+    let (stat_total, stat_imax, stat_buckets) = if is_city {
+        (
+            city_last_show_count.max(0) as usize,
+            city_last_imax_count.max(0) as usize,
+            city_last_bucket_count.max(0) as usize,
+        )
+    } else {
+        (base_total, base_imax, base_buckets)
+    };
+    let baseline_days = if is_city {
+        Vec::new()
+    } else {
+        baseline_days_from_states(&states, &names)
+    };
     let lock_rows = st
         .db
         .lock_states_for_watch(id)
@@ -1598,10 +1876,14 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
         } else {
             w.movie_name.clone()
         },
-        subtitle: format!("{} · {} 个影院", time_summary(&w), cinemas.len()),
-        total: base_total,
-        imax: base_imax,
-        buckets: base_buckets,
+        subtitle: if is_city {
+            format!("全部开售日期 · 全城 {}", city_name)
+        } else {
+            format!("{} · {} 个影院", time_summary(&w), cinemas.len())
+        },
+        total: stat_total,
+        imax: stat_imax,
+        buckets: stat_buckets,
     };
 
     Ok(DetailTemplate {
@@ -1619,7 +1901,11 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
         enabled_text: if w.enabled { "已启用" } else { "已停用" }.into(),
         status_text,
         status_class,
-        time_spec: time_summary(&w),
+        time_spec: if is_city {
+            "全部开售日期".into()
+        } else {
+            time_summary(&w)
+        },
         imax_text: if w.imax_only {
             "只看 IMAX"
         } else {
@@ -1627,16 +1913,20 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
         }
         .into(),
         imax_only: w.imax_only,
-        cinema_count: cinemas.len(),
+        cinema_count: if is_city {
+            city_last_cinema_count.max(0) as usize
+        } else {
+            cinemas.len()
+        },
         time_spec_json: TimeSpec::from_json(&w.time_spec_value())
             .map(|t| t.to_json().to_string())
             .unwrap_or_else(|_| json!({"type":"all"}).to_string()),
         lock_rows,
         cinema_choices,
         subscriber_count: w.subscriber_count,
-        total: base_total,
-        imax: base_imax,
-        buckets: base_buckets,
+        total: stat_total,
+        imax: stat_imax,
+        buckets: stat_buckets,
         created_at: w.created_at.clone(),
         cinemas: cinema_views,
         channels,
@@ -1645,6 +1935,23 @@ async fn build_detail(st: &Arc<AppState>, id: &str) -> anyhow::Result<DetailTemp
         chart,
         baseline_days,
         city_id,
+        is_city,
+        city_name,
+        city_choices,
+        city_fired,
+        city_fired_at,
+        city_fired_cinema,
+        city_fired_cinema_id,
+        city_fired_date,
+        city_fired_time,
+        city_fired_seq_no,
+        city_fired_is_imax,
+        city_monitored_dates,
+        city_last_polled,
+        city_last_ok,
+        city_last_error,
+        city_last_cinema_count,
+        city_last_show_count,
     })
 }
 
@@ -2132,12 +2439,33 @@ struct NewWatchQuery {
     error: Option<String>,
     #[serde(default)]
     movie_error: Option<u8>,
+    #[serde(default)]
+    scope: Option<String>,
+}
+
+fn normalize_scope(scope: Option<&str>) -> String {
+    match scope.map(str::trim) {
+        Some("city") => "city".into(),
+        _ => "cinema".into(),
+    }
+}
+
+fn city_choices(default_city_id: u32) -> Vec<CityChoiceView> {
+    crate::cities::CITIES
+        .iter()
+        .map(|(id, name)| CityChoiceView {
+            id: *id,
+            name: (*name).to_string(),
+            selected: *id == default_city_id,
+        })
+        .collect()
 }
 
 async fn build_new_watch(
     st: &Arc<AppState>,
     error: String,
     movie_error: bool,
+    scope: String,
 ) -> anyhow::Result<NewWatchTemplate> {
     let (version, now) = meta();
     let city_id = Settings::load(&st.db)
@@ -2164,6 +2492,8 @@ async fn build_new_watch(
         cinemas,
         time_spec_json: json!({"type":"all"}).to_string(),
         city_id,
+        scope,
+        cities: city_choices(city_id),
     })
 }
 
@@ -2175,6 +2505,7 @@ async fn new_watch_page(
         &st,
         q.error.unwrap_or_default(),
         q.movie_error.unwrap_or(0) != 0,
+        normalize_scope(q.scope.as_deref()),
     )
     .await
     {
@@ -2195,21 +2526,27 @@ fn parse_time_spec_form(s: &str) -> Result<TimeSpec, String> {
 #[derive(Debug, Deserialize)]
 struct CreateWatchForm {
     movie_id: i64,
+    #[serde(default)]
     cinemas: String,
     #[serde(default)]
     time_spec: String,
     #[serde(default)]
     imax_only: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    city_id: Option<u32>,
 }
 
 async fn action_create_watch(
     State(st): State<Arc<AppState>>,
     Form(f): Form<CreateWatchForm>,
 ) -> Response {
-    let error_page = |st: &Arc<AppState>, msg: String| {
+    let scope = normalize_scope(f.scope.as_deref());
+    let error_page = |st: &Arc<AppState>, msg: String, scope: String| {
         let st = st.clone();
         async move {
-            match build_new_watch(&st, msg, false).await {
+            match build_new_watch(&st, msg, false, scope).await {
                 Ok(t) => render(&t).into_response(),
                 Err(e) => {
                     (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
@@ -2217,17 +2554,36 @@ async fn action_create_watch(
             }
         }
     };
-    let cinemas = split_ids(&f.cinemas);
-    if cinemas.is_empty() {
-        return error_page(&st, "请至少选择一家影院".into()).await;
+    let is_city = scope == "city";
+    let cinemas = if is_city {
+        Vec::new()
+    } else {
+        split_ids(&f.cinemas)
+    };
+    if !is_city && cinemas.is_empty() {
+        return error_page(&st, "请至少选择一家影院".into(), scope).await;
     }
-    let time_spec = match parse_time_spec_form(&f.time_spec) {
-        Ok(t) => t,
-        Err(e) => return error_page(&st, format!("时间选择错误：{}", e)).await,
+    let city_id = if is_city {
+        match f.city_id {
+            Some(id) if id >= 1 => id,
+            _ => return error_page(&st, "请选择城市".into(), scope).await,
+        }
+    } else {
+        0
+    };
+    let time_spec = if is_city {
+        TimeSpec::All
+    } else {
+        match parse_time_spec_form(&f.time_spec) {
+            Ok(t) => t,
+            Err(e) => {
+                return error_page(&st, format!("时间选择错误：{}", e), scope).await;
+            }
+        }
     };
     let movie_name = match st.db.movie_name(f.movie_id).await {
         Ok(Some(n)) if !n.trim().is_empty() => Some(n),
-        _ => return error_page(&st, "请选择一部电影".into()).await,
+        _ => return error_page(&st, "请选择一部电影".into(), scope).await,
     };
     let spec = crate::db::NewWatch {
         movie_id: f.movie_id,
@@ -2237,6 +2593,13 @@ async fn action_create_watch(
         imax_only: f.imax_only.is_some(),
         created_by: None,
         visibility: "public".into(),
+        scope: scope.clone(),
+        city_id,
+        city_name: if is_city {
+            crate::cities::resolve_name(city_id)
+        } else {
+            String::new()
+        },
         auto_lock: false,
         lock_num_seats: crate::db::DEFAULT_LOCK_NUM_SEATS,
         lock_max_retries: crate::db::DEFAULT_LOCK_MAX_RETRIES,
@@ -2252,7 +2615,7 @@ async fn action_create_watch(
             );
             Redirect::to(&format!("/watches/{}", wid)).into_response()
         }
-        Err(e) => error_page(&st, format!("创建失败：{}", e)).await,
+        Err(e) => error_page(&st, format!("创建失败：{}", e), scope).await,
     }
 }
 
@@ -2260,11 +2623,16 @@ async fn action_create_watch(
 struct EditWatchForm {
     #[serde(default)]
     movie_id: Option<i64>,
+    #[serde(default)]
     cinemas: String,
     #[serde(default)]
     time_spec: String,
     #[serde(default)]
     imax_only: Option<String>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    city_id: Option<u32>,
 }
 
 async fn action_edit_watch(
@@ -2272,14 +2640,8 @@ async fn action_edit_watch(
     Path(id): Path<String>,
     Form(f): Form<EditWatchForm>,
 ) -> Response {
-    let cinemas = split_ids(&f.cinemas);
-    if cinemas.is_empty() {
-        return Redirect::to(&format!("/watches/{}", id)).into_response();
-    }
-    let time_spec = match parse_time_spec_form(&f.time_spec) {
-        Ok(t) => t,
-        Err(_) => return Redirect::to(&format!("/watches/{}", id)).into_response(),
-    };
+    let scope = normalize_scope(f.scope.as_deref());
+    let is_city = scope == "city";
     let movie_name = match f.movie_id {
         Some(mid) => match st.db.movie_name(mid).await {
             Ok(Some(name)) => Some(name),
@@ -2287,14 +2649,33 @@ async fn action_edit_watch(
         },
         None => None,
     };
-    let patch = crate::db::WatchPatch {
+    let mut patch = crate::db::WatchPatch {
         movie_id: f.movie_id,
         movie_name,
-        cinemas: Some(cinemas),
-        time_spec: Some(time_spec.to_json()),
         imax_only: Some(f.imax_only.is_some()),
+        scope: Some(scope.clone()),
         ..Default::default()
     };
+    if is_city {
+        let Some(city_id) = f.city_id.filter(|id| *id >= 1) else {
+            return Redirect::to(&format!("/watches/{}", id)).into_response();
+        };
+        patch.city_id = Some(city_id);
+        patch.city_name = Some(crate::cities::resolve_name(city_id));
+    } else {
+        let cinemas = split_ids(&f.cinemas);
+        if cinemas.is_empty() {
+            return Redirect::to(&format!("/watches/{}", id)).into_response();
+        }
+        let time_spec = match parse_time_spec_form(&f.time_spec) {
+            Ok(t) => t,
+            Err(_) => return Redirect::to(&format!("/watches/{}", id)).into_response(),
+        };
+        patch.cinemas = Some(cinemas);
+        patch.time_spec = Some(time_spec.to_json());
+        patch.city_id = Some(0);
+        patch.city_name = Some(String::new());
+    }
     match st.db.update_watch(&id, &patch).await {
         Ok((new_id, changed)) => {
             st.wake.notify_one();
@@ -2410,6 +2791,28 @@ async fn action_update_lock(
             ),
         );
     }
+    Redirect::to(&format!("/watches/{}", id)).into_response()
+}
+
+async fn action_rearm_watch(State(st): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if !st.db.rearm_city_watch(&id).await.unwrap_or(false) {
+        return Redirect::to(&format!("/watches/{}", id)).into_response();
+    }
+    {
+        let mut inflight = st.lock_inflight.lock().unwrap();
+        let prefix = format!("{}:", id);
+        inflight.retain(|k, _| !k.starts_with(&prefix));
+    }
+    st.set_watch_status(
+        &id,
+        super::WatchStatus {
+            status: "waiting".into(),
+            last_checked_at: Some(now_secs()),
+            ..Default::default()
+        },
+    );
+    st.push_event("watch", Some(&id), "全城 watch 已重新武装".to_string());
+    st.wake.notify_one();
     Redirect::to(&format!("/watches/{}", id)).into_response()
 }
 
@@ -2691,3 +3094,36 @@ async fn action_create_user(
 // Keep `Value` used for future channel-specific forms.
 #[allow(dead_code)]
 fn _unused(_: Value) {}
+
+#[cfg(test)]
+mod poll_health_tests {
+    use super::*;
+
+    #[test]
+    fn chart_uses_speed_axis_and_status_colors() {
+        let points = vec![
+            HealthPoint {
+                ts: 0,
+                ok: 1,
+                total: 1,
+                blocked: 0,
+                err: 0,
+                ms_weighted: 500,
+            },
+            HealthPoint {
+                ts: 300,
+                ok: 0,
+                total: 1,
+                blocked: 0,
+                err: 1,
+                ms_weighted: 900,
+            },
+        ];
+        let svg = poll_health_svg(&points, 0, 600);
+        assert!(svg.contains("poll 单次 JSON 耗时"));
+        assert!(svg.contains("900ms"));
+        assert!(svg.contains("#9a6a22"));
+        assert!(!svg.contains("100%"));
+        assert!(svg.contains("0/1 成功"));
+    }
+}

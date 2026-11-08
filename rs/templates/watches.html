@@ -30,7 +30,7 @@
         <div class="watch-sub mono">{{ w.id }}</div>
       </td>
       <td class="mono">{{ w.movie_id }}</td>
-      <td class="mono">{{ w.cinemas }}</td>
+      <td class="mono">{% if w.is_city %}全城{% else %}{{ w.cinemas }}{% endif %}</td>
       <td class="num">{{ w.subs }}</td>
       <td><span class="badge {{ w.status_class }}">{{ w.status_text }}</span></td>
       <td class="mono muted">{{ w.last_trigger }}</td>

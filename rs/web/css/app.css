@@ -163,6 +163,7 @@ h3 { font-size: 17px; }
   font-weight: 400; padding: 0 0 9px;
 }
 .table td { padding: 11px 0; border-top: 1px solid var(--surface-2); font-size: 13px; }
+.table th.num { text-align: right; }
 .table td:first-child, .table th:first-child { padding-left: 0; }
 .table td:last-child, .table th:last-child { padding-right: 0; }
 .table tr:first-child td { border-top: 0; }
@@ -216,7 +217,7 @@ a.watch-name:hover { color: var(--clay-deep); }
 .badge.warn { color: var(--warn); border-color: #e2d3b3; background: #f7efdd; }
 .badge.bad { color: var(--bad); border-color: #e3c3bc; background: #f8ece8; }
 .badge.flat { color: var(--muted); }
-.pill { border-radius: 999px; background: var(--surface-2); padding: 3px 9px; font-family: var(--mono); font-size: 10px; color: var(--muted); }
+.pill { border-radius: 999px; background: var(--surface-2); padding: 3px 9px; font-family: var(--mono); font-size: 10px; color: var(--muted); white-space: nowrap; }
 
 /* ---------- health ---------- */
 .health-row {
@@ -248,10 +249,27 @@ a.watch-name:hover { color: var(--clay-deep); }
   display: grid; grid-template-columns: 10px minmax(0, 1fr) 52px 92px;
   gap: 10px; align-items: center; padding: 10px 0;
   border-top: 1px solid var(--surface-2); font-size: 12.5px;
+  text-decoration: none; color: inherit;
 }
 .poll-row:first-child { border-top: 0; }
 .poll-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .poll-meta { font-family: var(--mono); font-size: 10.5px; color: var(--muted); text-align: right; }
+.poll-row-city {
+  display: flex; align-items: flex-start; gap: 10px;
+}
+.poll-row-city .status-dot { margin-top: 7px; flex: 0 0 auto; }
+.poll-row-city .city-poll-main {
+  min-width: 0; display: flex; flex-direction: column; gap: 4px;
+}
+.poll-row-city .poll-name {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 6px;
+  overflow: visible; text-overflow: clip; white-space: normal; line-height: 1.45;
+}
+.city-poll-sub {
+  display: flex; flex-wrap: wrap; gap: 3px 10px;
+  font-family: var(--mono); font-size: 10.5px; color: var(--muted);
+}
+.city-poll-sub span { white-space: nowrap; }
 .event-list { display: flex; flex-direction: column; max-height: 300px; overflow: auto; padding-right: 4px; }
 .event-row { display: grid; grid-template-columns: 62px 66px minmax(0, 1fr); gap: 10px; padding: 8px 0; border-top: 1px solid var(--surface-2); font-size: 12px; }
 .event-row:first-child { border-top: 0; }
@@ -282,7 +300,7 @@ a.watch-name:hover { color: var(--clay-deep); }
 .poll-health-svg { display: block; width: 100%; height: auto; }
 .poll-health-axis {
   display: flex; justify-content: space-between;
-  padding: 4px 8px 0 38px; margin-bottom: 2px;
+  padding: 4px 8px 0 48px; margin-bottom: 2px;
   font-family: var(--mono); font-size: 10px; color: var(--muted);
 }
 .poll-health-legend {

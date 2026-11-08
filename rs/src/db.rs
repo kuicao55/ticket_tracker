@@ -54,6 +54,9 @@ pub struct WatchRow {
     pub enabled: bool,
     pub created_by: Option<String>,
     pub visibility: String,
+    pub scope: String,
+    pub city_id: i64,
+    pub city_name: String,
     pub auto_lock: bool,
     pub lock_num_seats: i64,
     pub lock_max_retries: i64,
@@ -65,6 +68,10 @@ pub struct WatchRow {
 }
 
 impl WatchRow {
+    pub fn is_city(&self) -> bool {
+        self.scope == "city"
+    }
+
     pub fn time_spec_value(&self) -> Value {
         serde_json::from_str(&self.time_spec).unwrap_or_else(|_| json!({"type":"all"}))
     }
@@ -140,7 +147,65 @@ pub struct PollHealthRow {
     pub cinemas_err: i64,
     pub blocked_cinemas: i64,
     pub duration_ms: i64,
+    pub city_total: i64,
+    pub city_ok: i64,
+    pub city_err: i64,
+    pub city_blocked: i64,
+    pub city_duration_ms: i64,
     pub error_summary: Option<String>,
+}
+
+impl PollHealthRow {
+    /// 基础 JSON 获取总数（影院 + 全城扫描）。
+    pub fn json_total(&self) -> i64 {
+        self.cinemas_total + self.city_total
+    }
+
+    pub fn json_ok(&self) -> i64 {
+        self.cinemas_ok + self.city_ok
+    }
+
+    pub fn json_err(&self) -> i64 {
+        self.cinemas_err + self.city_err
+    }
+
+    pub fn json_blocked(&self) -> i64 {
+        self.blocked_cinemas + self.city_blocked
+    }
+
+    /// 按请求数加权后的单次 JSON 平均耗时。
+    pub fn json_avg_ms(&self) -> i64 {
+        let total = self.json_total();
+        if total <= 0 {
+            return 0;
+        }
+        let cinema = self.cinemas_total.max(0) * self.duration_ms.max(0);
+        let city = self.city_total.max(0) * self.city_duration_ms.max(0);
+        (cinema + city) / total
+    }
+}
+
+/// 主页 Poll plan「全城扫描」tab 的一行。
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct CityScanRow {
+    pub watch_id: String,
+    pub movie_name: String,
+    pub city_id: i64,
+    pub city_name: String,
+    pub imax_only: bool,
+    pub enabled: bool,
+    pub fired: bool,
+    pub fired_cinema_name: Option<String>,
+    pub fired_date: Option<String>,
+    pub fired_show_time: Option<String>,
+    pub last_polled_at: Option<String>,
+    pub last_ok: Option<bool>,
+    pub last_error: Option<String>,
+    pub last_dates_json: String,
+    pub last_cinema_count: i64,
+    pub last_show_count: i64,
+    pub last_imax_count: i64,
+    pub last_duration_ms: i64,
 }
 
 #[derive(Debug, Clone, Serialize, FromRow)]
@@ -172,12 +237,37 @@ pub struct LockStateRow {
     pub updated_at: String,
 }
 
+/// 全城开售 watch 的状态（1:1，只有 scope='city' 的 watch 有）。
+#[derive(Debug, Clone, Serialize, FromRow)]
+pub struct WatchCityStateRow {
+    pub watch_id: String,
+    pub fired: bool,
+    pub fired_at: Option<String>,
+    pub fired_cinema_id: Option<String>,
+    pub fired_cinema_name: Option<String>,
+    pub fired_date: Option<String>,
+    pub fired_show_time: Option<String>,
+    pub fired_seq_no: Option<String>,
+    pub fired_is_imax: bool,
+    pub last_polled_at: Option<String>,
+    pub last_ok: Option<bool>,
+    pub last_error: Option<String>,
+    pub last_dates_json: String,
+    pub last_cinema_count: i64,
+    pub last_show_count: i64,
+    pub last_imax_count: i64,
+    pub last_bucket_count: i64,
+    pub last_duration_ms: i64,
+    pub updated_at: String,
+}
+
 /// monitor 一轮需要的 watch 数据：DB 行 + 影院 + 上次 state。
 #[derive(Debug, Clone)]
 pub struct MonitorWatch {
     pub row: WatchRow,
     pub cinemas: Vec<String>,
     pub state: HashMap<String, Value>,
+    pub city_state: Option<WatchCityStateRow>,
 }
 
 impl MonitorWatch {
@@ -206,6 +296,10 @@ pub struct NewWatch {
     pub imax_only: bool,
     pub created_by: Option<String>,
     pub visibility: String,
+    /// `cinema`（默认）或 `city`（全城开售）。
+    pub scope: String,
+    pub city_id: u32,
+    pub city_name: String,
     pub auto_lock: bool,
     pub lock_num_seats: u64,
     pub lock_max_retries: u64,
@@ -220,6 +314,9 @@ pub struct WatchPatch {
     pub cinemas: Option<Vec<String>>,
     pub time_spec: Option<Value>,
     pub imax_only: Option<bool>,
+    pub scope: Option<String>,
+    pub city_id: Option<u32>,
+    pub city_name: Option<String>,
     pub enabled: Option<bool>,
     pub auto_lock: Option<bool>,
     pub lock_num_seats: Option<u64>,
@@ -297,6 +394,11 @@ fn watch_filter_key(movie_id: i64, cinemas: &[String], time_spec: &Value, imax: 
         .map(|t| t.key())
         .unwrap_or_else(|_| "all".into());
     format!("{}|{}|{}|{}", movie_id, cinemas.join(","), time_key, imax)
+}
+
+/// city scope 的 key 使用 `city:` 前缀，与所有旧 cinema key 隔离。
+fn city_watch_filter_key(city_id: u32, movie_id: i64, imax: bool) -> String {
+    format!("city:{}|{}|all|{}", city_id, movie_id, imax)
 }
 
 impl Db {
@@ -547,6 +649,38 @@ impl Db {
         Ok(n)
     }
 
+    pub async fn city_watch_count(&self) -> Result<i64> {
+        let (n,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM watches WHERE scope = 'city' AND enabled = 1")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
+    }
+
+    /// 主页 Poll plan「全城扫描」tab 的数据。
+    pub async fn list_city_scans(&self, limit: i64) -> Result<Vec<CityScanRow>> {
+        Ok(sqlx::query_as::<_, CityScanRow>(
+            "SELECT w.id AS watch_id, w.movie_name, w.city_id, w.city_name,
+                    w.imax_only, w.enabled,
+                    COALESCE(s.fired, 0) AS fired,
+                    s.fired_cinema_name, s.fired_date, s.fired_show_time,
+                    s.last_polled_at, s.last_ok, s.last_error,
+                    COALESCE(s.last_dates_json, '[]') AS last_dates_json,
+                    COALESCE(s.last_cinema_count, 0) AS last_cinema_count,
+                    COALESCE(s.last_show_count, 0) AS last_show_count,
+                    COALESCE(s.last_imax_count, 0) AS last_imax_count,
+                    COALESCE(s.last_duration_ms, 0) AS last_duration_ms
+             FROM watches w
+             LEFT JOIN watch_city_state s ON s.watch_id = w.id
+             WHERE w.scope = 'city' AND w.enabled = 1
+             ORDER BY COALESCE(s.last_polled_at, '') DESC, w.id
+             LIMIT ?",
+        )
+        .bind(limit.clamp(1, 200))
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
     // ------------------------- watches -------------------------
 
     pub async fn list_watches(&self, sort: &str, limit: i64, offset: i64) -> Result<Vec<WatchRow>> {
@@ -619,19 +753,42 @@ impl Db {
     }
 
     pub async fn create_or_reuse_watch(&self, spec: &NewWatch) -> Result<(String, bool)> {
-        if spec.cinemas.is_empty() {
-            anyhow::bail!("至少需要一个影院");
-        }
-        let mut cinemas: Vec<String> = spec
-            .cinemas
-            .iter()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .collect();
-        cinemas.sort();
-        cinemas.dedup();
-
-        let key = watch_filter_key(spec.movie_id, &cinemas, &spec.time_spec, spec.imax_only);
+        let is_city = spec.scope == "city";
+        let mut time_spec = spec.time_spec.clone();
+        let (cinemas, key, city_id, city_name) = if is_city {
+            if spec.city_id == 0 {
+                anyhow::bail!("全城 watch 需要 city_id");
+            }
+            time_spec = json!({"type":"all"});
+            let name = if spec.city_name.trim().is_empty() {
+                crate::cities::resolve_name(spec.city_id)
+            } else {
+                spec.city_name.trim().to_string()
+            };
+            (
+                Vec::new(),
+                city_watch_filter_key(spec.city_id, spec.movie_id, spec.imax_only),
+                spec.city_id,
+                name,
+            )
+        } else {
+            if spec.cinemas.is_empty() {
+                anyhow::bail!("至少需要一个影院");
+            }
+            let mut cinemas: Vec<String> = spec
+                .cinemas
+                .iter()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            cinemas.sort();
+            cinemas.dedup();
+            if cinemas.is_empty() {
+                anyhow::bail!("至少需要一个影院");
+            }
+            let key = watch_filter_key(spec.movie_id, &cinemas, &time_spec, spec.imax_only);
+            (cinemas, key, 0, String::new())
+        };
 
         if let Some(existing) = self.find_by_filter_key(&key).await? {
             if existing.movie_name.is_empty() {
@@ -642,6 +799,13 @@ impl Db {
                         .execute(&self.pool)
                         .await;
                 }
+            }
+            if is_city {
+                // 兼容手工构造/旧数据：确保 city state 行存在。
+                let _ = sqlx::query("INSERT OR IGNORE INTO watch_city_state(watch_id) VALUES (?)")
+                    .bind(&existing.id)
+                    .execute(&self.pool)
+                    .await;
             }
             // 重复 POST 只允许“开启/调整”锁票，不会把已有 true 意外关掉。
             if spec.auto_lock {
@@ -668,17 +832,21 @@ impl Db {
         sqlx::query(
             "INSERT INTO watches(id, filter_key, movie_id, movie_name, time_spec,
                                  imax_only, enabled, created_by, visibility,
+                                 scope, city_id, city_name,
                                  auto_lock, lock_num_seats, lock_max_retries, lock_seats)
-             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&wid)
         .bind(&key)
         .bind(spec.movie_id)
         .bind(spec.movie_name.clone().unwrap_or_default())
-        .bind(spec.time_spec.to_string())
+        .bind(time_spec.to_string())
         .bind(if spec.imax_only { 1 } else { 0 })
         .bind(&spec.created_by)
         .bind(&spec.visibility)
+        .bind(if is_city { "city" } else { "cinema" })
+        .bind(city_id as i64)
+        .bind(&city_name)
         .bind(if spec.auto_lock { 1 } else { 0 })
         .bind(spec.lock_num_seats as i64)
         .bind(spec.lock_max_retries as i64)
@@ -686,16 +854,23 @@ impl Db {
         .execute(&mut *tx)
         .await?;
 
-        for cid in &cinemas {
-            sqlx::query("INSERT OR IGNORE INTO cinemas(id, name) VALUES (?, '')")
-                .bind(cid)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("INSERT INTO watch_cinemas(watch_id, cinema_id) VALUES (?, ?)")
+        if is_city {
+            sqlx::query("INSERT OR IGNORE INTO watch_city_state(watch_id) VALUES (?)")
                 .bind(&wid)
-                .bind(cid)
                 .execute(&mut *tx)
                 .await?;
+        } else {
+            for cid in &cinemas {
+                sqlx::query("INSERT OR IGNORE INTO cinemas(id, name) VALUES (?, '')")
+                    .bind(cid)
+                    .execute(&mut *tx)
+                    .await?;
+                sqlx::query("INSERT INTO watch_cinemas(watch_id, cinema_id) VALUES (?, ?)")
+                    .bind(&wid)
+                    .bind(cid)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         tx.commit().await?;
         if spec.auto_lock {
@@ -708,23 +883,67 @@ impl Db {
         let Some(old) = self.get_watch(id).await? else {
             anyhow::bail!("watch 不存在: {}", id);
         };
-        let old_cinemas = self.watch_cinemas(id).await?;
+        let scope = patch.scope.clone().unwrap_or_else(|| old.scope.clone());
+        if scope != "cinema" && scope != "city" {
+            anyhow::bail!("未知 watch scope: {}", scope);
+        }
+        let is_city = scope == "city";
+        let city_id = if is_city {
+            patch.city_id.unwrap_or_else(|| old.city_id.max(0) as u32)
+        } else {
+            0
+        };
+        if is_city && city_id == 0 {
+            anyhow::bail!("全城 watch 需要 city_id");
+        }
+        let city_name = if is_city {
+            match patch.city_name.as_deref().map(str::trim) {
+                Some(n) if !n.is_empty() => n.to_string(),
+                _ if city_id as i64 == old.city_id && !old.city_name.trim().is_empty() => {
+                    old.city_name.clone()
+                }
+                _ => crate::cities::resolve_name(city_id),
+            }
+        } else {
+            String::new()
+        };
+
+        let old_cinemas = if old.is_city() {
+            Vec::new()
+        } else {
+            self.watch_cinemas(id).await?
+        };
         let movie_id = patch.movie_id.unwrap_or(old.movie_id);
         let movie_name = patch
             .movie_name
             .clone()
             .unwrap_or_else(|| old.movie_name.clone());
-        let mut cinemas = patch.cinemas.clone().unwrap_or(old_cinemas);
+        let mut cinemas = if is_city {
+            Vec::new()
+        } else {
+            patch.cinemas.clone().unwrap_or(old_cinemas)
+        };
         cinemas.sort();
         cinemas.dedup();
-        let time_spec = patch
-            .time_spec
-            .clone()
-            .unwrap_or_else(|| old.time_spec_value());
+        if !is_city && cinemas.is_empty() {
+            anyhow::bail!("至少需要一个影院");
+        }
+        let time_spec = if is_city {
+            json!({"type":"all"})
+        } else {
+            patch
+                .time_spec
+                .clone()
+                .unwrap_or_else(|| old.time_spec_value())
+        };
         let imax_only = patch.imax_only.unwrap_or(old.imax_only);
         let enabled = patch.enabled.unwrap_or(old.enabled);
 
-        let key = watch_filter_key(movie_id, &cinemas, &time_spec, imax_only);
+        let key = if is_city {
+            city_watch_filter_key(city_id, movie_id, imax_only)
+        } else {
+            watch_filter_key(movie_id, &cinemas, &time_spec, imax_only)
+        };
         let filter_changed = key != old.filter_key;
 
         if filter_changed {
@@ -740,6 +959,7 @@ impl Db {
         sqlx::query(
             "UPDATE watches SET movie_id = ?, movie_name = ?, time_spec = ?,
                 imax_only = ?, enabled = ?, filter_key = ?,
+                scope = ?, city_id = ?, city_name = ?,
                 auto_lock = COALESCE(?, auto_lock),
                 lock_num_seats = COALESCE(?, lock_num_seats),
                 lock_max_retries = COALESCE(?, lock_max_retries),
@@ -753,6 +973,9 @@ impl Db {
         .bind(if imax_only { 1 } else { 0 })
         .bind(if enabled { 1 } else { 0 })
         .bind(&key)
+        .bind(&scope)
+        .bind(city_id as i64)
+        .bind(&city_name)
         .bind(patch.auto_lock.map(|b| if b { 1 } else { 0 }))
         .bind(patch.lock_num_seats.map(|n| n as i64))
         .bind(patch.lock_max_retries.map(|n| n as i64))
@@ -785,6 +1008,16 @@ impl Db {
                 .bind(id)
                 .execute(&mut *tx)
                 .await?;
+            sqlx::query("DELETE FROM watch_city_state WHERE watch_id = ?")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            if is_city {
+                sqlx::query("INSERT OR IGNORE INTO watch_city_state(watch_id) VALUES (?)")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         tx.commit().await?;
         if let Some(on) = patch.auto_lock {
@@ -899,6 +1132,160 @@ impl Db {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    // ------------------------- city watch state -------------------------
+
+    pub async fn city_state(&self, watch_id: &str) -> Result<Option<WatchCityStateRow>> {
+        Ok(sqlx::query_as::<_, WatchCityStateRow>(
+            "SELECT watch_id, fired, fired_at, fired_cinema_id, fired_cinema_name,
+                    fired_date, fired_show_time, fired_seq_no, fired_is_imax,
+                    last_polled_at, last_ok, last_error, last_dates_json,
+                    last_cinema_count, last_show_count, last_imax_count,
+                    last_bucket_count, last_duration_ms, updated_at
+             FROM watch_city_state WHERE watch_id = ?",
+        )
+        .bind(watch_id)
+        .fetch_optional(&self.pool)
+        .await?)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_city_poll(
+        &self,
+        watch_id: &str,
+        ok: bool,
+        error: Option<&str>,
+        dates: &[String],
+        cinema_count: usize,
+        total: usize,
+        imax: usize,
+        buckets: usize,
+        duration_ms: u128,
+    ) -> Result<()> {
+        let dates_json = serde_json::to_string(dates).unwrap_or_else(|_| "[]".into());
+        sqlx::query(
+            "INSERT INTO watch_city_state(
+                watch_id, last_polled_at, last_ok, last_error, last_dates_json,
+                last_cinema_count, last_show_count, last_imax_count, last_bucket_count,
+                last_duration_ms, updated_at)
+             VALUES (?, datetime('now'), ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(watch_id) DO UPDATE SET
+                last_polled_at = datetime('now'),
+                last_ok = excluded.last_ok,
+                last_error = excluded.last_error,
+                last_dates_json = excluded.last_dates_json,
+                last_cinema_count = excluded.last_cinema_count,
+                last_show_count = excluded.last_show_count,
+                last_imax_count = excluded.last_imax_count,
+                last_bucket_count = excluded.last_bucket_count,
+                last_duration_ms = excluded.last_duration_ms,
+                updated_at = datetime('now')",
+        )
+        .bind(watch_id)
+        .bind(if ok { 1 } else { 0 })
+        .bind(error)
+        .bind(&dates_json)
+        .bind(cinema_count as i64)
+        .bind(total as i64)
+        .bind(imax as i64)
+        .bind(buckets as i64)
+        .bind(duration_ms as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// 原子地标记已推送。返回 true 表示本轮抢到了首推资格。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn mark_city_watch_fired(
+        &self,
+        watch_id: &str,
+        show: &crate::city::CityShow,
+        dates: &[String],
+        cinema_count: usize,
+        total: usize,
+        imax: usize,
+        buckets: usize,
+    ) -> Result<bool> {
+        let dates_json = serde_json::to_string(dates).unwrap_or_else(|_| "[]".into());
+        let r = sqlx::query(
+            "INSERT INTO watch_city_state(
+                watch_id, fired, fired_at, fired_cinema_id, fired_cinema_name,
+                fired_date, fired_show_time, fired_seq_no, fired_is_imax,
+                last_polled_at, last_ok, last_error, last_dates_json,
+                last_cinema_count, last_show_count, last_imax_count, last_bucket_count,
+                updated_at)
+             VALUES (?, 1, datetime('now'), ?, ?, ?, ?, ?, ?, datetime('now'), 1, NULL,
+                     ?, ?, ?, ?, ?, datetime('now'))
+             ON CONFLICT(watch_id) DO UPDATE SET
+                fired = 1,
+                fired_at = datetime('now'),
+                fired_cinema_id = excluded.fired_cinema_id,
+                fired_cinema_name = excluded.fired_cinema_name,
+                fired_date = excluded.fired_date,
+                fired_show_time = excluded.fired_show_time,
+                fired_seq_no = excluded.fired_seq_no,
+                fired_is_imax = excluded.fired_is_imax,
+                last_polled_at = datetime('now'),
+                last_ok = 1,
+                last_error = NULL,
+                last_dates_json = excluded.last_dates_json,
+                last_cinema_count = excluded.last_cinema_count,
+                last_show_count = excluded.last_show_count,
+                last_imax_count = excluded.last_imax_count,
+                last_bucket_count = excluded.last_bucket_count,
+                updated_at = datetime('now')
+             WHERE watch_city_state.fired = 0",
+        )
+        .bind(watch_id)
+        .bind(&show.cinema_id)
+        .bind(&show.cinema_name)
+        .bind(&show.date)
+        .bind(&show.show_time)
+        .bind(show.seq_no.as_deref())
+        .bind(if show.is_imax { 1 } else { 0 })
+        .bind(&dates_json)
+        .bind(cinema_count as i64)
+        .bind(total as i64)
+        .bind(imax as i64)
+        .bind(buckets as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// 重新武装：清掉 fired 标记和锁票状态；保留 metrics/渠道/订阅。
+    pub async fn rearm_city_watch(&self, watch_id: &str) -> Result<bool> {
+        let mut tx = self.pool.begin().await?;
+        let r = sqlx::query(
+            "UPDATE watch_city_state SET
+                fired = 0,
+                fired_at = NULL,
+                fired_cinema_id = NULL,
+                fired_cinema_name = NULL,
+                fired_date = NULL,
+                fired_show_time = NULL,
+                fired_seq_no = NULL,
+                fired_is_imax = 0,
+                last_error = NULL,
+                updated_at = datetime('now')
+             WHERE watch_id = ?
+               AND EXISTS (SELECT 1 FROM watches w WHERE w.id = watch_id AND w.scope = 'city')",
+        )
+        .bind(watch_id)
+        .execute(&mut *tx)
+        .await?;
+        if r.rows_affected() == 0 {
+            tx.rollback().await.ok();
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM lock_state WHERE watch_id = ?")
+            .bind(watch_id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     // ------------------------- auto-lock state -------------------------
@@ -1114,10 +1501,16 @@ impl Db {
                     state.insert(cid, v);
                 }
             }
+            let city_state = if row.is_city() {
+                self.city_state(&row.id).await?
+            } else {
+                None
+            };
             out.push(MonitorWatch {
                 row,
                 cinemas,
                 state,
+                city_state,
             });
         }
         Ok(out)
@@ -1133,16 +1526,51 @@ impl Db {
         duration_ms: u128,
         error_summary: Option<&str>,
     ) -> Result<()> {
+        self.insert_poll_health_full(
+            cinemas_ok,
+            cinemas_err,
+            blocked_cinemas,
+            duration_ms,
+            0,
+            0,
+            0,
+            0,
+            error_summary,
+        )
+        .await
+    }
+
+    /// 一轮的“基础 JSON 获取”采样：影院抓取 + 全城扫描。
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_poll_health_full(
+        &self,
+        cinemas_ok: usize,
+        cinemas_err: usize,
+        blocked_cinemas: usize,
+        duration_ms: u128,
+        city_ok: usize,
+        city_err: usize,
+        city_blocked: usize,
+        city_duration_ms: u128,
+        error_summary: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
             "INSERT INTO poll_health(cinemas_total, cinemas_ok, cinemas_err,
-                                     blocked_cinemas, duration_ms, error_summary)
-             VALUES (?, ?, ?, ?, ?, ?)",
+                                     blocked_cinemas, duration_ms,
+                                     city_total, city_ok, city_err, city_blocked,
+                                     city_duration_ms, error_summary)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind((cinemas_ok + cinemas_err) as i64)
         .bind(cinemas_ok as i64)
         .bind(cinemas_err as i64)
         .bind(blocked_cinemas as i64)
         .bind(duration_ms as i64)
+        .bind((city_ok + city_err) as i64)
+        .bind(city_ok as i64)
+        .bind(city_err as i64)
+        .bind(city_blocked as i64)
+        .bind(city_duration_ms as i64)
         .bind(error_summary)
         .execute(&self.pool)
         .await?;
@@ -1155,7 +1583,9 @@ impl Db {
             "SELECT id, recorded_at,
                     CAST(strftime('%s', recorded_at) AS INTEGER) AS recorded_ts,
                     cinemas_total, cinemas_ok, cinemas_err,
-                    blocked_cinemas, duration_ms, error_summary
+                    blocked_cinemas, duration_ms,
+                    city_total, city_ok, city_err, city_blocked, city_duration_ms,
+                    error_summary
              FROM poll_health
              WHERE recorded_at >= datetime('now', ?)
              ORDER BY recorded_at ASC",
@@ -1175,7 +1605,9 @@ impl Db {
             "SELECT id, recorded_at,
                     CAST(strftime('%s', recorded_at) AS INTEGER) AS recorded_ts,
                     cinemas_total, cinemas_ok, cinemas_err,
-                    blocked_cinemas, duration_ms, error_summary
+                    blocked_cinemas, duration_ms,
+                    city_total, city_ok, city_err, city_blocked, city_duration_ms,
+                    error_summary
              FROM poll_health
              WHERE recorded_at >= datetime(?, 'unixepoch')
                AND recorded_at < datetime(?, 'unixepoch')
@@ -1192,7 +1624,9 @@ impl Db {
             "SELECT id, recorded_at,
                     CAST(strftime('%s', recorded_at) AS INTEGER) AS recorded_ts,
                     cinemas_total, cinemas_ok, cinemas_err,
-                    blocked_cinemas, duration_ms, error_summary
+                    blocked_cinemas, duration_ms,
+                    city_total, city_ok, city_err, city_blocked, city_duration_ms,
+                    error_summary
              FROM poll_health
              ORDER BY recorded_at DESC, id DESC LIMIT ?",
         )
@@ -1608,6 +2042,9 @@ mod tests {
             imax_only: false,
             created_by: None,
             visibility: "public".into(),
+            scope: "cinema".into(),
+            city_id: 0,
+            city_name: String::new(),
             auto_lock: false,
             lock_num_seats: DEFAULT_LOCK_NUM_SEATS,
             lock_max_retries: DEFAULT_LOCK_MAX_RETRIES,
@@ -1775,6 +2212,9 @@ mod lock_tests {
             imax_only: false,
             created_by: None,
             visibility: "public".into(),
+            scope: "cinema".into(),
+            city_id: 0,
+            city_name: String::new(),
             auto_lock: true,
             lock_num_seats: 2,
             lock_max_retries: 2,
@@ -1818,6 +2258,195 @@ mod lock_tests {
         };
         db.update_watch(&wid, &patch).await.unwrap();
         assert!(db.lock_state(&wid, "2").await.unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod city_tests {
+    use super::*;
+    use crate::city::CityShow;
+
+    fn city_spec(movie_id: i64, city_id: u32, imax: bool) -> NewWatch {
+        NewWatch {
+            movie_id,
+            movie_name: Some("沙丘3".into()),
+            cinemas: Vec::new(),
+            time_spec: TimeSpec::parse("all").unwrap().to_json(),
+            imax_only: imax,
+            created_by: None,
+            visibility: "public".into(),
+            scope: "city".into(),
+            city_id,
+            city_name: String::new(),
+            auto_lock: false,
+            lock_num_seats: DEFAULT_LOCK_NUM_SEATS,
+            lock_max_retries: DEFAULT_LOCK_MAX_RETRIES,
+            lock_seats: Vec::new(),
+        }
+    }
+
+    fn show(cinema_id: &str) -> CityShow {
+        CityShow {
+            cinema_id: cinema_id.into(),
+            cinema_name: "测试影院".into(),
+            date: "2026-12-31".into(),
+            show_time: "10:00".into(),
+            hall: "IMAX".into(),
+            format: "IMAX2D".into(),
+            seq_no: Some("202612310000001".into()),
+            is_imax: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn city_watch_creates_state_without_cinemas() {
+        let db = Db::connect_memory().await.unwrap();
+        let (wid, created) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, false))
+            .await
+            .unwrap();
+        assert!(created);
+        assert!(db.watch_cinemas(&wid).await.unwrap().is_empty());
+        let w = db.get_watch(&wid).await.unwrap().unwrap();
+        assert!(w.is_city());
+        assert_eq!(w.city_name, "上海");
+        let st = db.city_state(&wid).await.unwrap().unwrap();
+        assert!(!st.fired);
+        assert_eq!(st.last_dates_json, "[]");
+    }
+
+    #[tokio::test]
+    async fn city_watch_dedupes_by_city_movie_imax() {
+        let db = Db::connect_memory().await.unwrap();
+        let (a, ca) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, false))
+            .await
+            .unwrap();
+        let (b, cb) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, false))
+            .await
+            .unwrap();
+        assert_eq!(a, b);
+        assert!(ca);
+        assert!(!cb);
+        let (c, cc) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, true))
+            .await
+            .unwrap();
+        assert_ne!(a, c);
+        assert!(cc);
+    }
+
+    #[tokio::test]
+    async fn city_and_cinema_watch_with_same_movie_do_not_collide() {
+        let db = Db::connect_memory().await.unwrap();
+        let (city_id, _) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, false))
+            .await
+            .unwrap();
+        let (cinema_id, _) = db
+            .create_or_reuse_watch(&NewWatch {
+                movie_id: 1503101,
+                movie_name: Some("沙丘3".into()),
+                cinemas: vec!["37534".into()],
+                time_spec: TimeSpec::parse("all").unwrap().to_json(),
+                imax_only: false,
+                created_by: None,
+                visibility: "public".into(),
+                scope: "cinema".into(),
+                city_id: 0,
+                city_name: String::new(),
+                auto_lock: false,
+                lock_num_seats: DEFAULT_LOCK_NUM_SEATS,
+                lock_max_retries: DEFAULT_LOCK_MAX_RETRIES,
+                lock_seats: Vec::new(),
+            })
+            .await
+            .unwrap();
+        assert_ne!(city_id, cinema_id);
+    }
+
+    #[tokio::test]
+    async fn fire_is_idempotent_and_rearm_clears_it() {
+        let db = Db::connect_memory().await.unwrap();
+        let (wid, _) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, false))
+            .await
+            .unwrap();
+        let dates = vec!["2026-12-31".to_string()];
+        assert!(db
+            .mark_city_watch_fired(&wid, &show("37534"), &dates, 1, 1, 1, 1)
+            .await
+            .unwrap());
+        assert!(!db
+            .mark_city_watch_fired(&wid, &show("37534"), &dates, 1, 1, 1, 1)
+            .await
+            .unwrap());
+        let st = db.city_state(&wid).await.unwrap().unwrap();
+        assert!(st.fired);
+        assert_eq!(st.fired_cinema_id.as_deref(), Some("37534"));
+        assert_eq!(st.fired_show_time.as_deref(), Some("10:00"));
+
+        db.record_lock_failure(&wid, "37534", "ShowGone", None, None, 2)
+            .await
+            .unwrap();
+        assert!(db.rearm_city_watch(&wid).await.unwrap());
+        let st = db.city_state(&wid).await.unwrap().unwrap();
+        assert!(!st.fired);
+        assert!(st.fired_cinema_id.is_none());
+        assert!(db.lock_state(&wid, "37534").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn editing_city_filter_rearms_but_toggle_does_not() {
+        let db = Db::connect_memory().await.unwrap();
+        let (wid, _) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, false))
+            .await
+            .unwrap();
+        let dates = vec!["2026-12-31".to_string()];
+        db.mark_city_watch_fired(&wid, &show("37534"), &dates, 1, 1, 1, 1)
+            .await
+            .unwrap();
+
+        let (_, changed) = db
+            .update_watch(
+                &wid,
+                &WatchPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(!changed);
+        assert!(db.city_state(&wid).await.unwrap().unwrap().fired);
+
+        let (_, changed) = db
+            .update_watch(
+                &wid,
+                &WatchPatch {
+                    imax_only: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(changed);
+        assert!(!db.city_state(&wid).await.unwrap().unwrap().fired);
+    }
+
+    #[tokio::test]
+    async fn monitor_loads_city_watch_without_cinemas() {
+        let db = Db::connect_memory().await.unwrap();
+        let (wid, _) = db
+            .create_or_reuse_watch(&city_spec(1503101, 10, false))
+            .await
+            .unwrap();
+        let rows = db.load_monitor_watches().await.unwrap();
+        let mw = rows.iter().find(|w| w.row.id == wid).unwrap();
+        assert!(mw.cinemas.is_empty());
+        assert!(mw.city_state.is_some());
     }
 }
 

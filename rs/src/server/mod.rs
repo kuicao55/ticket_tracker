@@ -52,6 +52,9 @@ pub struct HealthState {
     pub check_count: u64,
     pub health_ok: bool,
     pub paused: bool,
+    /// 最近一次通知/锁票投递最终失败；监控下一轮会短暂并入全局健康。
+    pub last_delivery_error: Option<String>,
+    pub last_delivery_error_at: Option<f64>,
 }
 
 pub struct AppState {
@@ -180,6 +183,31 @@ impl AppState {
             .lock()
             .unwrap()
             .insert(id.to_string(), status);
+    }
+
+    /// 通知 / 锁票重试后仍失败：立即把全局健康置为异常，并留一个短 TTL
+    /// 供下一轮 monitor 合并进 health_ok / Discord 健康告警。
+    pub fn report_delivery_error(&self, msg: impl Into<String>) {
+        let msg = msg.into();
+        {
+            let mut h = self.health.lock().unwrap();
+            h.health_ok = false;
+            h.last_error = Some(format!("投递失败：{}", msg));
+            h.last_delivery_error = Some(msg.clone());
+            h.last_delivery_error_at = Some(now_secs());
+        }
+        self.push_event("health", None, format!("⚠ 投递失败：{}", msg));
+    }
+
+    /// 返回 TTL 内最近一次投递失败，供 monitor 合并进本轮 health_issues。
+    pub fn delivery_error(&self, ttl_secs: f64) -> Option<String> {
+        let h = self.health.lock().unwrap();
+        let at = h.last_delivery_error_at?;
+        if now_secs() - at <= ttl_secs {
+            h.last_delivery_error.clone()
+        } else {
+            None
+        }
     }
 }
 
@@ -338,4 +366,24 @@ async fn shutdown_signal() {
 /// 给测试/工具用：从一个已有 pool 构造 state。
 pub fn state_from_pool(pool: SqlitePool) -> Arc<AppState> {
     AppState::new(Db { pool })
+}
+
+#[cfg(test)]
+mod health_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn delivery_error_marks_health_and_honors_ttl() {
+        let db = Db::connect_memory().await.unwrap();
+        let state = AppState::new(db);
+        state.report_delivery_error("webhook 发送失败");
+        let h = state.health_snapshot();
+        assert!(!h.health_ok);
+        assert_eq!(h.last_error.as_deref(), Some("投递失败：webhook 发送失败"));
+        assert_eq!(
+            state.delivery_error(600.0).as_deref(),
+            Some("webhook 发送失败")
+        );
+        assert!(state.delivery_error(-1.0).is_none());
+    }
 }

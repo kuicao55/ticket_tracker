@@ -9,7 +9,7 @@
   <div>
     <p class="eyebrow">Watch registry</p>
     <h1>New watch.</h1>
-    <p class="lede">从弹窗里选电影、影院和时间；相同过滤条件会自动复用已有 watch。</p>
+    <p class="lede">指定影院，或为未开售电影创建全城开售 watch；相同过滤条件会自动复用已有 watch。</p>
   </div>
 </section>
 
@@ -33,8 +33,18 @@
     </form>
   </div>
 
-  <form method="post" action="/actions/watches" data-picker-form>
+  <form method="post" action="/actions/watches" data-picker-form data-scope-form>
+    <input type="hidden" name="scope" value="{{ scope }}" data-scope-value>
     <div class="form-field">
+      <label>监控模式</label>
+      <div class="segmented" data-scope-toggle>
+        <button type="button" data-scope="cinema" class="{% if scope != "city" %}active{% endif %}">指定影院</button>
+        <button type="button" data-scope="city" class="{% if scope == "city" %}active{% endif %}">全城开售</button>
+      </div>
+      <p class="form-note">全城开售模式只需选电影、城市和 IMAX；自动跟踪所有可预售日期。</p>
+    </div>
+
+    <div class="form-field" style="margin-top:16px">
       <label>电影</label>
       <button type="button" class="select-trigger" data-movie-open>
         <span class="select-main" data-movie-label>选择电影</span>
@@ -44,34 +54,46 @@
       <input type="hidden" name="movie_id" data-movie-value value="">
     </div>
 
-    <div class="form-field" style="margin-top:16px">
-      <label>影院（可多选）</label>
-      <button type="button" class="select-trigger" data-cinema-open>
-        <span class="select-main" data-cinema-label>选择影院</span>
-        <span class="menu-caret">⌄</span>
-      </button>
-      <input type="hidden" name="cinemas" data-cinema-value value="">
-      <div class="chips" data-cinema-chips></div>
-    </div>
+    <div data-scope-panel="cinema" {% if scope == "city" %}hidden{% endif %}>
+      <div class="form-field" style="margin-top:16px">
+        <label>影院（可多选）</label>
+        <button type="button" class="select-trigger" data-cinema-open>
+          <span class="select-main" data-cinema-label>选择影院</span>
+          <span class="menu-caret">⌄</span>
+        </button>
+        <input type="hidden" name="cinemas" data-cinema-value value="">
+        <div class="chips" data-cinema-chips></div>
+      </div>
 
-    <div class="form-field" style="margin-top:16px">
-      <label>时间</label>
-      <div class="time-picker" data-time-picker>
-        <input type="hidden" name="time_spec" data-time-value value="{{ time_spec_json }}">
-        <div class="segmented time-modes">
-          <button type="button" data-time-mode="all">不限</button>
-          <button type="button" data-time-mode="daily">每天固定时段</button>
-          <button type="button" data-time-mode="dates">指定日期</button>
-        </div>
-        <div data-time-panel="daily" hidden>
-          <p class="form-note">点击或拖动方块选择小时；每格 1 小时。</p>
-          <div class="hour-grid" data-daily-grid></div>
-        </div>
-        <div data-time-panel="dates" hidden>
-          <div class="time-segments" data-time-segments></div>
-          <button type="button" class="btn ghost small" data-time-add>+ 添加日期段</button>
+      <div class="form-field" style="margin-top:16px">
+        <label>时间</label>
+        <div class="time-picker" data-time-picker>
+          <input type="hidden" name="time_spec" data-time-value value="{{ time_spec_json }}">
+          <div class="segmented time-modes">
+            <button type="button" data-time-mode="all">不限</button>
+            <button type="button" data-time-mode="daily">每天固定时段</button>
+            <button type="button" data-time-mode="dates">指定日期</button>
+          </div>
+          <div data-time-panel="daily" hidden>
+            <p class="form-note">点击或拖动方块选择小时；每格 1 小时。</p>
+            <div class="hour-grid" data-daily-grid></div>
+          </div>
+          <div data-time-panel="dates" hidden>
+            <div class="time-segments" data-time-segments></div>
+            <button type="button" class="btn ghost small" data-time-add>+ 添加日期段</button>
+          </div>
         </div>
       </div>
+    </div>
+
+    <div class="form-field" data-scope-panel="city" {% if scope != "city" %}hidden{% endif %} style="margin-top:16px">
+      <label>城市</label>
+      <select class="input" name="city_id" data-city-select>
+        {% for c in cities %}
+        <option value="{{ c.id }}" {% if c.selected %}selected{% endif %}>{{ c.name }}</option>
+        {% endfor %}
+      </select>
+      <p class="form-note">自动查询该城市所有可预售日期；首批开售后只推送日期/时间最早的一家影院。</p>
     </div>
 
     <div class="form-field" style="margin-top:14px">

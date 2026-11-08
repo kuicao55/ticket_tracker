@@ -20,6 +20,7 @@
       </div>
       <div class="detail-meta">
         <span class="mono">movie {{ movie_id }}</span>
+        {% if is_city %}<span>全城 · {{ city_name }}</span>{% endif %}
         <span>{{ time_spec }}</span>
         <span>{{ imax_text }}</span>
         <span class="mono">{{ created_at }}</span>
@@ -41,7 +42,7 @@
 
   <section class="detail-stats">
     <div class="stat"><div class="label">Subscribers</div><div class="value">{{ subscriber_count }}</div></div>
-    <div class="stat"><div class="label">Cinemas</div><div class="value">{{ cinema_count }}</div></div>
+    <div class="stat"><div class="label">{% if is_city %}首轮影院{% else %}Cinemas{% endif %}</div><div class="value">{{ cinema_count }}</div></div>
     <div class="stat"><div class="label">Total shows</div><div class="value">{{ total }}</div></div>
     <div class="stat"><div class="label">IMAX shows</div><div class="value">{{ imax }}</div></div>
     <div class="stat"><div class="label">Buckets</div><div class="value">{{ buckets }}</div></div>
@@ -189,6 +190,51 @@
     </div>
 
     <div class="stack">
+      {% if is_city %}
+      <div class="card">
+        <div class="card-head">
+          <div>
+            <p class="eyebrow">City presale</p>
+            <h2>全城开售状态</h2>
+            <p>只监控首批开售；推送后停止轮询，可手动重新武装。</p>
+          </div>
+          <span class="pill">{{ city_name }}</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">监控城市</span>
+          <span class="health-val">{{ city_name }}</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">可预售日期</span>
+          <span class="health-val mono">{{ city_monitored_dates }}</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">最近轮询</span>
+          <span class="health-val"><span class="mono">{{ city_last_polled }}</span> · {{ city_last_ok }}</span>
+        </div>
+        <div class="health-row">
+          <span class="health-key">首轮影院 / 场次</span>
+          <span class="health-val mono">{{ city_last_cinema_count }} 家 / {{ city_last_show_count }} 场</span>
+        </div>
+        {% if city_last_error != "" %}
+        <div class="alert-strip" style="margin-top:12px">{{ city_last_error }}</div>
+        {% endif %}
+        {% if city_fired %}
+        <div class="alert-strip" style="margin-top:12px">
+          <strong>已推送：</strong>{{ city_fired_cinema }}{% if city_fired_cinema_id != "" %} · {{ city_fired_cinema_id }}{% endif %}<br>
+          {{ city_fired_date }} {{ city_fired_time }}{% if city_fired_is_imax %} · IMAX{% endif %}
+          {% if city_fired_seq_no != "" %}<br><span class="mono">seqNo {{ city_fired_seq_no }}</span>{% endif %}
+          <br><span class="mono muted">{{ city_fired_at }}</span>
+        </div>
+        <form method="post" action="/actions/watches/{{ id }}/rearm" style="margin-top:12px"
+              onsubmit="return confirm('重新武装会让这个全城 watch 再次推送首批开售，继续？')">
+          <button class="btn clay small" type="submit">重新武装</button>
+        </form>
+        {% else %}
+        <div class="empty">等待开售；当前还没有可推送场次。</div>
+        {% endif %}
+      </div>
+      {% else %}
       <div class="card">
         <div class="card-head">
           <div>
@@ -208,6 +254,7 @@
         {% endfor %}
         {% endif %}
       </div>
+      {% endif %}
 
       <div class="card">
         <div class="card-head">
@@ -217,6 +264,37 @@
             <p>保存后如过滤条件变化，会清空该 watch 的基线。</p>
           </div>
         </div>
+        {% if is_city %}
+        <form method="post" action="/actions/watches/{{ id }}/edit" data-picker-form data-scope-form>
+          <input type="hidden" name="scope" value="city" data-scope-value>
+          <div class="form-field">
+            <label>电影</label>
+            <button type="button" class="select-trigger" data-movie-open>
+              <span class="select-main" data-movie-label>{{ name }}</span>
+              <span class="select-sub mono" data-movie-id>{{ movie_id }}</span>
+              <span class="menu-caret">⌄</span>
+            </button>
+            <input type="hidden" name="movie_id" data-movie-value value="{{ movie_id }}">
+          </div>
+
+          <div class="form-field" data-scope-panel="city" style="margin-top:12px">
+            <label>城市</label>
+            <select class="input" name="city_id" data-city-select>
+              {% for c in city_choices %}
+              <option value="{{ c.id }}" {% if c.selected %}selected{% endif %}>{{ c.name }}</option>
+              {% endfor %}
+            </select>
+            <p class="form-note">修改城市或电影会重新武装，并清空已推送状态。</p>
+          </div>
+
+          <div class="form-field" style="margin-top:10px">
+            <label style="display:flex;align-items:center;gap:8px;text-transform:none;letter-spacing:0;font-family:var(--sans);font-size:13px;color:var(--ink)">
+              <input type="checkbox" name="imax_only" value="on" {% if imax_only %}checked{% endif %}> 只看 IMAX
+            </label>
+          </div>
+          <div class="form-actions"><button class="btn small" type="submit">保存过滤条件</button></div>
+        </form>
+        {% else %}
         <form method="post" action="/actions/watches/{{ id }}/edit" data-picker-form>
           <div class="form-field">
             <label>电影</label>
@@ -265,6 +343,7 @@
           </div>
           <div class="form-actions"><button class="btn small" type="submit">保存过滤条件</button></div>
         </form>
+        {% endif %}
       </div>
 
 
@@ -308,8 +387,8 @@
   <div class="card chart-card">
     <div class="card-head">
       <div>
-        <p class="eyebrow">Baseline history</p>
-        <h2>{{ chart.name }} 的基线</h2>
+        <p class="eyebrow">{% if is_city %}Presale samples{% else %}Baseline history{% endif %}</p>
+        <h2>{{ chart.name }} 的{% if is_city %}开售采样{% else %}基线{% endif %}</h2>
         <p>{{ chart.subtitle }} · 当前 {{ chart.total }} 场 / IMAX {{ chart.imax }}</p>
       </div>
       <div class="segmented">
@@ -324,6 +403,7 @@
   </div>
 </section>
 
+{% if !is_city %}
 <section class="card baseline-shows" style="margin-top:12px">
   <div class="card-head">
     <div>
@@ -369,6 +449,7 @@
   {% endfor %}
   {% endif %}
 </section>
+{% endif %}
 
 <dialog id="movie-dialog" class="picker-dialog">
   <div class="picker-head">

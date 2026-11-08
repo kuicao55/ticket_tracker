@@ -865,13 +865,44 @@
     });
   }
 
+  function initWatchScope(root) {
+    root.querySelectorAll('form[data-scope-form]').forEach(function (form) {
+      if (form.dataset.scopeInit) return;
+      form.dataset.scopeInit = '1';
+      const hidden = form.querySelector('[data-scope-value]');
+      const buttons = Array.from(form.querySelectorAll('[data-scope-toggle] [data-scope]'));
+      const panels = Array.from(form.querySelectorAll('[data-scope-panel]'));
+      if (!hidden || !panels.length) return;
+      function apply(scope) {
+        hidden.value = scope;
+        buttons.forEach(function (b) {
+          b.classList.toggle('active', b.dataset.scope === scope);
+          b.setAttribute('aria-pressed', b.dataset.scope === scope ? 'true' : 'false');
+        });
+        panels.forEach(function (panel) {
+          const on = panel.dataset.scopePanel === scope;
+          panel.hidden = !on;
+          panel.querySelectorAll('input,select,textarea,button').forEach(function (el) {
+            if (el.dataset.scope) return;
+            el.disabled = !on;
+          });
+        });
+      }
+      buttons.forEach(function (b) {
+        b.addEventListener('click', function () { apply(b.dataset.scope); });
+      });
+      apply(hidden.value === 'city' ? 'city' : 'cinema');
+    });
+  }
+
   function initFormGuards(root) {
     root.querySelectorAll('form[data-picker-form]').forEach(function (form) {
       if (form.dataset.guardInit) return;
       form.dataset.guardInit = '1';
       form.addEventListener('submit', function (e) {
         const movie = form.querySelector('[data-movie-value]');
-        const cinemas = form.querySelector('[data-cinema-value]');
+        const scopeInput = form.querySelector('[data-scope-value]');
+        const scope = scopeInput && scopeInput.value === 'city' ? 'city' : 'cinema';
         if (movie && !movie.value) {
           e.preventDefault();
           const btn = form.querySelector('[data-movie-open]');
@@ -881,6 +912,15 @@
           }
           return;
         }
+        if (scope === 'city') {
+          const city = form.querySelector('[data-city-select]');
+          if (city && !city.value) {
+            e.preventDefault();
+            city.focus();
+          }
+          return;
+        }
+        const cinemas = form.querySelector('[data-cinema-value]');
         if (cinemas && !cinemas.value) {
           e.preventDefault();
           const btn = form.querySelector('[data-cinema-open]');
@@ -890,6 +930,46 @@
           }
         }
       });
+    });
+  }
+
+  function initPollTabs(root) {
+    root.querySelectorAll('[data-poll-tabs]').forEach(function (tabs) {
+      if (tabs.dataset.pollInit) return;
+      tabs.dataset.pollInit = '1';
+      const card = tabs.closest('.card');
+      if (!card) return;
+      const buttons = Array.from(tabs.querySelectorAll('[data-poll-tab]'));
+      const panels = Array.from(card.querySelectorAll('[data-poll-panel]'));
+      const storageKey = 'tt.pollTab';
+      function remember(name) {
+        try { sessionStorage.setItem(storageKey, name); } catch (e) {}
+      }
+      function remembered() {
+        try {
+          const v = sessionStorage.getItem(storageKey);
+          return v === 'city' ? 'city' : 'cinema';
+        } catch (e) {
+          return 'cinema';
+        }
+      }
+      function select(name) {
+        buttons.forEach(function (b) {
+          const on = b.dataset.pollTab === name;
+          b.classList.toggle('active', on);
+          b.setAttribute('aria-selected', on ? 'true' : 'false');
+        });
+        panels.forEach(function (p) {
+          p.hidden = p.dataset.pollPanel !== name;
+        });
+      }
+      buttons.forEach(function (b) {
+        b.addEventListener('click', function () {
+          select(b.dataset.pollTab);
+          remember(b.dataset.pollTab);
+        });
+      });
+      select(remembered());
     });
   }
 
@@ -925,7 +1005,9 @@
     bindPickerDialogs();
     initDateDialog();
     initTimePickers(root);
+    initWatchScope(root);
     initFormGuards(root);
+    initPollTabs(root);
     initBaselineTabs(root);
   }
 

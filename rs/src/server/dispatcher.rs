@@ -82,6 +82,7 @@ pub async fn dispatch_trigger(state: Arc<AppState>, event: Value) {
                 buy_url.as_deref(),
                 &ev,
                 &settings,
+                true,
             )
             .await;
         });
@@ -124,7 +125,7 @@ fn effective_channel_config(ch: &ChannelRow, binding: Option<&Value>) -> Value {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn deliver_channel(
+async fn deliver_channel_once(
     state: &Arc<AppState>,
     ch: &ChannelRow,
     cfg: &Value,
@@ -143,9 +144,7 @@ async fn deliver_channel(
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
             let Some(url) = url else {
-                let r: Result<String, String> = Err("渠道未配置 url/webhook".to_string());
-                log_result(state, ch, event, r.clone());
-                return r;
+                return Err("渠道未配置 url/webhook".to_string());
             };
             match notify::notify_results_webhook_async(Some(url), title, message, buy_url).await {
                 Ok(true) => Ok("webhook 已发送".into()),
@@ -185,6 +184,39 @@ async fn deliver_channel(
         other => Err(format!("未知渠道类型: {}", other)),
     };
 
+    result
+}
+
+/// 包一层重试：webhook/discord 在 notify 层已有 3 次重试；email / Gofer
+/// 在这里再补一次。最终仍失败则上报全局健康。
+#[allow(clippy::too_many_arguments)]
+async fn deliver_channel(
+    state: &Arc<AppState>,
+    ch: &ChannelRow,
+    cfg: &Value,
+    title: &str,
+    message: &str,
+    buy_url: Option<&str>,
+    event: &Value,
+    settings: &Settings,
+    report_health: bool,
+) -> Result<String, String> {
+    let mut result =
+        deliver_channel_once(state, ch, cfg, title, message, buy_url, event, settings).await;
+    let retry_once = matches!(
+        ch.channel_type.as_str(),
+        "email" | "wechat_local" | "xhs_local"
+    );
+    if result.is_err() && retry_once {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        result =
+            deliver_channel_once(state, ch, cfg, title, message, buy_url, event, settings).await;
+    }
+    if report_health {
+        if let Err(e) = &result {
+            state.report_delivery_error(format!("{}：{}", ch.name, e));
+        }
+    }
     log_result(state, ch, event, result.clone());
     result
 }
@@ -280,7 +312,11 @@ pub async fn test_channel(state: Arc<AppState>, channel_id: &str, watch_id: &str
     });
     let title = "🧪 ticket-tracker 测试通知";
     let message = "这是一条来自 Web 面板的测试消息；收到即表示渠道链路正常。";
-    match deliver_channel(&state, &ch, &cfg, title, message, None, &event, &settings).await {
+    match deliver_channel(
+        &state, &ch, &cfg, title, message, None, &event, &settings, false,
+    )
+    .await
+    {
         Ok(msg) => format!("{}：{}", ch.name, msg),
         Err(e) => format!("{}：测试失败（{}）", ch.name, e),
     }
@@ -403,34 +439,46 @@ pub async fn maybe_dispatch_autolock(state: Arc<AppState>, event: &Value) {
             .lock()
             .unwrap()
             .insert(key.clone(), now_secs());
-        let mut req = state
-            .http
-            .post(format!("{}/lock", base))
-            .timeout(Duration::from_secs(3))
-            .json(&body);
-        if let Some(token) = token {
-            req = req.header("X-Agent-Token", token);
+        let mut last_error: Option<String> = None;
+        for attempt in 0..2 {
+            let mut req = state
+                .http
+                .post(format!("{}/lock", base))
+                .timeout(Duration::from_secs(3))
+                .json(&body);
+            if let Some(token) = token {
+                req = req.header("X-Agent-Token", token);
+            }
+            match req.send().await {
+                Ok(r) if r.status().is_success() => {
+                    state.push_event(
+                        "lock",
+                        Some(wid),
+                        if attempt == 0 {
+                            format!("🎯 自动锁票已提交 agent（影院 {}）", cid)
+                        } else {
+                            format!("🎯 自动锁票重试后提交成功（影院 {}）", cid)
+                        },
+                    );
+                    last_error = None;
+                    break;
+                }
+                Ok(r) => {
+                    state.lock_inflight.lock().unwrap().remove(&key);
+                    last_error = Some(format!("Gofer HTTP {}", r.status()));
+                }
+                Err(e) => {
+                    state.lock_inflight.lock().unwrap().remove(&key);
+                    last_error = Some(e.to_string());
+                }
+            }
+            if attempt == 0 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
         }
-        match req.send().await {
-            Ok(r) if r.status().is_success() => {
-                state.push_event(
-                    "lock",
-                    Some(wid),
-                    format!("🎯 自动锁票已提交 agent（影院 {}）", cid),
-                );
-            }
-            Ok(r) => {
-                state.lock_inflight.lock().unwrap().remove(&key);
-                state.push_event(
-                    "lock",
-                    Some(wid),
-                    format!("✗ 自动锁票提交失败（Gofer HTTP {}）", r.status()),
-                );
-            }
-            Err(e) => {
-                state.lock_inflight.lock().unwrap().remove(&key);
-                state.push_event("lock", Some(wid), format!("✗ 自动锁票提交失败：{}", e));
-            }
+        if let Some(e) = last_error {
+            state.report_delivery_error(format!("自动锁票（影院 {}）：{}", cid, e));
+            state.push_event("lock", Some(wid), format!("✗ 自动锁票重试后仍失败：{}", e));
         }
     }
 }
@@ -486,6 +534,7 @@ pub async fn dispatch_lock_result(
                 buy_url.as_deref(),
                 &ev,
                 &settings,
+                true,
             )
             .await;
         });

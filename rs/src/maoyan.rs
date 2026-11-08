@@ -7,12 +7,15 @@
 //! - 3 次重试，间隔 3s
 //!
 
+use std::collections::HashSet;
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use regex::Regex;
 use serde_json::{json, Value};
+
+use crate::city::{self, CityDateFetch, CityPoll, CityShow};
 
 const USER_AGENT_MOBILE: &str = "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) \
     AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.0 Mobile/15E148 Safari/604.1";
@@ -24,6 +27,9 @@ const FILM_API: &str = "https://m.maoyan.com/ajax/detailmovie?movieId={movie_id}
 const BUY_MOBILE: &str = "https://m.maoyan.com/shows/{cinema_id}";
 const BUY_PC: &str = "https://www.maoyan.com/cinema/{cinema_id}";
 const FILMS_LIST_URL: &str = "https://www.maoyan.com/films?showType={show_type}";
+const SHOWDAYS_URL: &str = "https://m.maoyan.com/api/mtrade/mmcs/show/v1/movie/showdays.json";
+const CITY_CINEMAS_URL: &str =
+    "https://m.maoyan.com/api/mtrade/mmcs/cinema/v2/select/movie/cinemas.json";
 
 /// 全进程共享的移动端 Client：连接复用 + gzip（单影院 JSON 92KB → ~6KB）。
 static MOBILE_CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
@@ -128,6 +134,129 @@ pub async fn fetch_cinema_async(cinema_id: &str) -> Result<Value> {
 pub fn fetch_cinema(cinema_id: &str) -> Result<Value> {
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(fetch_cinema_async(cinema_id))
+}
+
+// ----------------- 城市 × 影片（全城开售 watch） -----------------
+
+pub fn city_show_dates_url(movie_id: i64, city_id: u32) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(SHOWDAYS_URL)?;
+    url.query_pairs_mut()
+        .append_pair("movieId", &movie_id.to_string())
+        .append_pair("channelId", "4")
+        .append_pair("cityId", &city_id.to_string());
+    Ok(url)
+}
+
+pub fn city_date_shows_url(
+    movie_id: i64,
+    city_id: u32,
+    date: &str,
+    imax_only: bool,
+    offset: u32,
+) -> Result<reqwest::Url> {
+    let mut url = reqwest::Url::parse(CITY_CINEMAS_URL)?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("limit", "200")
+            .append_pair("offset", &offset.to_string())
+            .append_pair("utm_term", "7.5")
+            .append_pair("client", "iphone")
+            .append_pair("channelId", "4")
+            .append_pair("showDate", date)
+            .append_pair("movieId", &movie_id.to_string())
+            .append_pair("sort", "distance")
+            .append_pair("cityId", &city_id.to_string())
+            .append_pair("ci", &city_id.to_string())
+            .append_pair("lat", "-1")
+            .append_pair("lng", "-1");
+        if imax_only {
+            q.append_pair("hallTypeIds", "[\"2\"]")
+                .append_pair("hallType", "[\"2\"]");
+        }
+    }
+    Ok(url)
+}
+
+/// 猫眼 showdays；`code=109`（未开售）会被解析成空日期列表。
+pub async fn fetch_city_show_dates_async(movie_id: i64, city_id: u32) -> Result<Vec<String>> {
+    let url = city_show_dates_url(movie_id, city_id)?;
+    let data = _get_json(url.as_str(), Some("https://m.maoyan.com/"), 2).await?;
+    let dates = city::parse_show_dates(&data)?;
+    Ok(city::upcoming_dates(
+        dates,
+        chrono::Local::now().date_naive(),
+    ))
+}
+
+/// 单个 showDate 的城市影院列表；自动分页并去重。
+pub async fn fetch_city_date_shows_async(
+    movie_id: i64,
+    city_id: u32,
+    date: &str,
+    imax_only: bool,
+) -> Result<CityDateFetch> {
+    let mut out: Vec<CityShow> = Vec::new();
+    let mut seen: HashSet<(String, String, Option<String>, String)> = HashSet::new();
+    let mut offset: u32 = 0;
+    let mut requests = 0usize;
+    for _ in 0..10 {
+        let url = city_date_shows_url(movie_id, city_id, date, imax_only, offset)?;
+        let data = _get_json(url.as_str(), Some("https://m.maoyan.com/"), 2).await?;
+        requests += 1;
+        let shows = city::parse_city_date(date, &data, imax_only)?;
+        for show in shows {
+            let key = (
+                show.cinema_id.clone(),
+                show.show_time.clone(),
+                show.seq_no.clone(),
+                show.format.clone(),
+            );
+            if seen.insert(key) {
+                out.push(show);
+            }
+        }
+        let has_more = data
+            .pointer("/data/paging/hasMore")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if !has_more {
+            break;
+        }
+        offset = offset.saturating_add(200);
+    }
+    out.sort_by(|a, b| a.sort_key().cmp(&b.sort_key()));
+    Ok(CityDateFetch {
+        shows: out,
+        requests,
+    })
+}
+
+/// 按日期升序探测，返回最早一个非空日期的场次；全部为空则 `shows=[]`。
+pub async fn fetch_city_shows_async(
+    movie_id: i64,
+    city_id: u32,
+    dates: &[String],
+    imax_only: bool,
+) -> Result<CityPoll> {
+    let mut dates = dates.to_vec();
+    dates.sort();
+    dates.dedup();
+    let dates = city::upcoming_dates(dates, chrono::Local::now().date_naive());
+    let mut found: Vec<CityShow> = Vec::new();
+    let mut requests = 0usize;
+    for date in &dates {
+        let fetched = fetch_city_date_shows_async(movie_id, city_id, date, imax_only).await?;
+        requests += fetched.requests.max(1);
+        if !fetched.shows.is_empty() {
+            found = fetched.shows;
+            break;
+        }
+    }
+    Ok(CityPoll {
+        dates,
+        shows: found,
+        requests,
+    })
 }
 
 pub fn movie_dates(movie: &Value) -> Vec<String> {
@@ -519,6 +648,37 @@ mod tests {
             tp: "".into(),
         };
         assert!(!empty.is_imax());
+    }
+
+    #[test]
+    fn city_show_dates_url_contains_movie_and_city() {
+        let url = city_show_dates_url(1503101, 10).unwrap();
+        let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("movieId").map(String::as_str), Some("1503101"));
+        assert_eq!(q.get("cityId").map(String::as_str), Some("10"));
+        assert_eq!(q.get("channelId").map(String::as_str), Some("4"));
+    }
+
+    #[test]
+    fn city_date_shows_url_has_required_params_and_imax_filter() {
+        let url = city_date_shows_url(1503101, 10, "2026-12-31", true, 200).unwrap();
+        let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert_eq!(q.get("limit").map(String::as_str), Some("200"));
+        assert_eq!(q.get("offset").map(String::as_str), Some("200"));
+        assert_eq!(q.get("showDate").map(String::as_str), Some("2026-12-31"));
+        assert_eq!(q.get("cityId").map(String::as_str), Some("10"));
+        assert_eq!(q.get("ci").map(String::as_str), Some("10"));
+        assert_eq!(q.get("lat").map(String::as_str), Some("-1"));
+        assert_eq!(q.get("hallTypeIds").map(String::as_str), Some("[\"2\"]"));
+        assert_eq!(q.get("hallType").map(String::as_str), Some("[\"2\"]"));
+    }
+
+    #[test]
+    fn city_date_shows_url_omits_imax_filter_by_default() {
+        let url = city_date_shows_url(1, 10, "2026-12-31", false, 0).unwrap();
+        let q: std::collections::HashMap<String, String> = url.query_pairs().into_owned().collect();
+        assert!(!q.contains_key("hallTypeIds"));
+        assert!(!q.contains_key("hallType"));
     }
 
     #[test]

@@ -137,6 +137,163 @@ async fn watch_list_shows_facts_and_deletes() {
 }
 
 #[tokio::test]
+async fn city_watch_create_get_list_and_rearm() {
+    let app = app().await;
+    let body = serde_json::json!({
+        "movie_id": 1503101,
+        "movie_name": "沙丘3",
+        "scope": "city",
+        "city_id": 10,
+        "imax_only": true
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/watches")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["created"], true);
+    let wid = v["watch_id"].as_str().unwrap().to_string();
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/watches")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["created"], false);
+    assert_eq!(v["watch_id"], wid);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/api/v1/watches/{}", wid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["scope"], "city");
+    assert_eq!(v["city_id"], 10);
+    assert_eq!(v["city_name"], "上海");
+    assert_eq!(v["cinemas"].as_array().unwrap().len(), 0);
+    assert_eq!(v["city_state"]["fired"], false);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/watches")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains("全城 · 上海"));
+    assert!(html.contains("全部开售日期"));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri(format!("/watches/{}", wid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains("全城开售状态"));
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/api/v1/watches/{}/rearm", wid))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let v: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(v["rearmed"], true);
+}
+
+#[tokio::test]
+async fn city_watch_web_form_and_new_page_scope() {
+    let db = Db::connect_memory().await.unwrap();
+    db.upsert_movies(&[("1503101".into(), "沙丘3".into())], 1)
+        .await
+        .unwrap();
+    let state: Arc<AppState> = AppState::new(db.clone());
+    let app = api::router(state.clone()).merge(web::router(state));
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/watches/new?scope=city")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains("data-scope-panel=\"city\""));
+    assert!(html.contains("全城开售"));
+    assert!(html.contains("value=\"10\""));
+
+    let form = "movie_id=1503101&scope=city&city_id=10&imax_only=on";
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/actions/watches")
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(Body::from(form))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+
+    let rows = db.list_watches("recent", 10, 0).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].scope, "city");
+    assert_eq!(rows[0].city_id, 10);
+}
+
+#[tokio::test]
 async fn watch_filter_key_is_deduped_via_api() {
     let app = app().await;
     let make = || {
@@ -184,12 +341,81 @@ async fn dashboard_renders_poll_health_instead_of_baseline_chart() {
 
     assert!(html.contains("Poll 健康 · 今日"));
     assert!(html.contains("poll-health-svg"));
+    assert!(html.contains("poll 单次 JSON 耗时"));
+    assert!(html.contains("JSON 成功"));
     assert!(html.contains(">00:00<"));
     assert!(html.contains(">24:00<"));
     assert!(html.contains("风控"));
     assert!(html.contains("code=406"));
     assert!(!html.contains("基线趋势"));
     assert!(!html.contains("data-chart-url"));
+}
+
+#[tokio::test]
+async fn dashboard_combines_cinema_and_city_json_health() {
+    let db = Db::connect_memory().await.unwrap();
+    let state: Arc<AppState> = AppState::new(db.clone());
+    let app = api::router(state.clone()).merge(web::router(state));
+
+    let body = serde_json::json!({
+        "movie_id": 1503101,
+        "movie_name": "沙丘3",
+        "scope": "city",
+        "city_id": 10,
+        "imax_only": true
+    });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/v1/watches")
+                .header("content-type", "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let v: serde_json::Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let wid = v["watch_id"].as_str().unwrap().to_string();
+
+    db.record_city_poll(
+        &wid,
+        true,
+        None,
+        &["2026-12-31".to_string()],
+        3,
+        5,
+        2,
+        2,
+        180,
+    )
+    .await
+    .unwrap();
+    db.insert_poll_health_full(1, 0, 0, 100, 2, 0, 0, 60, None)
+        .await
+        .unwrap();
+
+    let resp = app
+        .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let html = String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap();
+    assert!(html.contains("基础 JSON"));
+    assert!(html.contains("3/3 基础 JSON 成功"));
+    assert!(html.contains("全城扫描"));
+    assert!(html.contains("城市影院列表"));
+    assert!(html.contains("3 家 · 5 场"));
 }
 
 #[tokio::test]

@@ -20,6 +20,9 @@ async fn make_watch(db: &Db, auto_lock: bool) -> String {
         imax_only: false,
         created_by: None,
         visibility: "public".into(),
+        scope: "cinema".into(),
+        city_id: 0,
+        city_name: String::new(),
         auto_lock,
         lock_num_seats: 2,
         lock_max_retries: 2,
@@ -156,4 +159,48 @@ async fn autolock_skips_watch_without_switch() {
     )
     .await;
     assert!(captured.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn autolock_retries_once_then_reports_health_on_failure() {
+    let db = Db::connect_memory().await.unwrap();
+    let state = AppState::new(db.clone());
+    let wid = make_watch(&db, true).await;
+
+    let count: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let cap = count.clone();
+    async fn fail_lock(State(cap): State<Arc<Mutex<usize>>>) -> StatusCode {
+        *cap.lock().unwrap() += 1;
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+    let app = Router::new()
+        .route("/lock", post(fail_lock))
+        .with_state(cap);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    db.set_setting("agent_url", &format!("http://{}", addr))
+        .await
+        .unwrap();
+
+    let event = json!({
+        "event_id": "evt_retry_1",
+        "watch_id": wid,
+        "triggers": [{
+            "cinema_id": "37534",
+            "cinema_name": "测试影院",
+            "date": "2026-11-12",
+            "hour": 19,
+            "added": []
+        }]
+    });
+    dispatcher::maybe_dispatch_autolock(state.clone(), &event).await;
+    assert_eq!(*count.lock().unwrap(), 2, "lock should retry exactly once");
+    let h = state.health_snapshot();
+    assert!(!h.health_ok);
+    assert!(h
+        .last_error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("自动锁票"));
 }

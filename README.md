@@ -2,7 +2,7 @@
 
 猫眼影城影片预售监测：**v4 无头主服务 + Web 面板**。
 
-实时盯紧电影 / 影院 / 日期组合，一旦猫眼放票就：
+实时盯紧电影 / 影院 / 日期组合，或全城开售的未上映电影；一旦猫眼放票就：
 
 - 通过 Discord / webhook / 邮件直接通知；
 - 或把微信 / 小红书 / 自动锁票请求投递给独立的 [`Gofer`](https://github.com/kuicao55/Gofer) 服务。
@@ -15,16 +15,18 @@
 
 ## 当前版本
 
-**v4.9.0** —— 只保留 v4 服务端：
+**v4.11.0** —— 只保留 v4 服务端：
 
 - `tt-server`：无头主服务 + SQLite + Web 面板
+- **全城开售 watch**：只选电影 + 城市 + IMAX，自动盯未开售电影；首批影院开售时推送日期/时间最早的一家
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）；watch 渠道可复用 Settings 里的全局绑定
 - iGlance `iglance.service.v1` 服务绑定（状态 / 内存 / 暂停 / 恢复 / 停止 / 一键打开面板）
 - Release 二进制内置 Web 资产，可扁平安装（`tt-server` + `start-ticket-tracker.sh`）
 - Web 面板密码登录：首次升级引导 `/setup` 设密，Argon2 哈希 + 会话 Cookie
 - 每 watch 独立通知渠道参数
 - watch 列表展示影院 / 监控日期 / IMAX 摘要，支持在列表和详情页删除 watch
-- 今日 Poll 健康图
+- 今日 Poll 健康图：影院轮询 + 全城扫描统一按“基础 JSON 获取”统计；纵轴为单次耗时，线条颜色表示状态
+- 主页 Poll plan 分「影院轮询 / 全城扫描」两个 tab
 - 监控暂停 / 恢复开关
 - GitHub Release 面板自动更新
 
@@ -34,8 +36,10 @@
 
 - **poll / watch 两层**：影院去重抓取，watch 按电影 / 影院 / 时间 / IMAX 过滤。
 - **小时桶差分**：首轮静默建基线；任一桶计数增加才触发，避免重复报警。
+- **全城开售 watch**：不选影院；按城市 + 电影 + IMAX 自动查询所有可预售日期，
+  首次出现场次时选日期/时间最早的一家影院推送一次，之后停止轮询；可手动重新武装。
 - **Web 面板**：KPI、watch leaderboard、poll 列表、poll 健康、用户、事件、渠道配置。
-  watch 列表会展示影院、监控日期与 IMAX 摘要，并可在列表 / 详情页删除 watch。
+  watch 列表会展示影院 / 全城范围、监控日期与 IMAX 摘要，并可在列表 / 详情页删除 watch。
 - **每 watch 独立渠道**：
   - Discord / webhook：URL
   - Email：收件人
@@ -44,7 +48,7 @@
   - 自动锁票：票数 / 重试 / 座位
   - 微信 / 小红书 / 自动锁票的 Gofer：可复用 Settings 里的全局 Gofer，也可单独填写地址和 token
 - **服务开关**：Dashboard 顶部暂停/恢复监控；暂停期间面板在线，不轮询、不通知、不锁票。
-- **投递解耦**：监控不探活 Gofer / 微信 / 小红书；Gofer 离线只记录一条投递失败，不影响监控健康。
+- **投递解耦**：监控不主动探活 Gofer / 微信 / 小红书；投递失败重试一次，最终失败会计入健康异常。
 - **Docker**：主服务可容器化；Gofer 因 GUI 依赖必须原生运行在 Mac 上。
 
 ---
@@ -118,8 +122,8 @@ SHA256SUMS
 发版：
 
 ```bash
-git tag v4.9.0
-git push origin v4.9.0
+git tag v4.11.0
+git push origin v4.11.0
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -146,8 +150,10 @@ cargo build --release
 
 - `/`：总览、监控开关、watch leaderboard、poll 列表、poll 健康、事件、用户。
 - `/watches`：全部 watch，附带影院 / 监控日期 / IMAX 摘要，可直接删除。
-- `/watches/new`：电影/影院搜索弹窗 + 日期范围 + 小时方块；不需要输入 ID。
-- `/watches/:id`：过滤条件、渠道配置、自动锁票、基线图、基线场次表；可删除 watch。
+- `/watches/new`：两种模式——指定影院（电影/影院弹窗 + 日期范围 + 小时方块），
+  或全城开售（电影 + 城市 + IMAX，未开售电影用）。
+- `/watches/:id`：过滤条件、渠道配置、自动锁票、基线图、基线场次表；全城 watch
+  展示城市开售状态、首批影院/最早场次，可重新武装；可删除 watch。
 - `/users`：用户与订阅。
 - `/settings`：检查间隔、静默窗口、Discord 健康告警、Gofer 地址/token、渠道默认值、影院城市。
 
@@ -223,6 +229,7 @@ cargo build --release
 | GET/PATCH/DELETE | `/api/v1/watches/:id` | 详情 / 编辑 / 删除 |
 | GET/PUT | `/api/v1/watches/:id/channels` | 渠道绑定 |
 | GET | `/api/v1/watches/:id/metrics?range=24h\|7d\|30d` | 图表数据 |
+| POST | `/api/v1/watches/:id/rearm` | 重新武装全城开售 watch（清 fired / lock_state） |
 | GET/POST | `/api/v1/channels` | 渠道列表 / 新建 |
 | GET/PATCH/DELETE | `/api/v1/channels/:id` | 渠道配置 |
 | GET/POST | `/api/v1/users` | 用户列表 / 新建 |
@@ -251,6 +258,25 @@ curl -X POST http://127.0.0.1:8787/api/v1/watches \
     "imax_only": true
   }'
 ```
+
+全城开售 watch（不选影院，自动跟踪所有可预售日期）：
+
+```bash
+curl -X POST http://127.0.0.1:8787/api/v1/watches \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "movie_id": 1503101,
+    "movie_name": "沙丘3",
+    "scope": "city",
+    "city_id": 10,
+    "imax_only": true
+  }'
+```
+
+- 未开售时 `showdays` 返回 `code=109`，watch 显示“等待开售”，不会报错。
+- 首批影院开售后，推送一次日期/时间最早的影院和场次；之后停止轮询。
+- 修改电影/城市/IMAX 会自动重新武装；也可以调用 `/rearm`。
+- 全城 watch 遵守全局静默时段（默认 `01:00-06:00`）。
 
 ### 暂停 / 恢复监控
 
@@ -375,6 +401,10 @@ watch 触发
 
 - 微信 / 小红书 / 锁票的实际执行、请求历史、能力状态都在 Gofer 面板查看。
 - 主服务不探活 Gofer；Gofer 离线只会记录一条投递失败。
+- 全城开售事件只包含那一批最早的一家影院/场次，通知消息里带城市、影院、日期和时间；
+  自动锁票渠道最多只提交这一个影院。Gofer 侧无需改动。
+- 全城扫描在同一个 monitor 任务内并发探测；city 错误和投递最终失败都会进入全局健康。
+- 通知 / 锁票失败会重试一次（webhook 层原本已有多次重试），仍失败则标记健康异常。
 - 锁票结果可以通过 Gofer 的 `callback_url` best-effort 回调到主服务，更新 `lock_state`。
 
 详见 [`docs/SERVER.md`](docs/SERVER.md)。
@@ -390,10 +420,12 @@ SQLite + WAL，迁移文件在 `rs/migrations/`：
 - `0003_movies.sql`
 - `0004_poll_health.sql`
 - `0005_watch_channel_config.sql`
+- `0006_city_watch.sql`
+- `0007_json_fetch_health.sql`
 
 主要表：
 
-`settings` / `cinemas` / `movies` / `polls` / `watches` / `watch_cinemas` / `watch_state` / `watch_metrics` / `poll_health` / `users` / `channels` / `watch_channels` / `subscriptions` / `lock_state`。
+`settings` / `cinemas` / `movies` / `polls` / `watches` / `watch_cinemas` / `watch_state` / `watch_city_state` / `watch_metrics` / `poll_health` / `users` / `channels` / `watch_channels` / `subscriptions` / `lock_state`。
 
 备份：
 
