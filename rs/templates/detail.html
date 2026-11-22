@@ -7,7 +7,7 @@
 
 <div id="detail-root"
      hx-get="/watches/{{ id }}"
-     hx-trigger="every 5s [document.activeElement.tagName !== 'INPUT' &amp;&amp; document.activeElement.tagName !== 'TEXTAREA' &amp;&amp; document.activeElement.tagName !== 'SELECT' &amp;&amp; !document.activeElement.closest('[data-time-picker]') &amp;&amp; !document.activeElement.closest('[data-menu]') &amp;&amp; !document.querySelector('dialog[open]') &amp;&amp; !document.querySelector('[data-menu-panel]:not([hidden])')]"
+     hx-trigger="every 5s [document.activeElement.tagName !== 'INPUT' &amp;&amp; document.activeElement.tagName !== 'TEXTAREA' &amp;&amp; document.activeElement.tagName !== 'SELECT' &amp;&amp; !document.activeElement.closest('[data-time-picker]') &amp;&amp; !document.activeElement.closest('[data-menu]') &amp;&amp; !document.querySelector('dialog[open]') &amp;&amp; !document.querySelector('[data-menu-panel]:not([hidden])') &amp;&amp; !document.querySelector('form[data-picker-form][data-dirty]') &amp;&amp; !window._hourDrag]"
      hx-select="#detail-root" hx-target="#detail-root" hx-swap="outerHTML">
 
   <section class="detail-hero">
@@ -312,7 +312,8 @@
               <span class="select-main" data-cinema-label>选择影院</span>
               <span class="menu-caret">⌄</span>
             </button>
-            <input type="hidden" name="cinemas" data-cinema-value value="">
+            <input type="hidden" name="cinemas" data-cinema-value
+                   value="{% for c in cinemas %}{{ c.id }}{% if !loop.last %},{% endif %}{% endfor %}">
             <div class="chips" data-cinema-chips></div>
           </div>
 

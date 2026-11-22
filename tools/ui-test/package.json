@@ -1,0 +1,12 @@
+{
+  "name": "ticket-tracker-ui-test",
+  "private": true,
+  "type": "module",
+  "description": "Playwright UI regression tests for the ticket-tracker web panel. Dev-only; not embedded into tt-server or release artifacts.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "devDependencies": {
+    "playwright-core": "1.65.1"
+  }
+}

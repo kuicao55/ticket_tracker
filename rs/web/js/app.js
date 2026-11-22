@@ -247,6 +247,13 @@
     return n;
   }
 
+  // 标记过滤条件表单有未保存的改动；详情页的 5s HTMX 轮询会据此暂停整块刷新，
+  // 否则用户刚选的影院/时间/IMAX 会被服务端旧值覆盖。
+  function markFormDirty(node) {
+    const form = node && node.closest && node.closest('form[data-picker-form]');
+    if (form) form.dataset.dirty = '1';
+  }
+
   // ---------------- modal pickers (movie / cinema) ----------------
   const CITIES = [
     ['上海', 10], ['北京', 1], ['广州', 20], ['深圳', 30], ['杭州', 50],
@@ -283,6 +290,7 @@
       label.textContent = m.name;
       if (idEl) idEl.textContent = String(m.id);
       trigger.classList.remove('picker-error');
+      markFormDirty(value);
       dialog.close();
     }
     function render(data) {
@@ -371,6 +379,13 @@
     function rowFor(id) {
       return rows().find(function (r) { return String(r.dataset.id) === String(id); });
     }
+    // 以隐藏字段为准恢复已选影院：即使服务端渲染的列表里暂时没有某个影院，
+    // 也不会把它从选择里丢掉。
+    (hidden.value || '').split(',').map(function (s) { return s.trim(); })
+      .filter(Boolean).forEach(function (id) {
+        const row = rowFor(id);
+        selected.set(String(id), row ? (row.dataset.name || id) : id);
+      });
     function sync() {
       hidden.value = Array.from(selected.keys()).join(',');
       if (selected.size === 0) {
@@ -394,6 +409,7 @@
               if (cb) cb.checked = false;
             }
             sync();
+            markFormDirty(hidden);
           });
           chips.appendChild(chip);
         });
@@ -409,11 +425,16 @@
         const name = row.dataset.name || id;
         if (cb.checked) selected.set(id, name); else selected.delete(id);
         sync();
+        markFormDirty(hidden);
       });
     }
     rows().forEach(function (row) {
       const cb = row.querySelector('input[type=checkbox]');
-      if (cb && cb.checked) selected.set(String(row.dataset.id), row.dataset.name || row.dataset.id);
+      const id = String(row.dataset.id);
+      if (cb) {
+        if (selected.has(id)) cb.checked = true;
+        else if (cb.checked) selected.set(id, row.dataset.name || id);
+      }
       bindRow(row);
     });
     function renderRemote(list) {
@@ -498,10 +519,12 @@
   const dateState = { start: null, end: null, hover: null, view: null, apply: null };
 
   function initDateDialog() {
-    if (window._dateDialogInit) return;
-    window._dateDialogInit = true;
+    // 详情页会用 HTMX outerHTML 换掉整个 #detail-root，日期弹窗每次都是新节点。
+    // 必须按元素判断是否绑定过（不能用 window 上的全局标记），否则刷新一次后
+    // 应用/上下月/清除/关闭就全部失联。
     const dialog = document.getElementById('date-dialog');
-    if (!dialog) return;
+    if (!dialog || dialog.dataset.dateInit) return;
+    dialog.dataset.dateInit = '1';
     const close = dialog.querySelector('[data-date-close]');
     const prev = dialog.querySelector('[data-date-prev]');
     const next = dialog.querySelector('[data-date-next]');
@@ -690,6 +713,7 @@
       let mode = 'all';
       let dailySelected = new Set([19, 20, 21]);
       let dailyCtrl = null;
+      let ready = false;
       const segments = [];
 
       function hourGrid(container, selected, onChange) {
@@ -821,6 +845,7 @@
           obj = { type: 'intervals', intervals: intervals };
         }
         hidden.value = JSON.stringify(obj);
+        if (ready) markFormDirty(hidden);
       }
 
       function ensureDaily() {
@@ -855,6 +880,8 @@
       } else {
         setMode('all');
       }
+      // 初始化期间的 update() 不是用户操作，别把它当成未保存改动。
+      ready = true;
       modes.forEach(function (b) {
         b.addEventListener('click', function () { setMode(b.dataset.timeMode); });
       });
@@ -899,6 +926,10 @@
     root.querySelectorAll('form[data-picker-form]').forEach(function (form) {
       if (form.dataset.guardInit) return;
       form.dataset.guardInit = '1';
+      // 直接操作表单控件（如 IMAX 勾选、城市下拉）也算未保存改动。
+      function mark() { form.dataset.dirty = '1'; }
+      form.addEventListener('input', mark, true);
+      form.addEventListener('change', mark, true);
       form.addEventListener('submit', function (e) {
         const movie = form.querySelector('[data-movie-value]');
         const scopeInput = form.querySelector('[data-scope-value]');
@@ -928,7 +959,10 @@
             btn.classList.add('picker-error');
             btn.click();
           }
+          return;
         }
+        // 真正提交了，就不再需要脏标记。
+        delete form.dataset.dirty;
       });
     });
   }
@@ -1018,8 +1052,25 @@
   document.addEventListener('DOMContentLoaded', () => init(document));
   // outerHTML swap 后旧的 target 可能已脱离 DOM；必须重新扫描整个 document，
   // 否则新插入的倒计时圈会短暂显示模板里的占位符。
-  document.body.addEventListener('htmx:afterSwap', () => init(document));
+  document.body.addEventListener('htmx:afterSwap', () => {
+    // 旧 DOM 上的小时拖拽状态已经失效，别让它把结果写进脱离文档的 hidden input。
+    window._hourDrag = null;
+    init(document);
+  });
   document.body.addEventListener('htmx:afterSettle', () => init(document));
+  // 轮询请求可能在用户打开弹窗/开始编辑之后才返回。若结果到达时已经有未保存改动，
+  // 直接放弃这次 swap，避免把正在操作的表单换掉。
+  document.body.addEventListener('htmx:beforeSwap', (e) => {
+    const d = e.detail || {};
+    const elt = d.elt;
+    const verb = d.requestConfig && String(d.requestConfig.verb || '').toUpperCase();
+    if (!elt || elt.id !== 'detail-root' || verb !== 'GET') return;
+    if (window._hourDrag
+      || document.querySelector('dialog[open]')
+      || document.querySelector('form[data-picker-form][data-dirty]')) {
+      d.shouldSwap = false;
+    }
+  });
   document.body.addEventListener('htmx:afterRequest', (e) => {
     const el = e.detail && e.detail.elt;
     const dlg = el && el.closest && el.closest('dialog');

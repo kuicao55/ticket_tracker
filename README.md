@@ -15,8 +15,10 @@
 
 ## 当前版本
 
-**v4.11.0** —— 只保留 v4 服务端：
+**v4.11.1** —— 只保留 v4 服务端：
 
+- **修复 watch 详情页过滤条件编辑**：5 秒自动刷新不再覆盖未保存的 IMAX / 时间 / 影院改动；日期弹窗在 HTMX 换块后仍可正常“应用”；保存不再偶发失效
+- 新增浏览器级 UI 回归测试（`tools/ui-test/`，仅开发用，不参与打包）
 - `tt-server`：无头主服务 + SQLite + Web 面板
 - **全城开售 watch**：只选电影 + 城市 + IMAX，自动盯未开售电影；首批影院开售时推送日期/时间最早的一家
 - 外部 Gofer：微信 / 小红书 / 锁票（独立项目）；watch 渠道可复用 Settings 里的全局绑定
@@ -122,8 +124,8 @@ SHA256SUMS
 发版：
 
 ```bash
-git tag v4.11.0
-git push origin v4.11.0
+git tag v4.11.1
+git push origin v4.11.1
 ```
 
 公开仓库通常不需要 token；如果遇到 GitHub 限流，可设置 `TT_UPDATE_TOKEN`。
@@ -463,6 +465,20 @@ cargo test
 - Web / API smoke
 - 自动锁票回调（mock Gofer）
 
+浏览器级 UI 回归（需要 Node >= 20、Chrome / Chromium、`sqlite3`）：
+
+```bash
+cd tools/ui-test
+npm install
+npm test
+```
+
+runner 会自动用隔离的临时数据库和随机端口启动 `tt-server`（关闭监控），
+跑完清理，不会碰生产库。覆盖详情页过滤条件编辑、轮询与未保存改动、
+日期弹窗重绑、IMAX / 时间 / 影院保存与回显。
+
+`tools/ui-test/` 是纯开发目录，不会被编进 `tt-server` 或 Release 产物。
+
 ---
 
 ## 项目结构
@@ -488,6 +504,8 @@ ticket_tracker/
 │   ├── templates/
 │   ├── web/
 │   └── tests/
+├── tools/
+│   └── ui-test/               # Playwright 面板回归测试（开发用，不参与打包）
 ├── docs/
 │   ├── SERVER.md
 │   └── assets/
