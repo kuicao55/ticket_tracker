@@ -264,8 +264,37 @@ async function runTests({ base, db, password, chrome }) {
     check('F6. 刷新后仍显示 1 家影院',
       (await page.locator('[data-cinema-chips] .chip').count()) === 1);
 
-    // ---------- G. 页面无 JS 错误 ----------
-    check('G. 无 pageerror / console.error', pageErrors.length === 0, pageErrors.join(' | '));
+    // ---------- G. 日期段内取消小时 / 移除日期段，不被轮询恢复 ----------
+    const seg = page.locator('[data-time-segments] .time-segment').first();
+    const cell19 = seg.locator('.hour-cell[data-hour="19"]');
+    check('G0. 19 点初始为选中', (await cell19.getAttribute('class')).includes('on'));
+    await cell19.click();
+    check('G1. 点击后 19 点取消选中', !(await cell19.getAttribute('class')).includes('on'));
+    await blurToBody();
+    await setFormMarker();
+    await sleep(6500);
+    check('G2. 6.5s 后 19 点仍为未选中', !(await cell19.getAttribute('class')).includes('on'));
+    check('G3. 有未保存改动时不发生换块', await formMarkerPresent());
+    const specG = JSON.parse(await page.locator('[data-time-value]').inputValue());
+    const hoursG = [];
+    for (const it of specG.intervals) {
+      for (let h = it.start_hour; h < it.end_hour; h++) hoursG.push(h);
+    }
+    check('G4. time_spec 已排除 19 点', !hoursG.includes(19), JSON.stringify(specG));
+
+    await page.locator('[data-time-add]').click();
+    const segs = page.locator('[data-time-segments] .time-segment');
+    check('G5. 添加后有两个日期段', (await segs.count()) === 2, String(await segs.count()));
+    await segs.nth(1).getByRole('button', { name: '移除' }).click();
+    check('G6. 移除后只剩一个日期段', (await segs.count()) === 1, String(await segs.count()));
+    await blurToBody();
+    await setFormMarker();
+    await sleep(6500);
+    check('G7. 6.5s 后仍只有一个日期段', (await segs.count()) === 1, String(await segs.count()));
+    check('G8. 有未保存改动时不发生换块', await formMarkerPresent());
+
+    // ---------- H. 页面无 JS 错误 ----------
+    check('H. 无 pageerror / console.error', pageErrors.length === 0, pageErrors.join(' | '));
   } finally {
     await browser.close().catch(() => {});
   }
